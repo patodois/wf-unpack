@@ -107,6 +107,21 @@ enum Command {
         #[arg(long)]
         survey: bool,
     },
+    /// Load every static and skinned model through the rewrite-bridge provider and validate it
+    #[cfg(feature = "bridge")]
+    CheckBridge {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+        /// Also bake every material's textures (much slower)
+        #[arg(long)]
+        textures: bool,
+        /// Only models whose path contains this text
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Stop after this many models
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -131,6 +146,13 @@ fn main() -> Result<()> {
         Command::Check { dir, only } => check(&dir, only.as_deref()),
         Command::Texture { path, out, game } => texture_cmd(&expand_home(&game), &path, &out),
         Command::Kinds { toc } => kinds_cmd(&toc),
+        #[cfg(feature = "bridge")]
+        Command::CheckBridge {
+            game,
+            textures,
+            filter,
+            limit,
+        } => check_bridge_cmd(&expand_home(&game), textures, &filter, limit),
         Command::CheckMaterials { game, survey } => {
             check_materials_cmd(&expand_home(&game), survey)
         }
@@ -1038,6 +1060,94 @@ fn find_text_cmd(game: &Path, needle: &str) -> Result<()> {
         let text = texts.text(path)?.unwrap_or_default();
         for line in text.lines().filter(|l| l.contains(needle)) {
             println!("{path}: {}", line.trim());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bridge")]
+fn check_bridge_cmd(game: &Path, textures: bool, filter: &str, limit: Option<usize>) -> Result<()> {
+    use rewrite_bridge::Provider;
+    let started = Instant::now();
+    let provider = wf_unpack::bridge::Warframe::open(game)?.with_textures(textures);
+    let models: Vec<(String, u16)> = provider
+        .models()?
+        .into_iter()
+        .filter(|(p, _)| p.contains(filter))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    eprintln!(
+        "{} models listed in {:.0}s",
+        models.len(),
+        started.elapsed().as_secs_f64()
+    );
+    #[derive(Default)]
+    struct Stats {
+        ok: usize,
+        meshes: usize,
+        triangles: u64,
+        joints: u64,
+        textured: usize,
+        errors: BTreeMap<String, Vec<String>>,
+    }
+    let mut stats: BTreeMap<u16, Stats> = BTreeMap::new();
+    for (path, kind) in &models {
+        let st = stats.entry(*kind).or_default();
+        match provider.load(path) {
+            Ok(m) => {
+                st.ok += 1;
+                st.meshes += m.meshes.len();
+                st.triangles += m
+                    .meshes
+                    .iter()
+                    .map(|x| x.indices.len() as u64 / 3)
+                    .sum::<u64>();
+                st.joints += m.skins.iter().map(|s| s.joints.len() as u64).sum::<u64>();
+                st.textured += usize::from(m.materials.iter().any(|x| x.base_color.is_some()));
+            }
+            Err(err) => {
+                // The innermost causes say what went wrong; the outermost is the path
+                let mut chain = Vec::new();
+                let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+                while let Some(e) = cur {
+                    chain.push(e.to_string());
+                    cur = e.source();
+                }
+                let msg = chain
+                    .into_iter()
+                    .filter(|m| m != path)
+                    .collect::<Vec<_>>()
+                    .join(": ");
+                let key: String = msg
+                    .chars()
+                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                    .collect();
+                st.errors.entry(key).or_default().push(path.clone());
+            }
+        }
+    }
+    println!(
+        "{:.0}s, textures {}",
+        started.elapsed().as_secs_f64(),
+        if textures { "baked" } else { "skipped" }
+    );
+    for (kind, st) in &stats {
+        let failed: usize = st.errors.values().map(Vec::len).sum();
+        println!(
+            "type {kind}: {}/{} load and validate, {failed} failed ({} meshes, {} triangles, {} joints{})",
+            st.ok,
+            st.ok + failed,
+            st.meshes,
+            st.triangles,
+            st.joints,
+            if textures { format!(", {} with a base colour texture", st.textured) } else { String::new() }
+        );
+        for (msg, list) in &st.errors {
+            println!(
+                "  {:>6}  {msg}\n          e.g. {}",
+                list.len(),
+                list.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            );
         }
     }
     Ok(())

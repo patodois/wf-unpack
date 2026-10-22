@@ -228,7 +228,7 @@ fn to_bevy_image(img: &pbr::Image, srgb: bool) -> Image {
 fn to_material(b: &Baked, images: &mut Assets<Image>) -> StandardMaterial {
     let [r, g, bl, a] = b.base_color_factor;
     StandardMaterial {
-        base_color: Color::srgba(r, g, bl, a),
+        base_color: Color::linear_rgba(r, g, bl, a),
         base_color_texture: b
             .base_color
             .as_ref()

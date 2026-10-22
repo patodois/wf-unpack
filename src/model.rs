@@ -921,6 +921,28 @@ impl Model {
         })
     }
 
+    /// Loads a model by path from already opened `H.Misc`, `B.Misc` and `F.Misc` packages.
+    pub fn load_from(
+        head: &mut Package,
+        body: Option<&mut Package>,
+        full: Option<&mut Package>,
+        path: &str,
+    ) -> Result<Self> {
+        let h = head
+            .read_path(path)?
+            .with_context(|| format!("{path} is not in H.Misc"))?;
+        let header = ModelHeader::parse(&h).with_context(|| path.to_string())?;
+        let body = match body {
+            Some(p) => p.read_path(path)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let full = match full {
+            Some(p) => p.read_path(path)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Model::from_parts(header, &body, &full).with_context(|| path.to_string())
+    }
+
     /// Loads a model by path from a `Cache.Windows` folder.
     pub fn load(dir: &Path, path: &str) -> Result<Self> {
         let read = |name: &str| -> Result<Option<Vec<u8>>> {

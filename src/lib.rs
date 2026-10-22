@@ -1,5 +1,7 @@
 //! Readers for Warframe's Evolution Engine packages (`.toc` + `.cache`) and the assets in them.
 
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod bytes;
 pub mod cache;
 pub mod gltf;

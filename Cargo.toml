@@ -16,6 +16,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 texture2ddecoder = "0.1.2"
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
+# Shared model types for crossovers with other game rewrites
+rewrite-bridge = { path = "../rewrite-bridge", optional = true }
+
+[features]
+bridge = ["dep:rewrite-bridge"]
 
 [workspace]
 members = ["viewer"]

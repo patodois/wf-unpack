@@ -68,6 +68,28 @@ The tests in `tests/game_data.rs` run against a real install when
 WF_GAME_DIR=~/Games/Warframe/Cache.Windows cargo test --release
 ```
 
+## rewrite-bridge
+
+With the `bridge` feature, `src/bridge.rs` implements
+[rewrite-bridge](../rewrite-bridge)'s `Provider` for Warframe. Other game
+rewrites can then load Warframe models into the same scene as their own.
+
+```sh
+cargo build --release --features bridge
+wf-unpack check-bridge --game $C              # load and validate every model
+wf-unpack check-bridge --game $C --textures   # the same, baking every material
+```
+
+- `list` returns every static (type 102) and skinned (type 281) model, with
+  the kind taken from the path: `/Lotus/Weapons` is Weapon,
+  `/Lotus/Characters` is Character, anything else is Prop.
+- `load` returns a validated `Model`. Geometry goes through `scene::prepare`,
+  so it matches the glTF export. Each material slot of a model becomes one
+  mesh holding only the vertices its triangles use (LOD 0). Skinned models
+  get the bones as nodes under the model node, plus one skin.
+- Units are metres already: Excalibur stands 1.84 m tall, feet at y = 0.
+- The bridge has one UV set; the second one (`uv1`) is dropped.
+
 ## Viewer
 
 `viewer/` is `wf-viewer`, a Bevy app that opens models straight from the

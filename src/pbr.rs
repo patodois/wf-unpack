@@ -201,6 +201,7 @@ pub fn convert_normal(px: [u8; 4]) -> [u8; 4] {
 /// glTF material inputs: images plus the factors they are multiplied by.
 pub struct Baked {
     pub base_color: Option<Image>,
+    /// Linear RGBA, as glTF's baseColorFactor.
     pub base_color_factor: [f32; 4],
     pub metallic_roughness: Option<Image>,
     pub metallic_factor: f32,
@@ -290,15 +291,8 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
         },
     ];
     let (base_color, base_color_factor) = match largest(base_inputs) {
-        None => (
-            None,
-            [
-                plan.diffuse_color[0],
-                plan.diffuse_color[1],
-                plan.diffuse_color[2],
-                1.0,
-            ],
-        ),
+        // The colour constants are taken as sRGB like the textures; glTF's factor is linear
+        None => (None, [diffuse_lin[0], diffuse_lin[1], diffuse_lin[2], 1.0]),
         Some((w, h)) => {
             let mut out = Image::new(w, h);
             for y in 0..h {

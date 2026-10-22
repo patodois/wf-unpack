@@ -171,3 +171,50 @@ fn excalibur_body_with_skeleton() {
         assert!(v.joints.iter().all(|&j| (j as usize) < sk.joints.len()));
     }
 }
+
+#[cfg(feature = "bridge")]
+#[test]
+fn bridge_provider_loads_valid_models_in_metres() {
+    use rewrite_bridge::{AssetKind, Provider};
+    use wf_unpack::bridge::Warframe;
+    let Some(dir) = game_dir() else { return };
+    let wf = Warframe::open(&dir).unwrap();
+    let listed = wf
+        .list("/Lotus/Characters/Tenno/Excalibur/Excalibur_skel")
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, AssetKind::Character);
+    assert_eq!(
+        wf.list("PrimeGalatine/PrimeGalatine.fbx").unwrap()[0].kind,
+        AssetKind::Weapon
+    );
+
+    let exc = wf.load(&listed[0].id).unwrap();
+    exc.validate().unwrap();
+    assert_eq!(exc.skins.len(), 1);
+    assert_eq!(exc.skins[0].joints.len(), 81);
+    assert!(exc.materials.iter().all(|m| m.base_color.is_some()));
+    // Warframe's units are metres: Excalibur is a bit under 2 m tall, feet at 0
+    let (lo, hi) = exc.bounds().unwrap();
+    let height = hi[1] - lo[1];
+    assert!(
+        (1.7..2.0).contains(&height),
+        "Excalibur is {height} units tall"
+    );
+    assert!(lo[1].abs() < 0.05);
+
+    let sword = wf
+        .load("/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx")
+        .unwrap();
+    sword.validate().unwrap();
+    assert!(sword.skins.is_empty());
+    assert_eq!(
+        sword
+            .meshes
+            .iter()
+            .map(|m| m.indices.len() / 3)
+            .sum::<usize>(),
+        4112
+    );
+    assert!(sword.materials[0].normal.is_some() && sword.materials[0].metallic_roughness.is_some());
+}
