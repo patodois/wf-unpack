@@ -114,6 +114,10 @@ impl Package {
             entry.len
         );
         let raw = self.read_raw(entry)?;
+        if !entry.is_compressed() {
+            // Stored: hand the buffer over instead of copying it (videos run to hundreds of MB)
+            return Ok(raw);
+        }
         decompress(&raw, entry.len as usize)
     }
 

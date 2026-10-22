@@ -61,6 +61,10 @@ Puxtril; no code was copied. Oodle streams are decoded with the pure-Rust
 [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
 with [texture2ddecoder](https://crates.io/crates/texture2ddecoder).
 
+Tested against the Steam (Windows) build of 2026-10-22: `check` decodes all
+1,090,424 entries of the 95 packages (132.7 GB once decompressed) with no
+failures in about five minutes.
+
 What this version learned beyond those sources:
 
 - Texture headers: the first byte is the number of mip levels in `B.`, the
