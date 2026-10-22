@@ -12,7 +12,6 @@ use wf_unpack::header::CommonHeader;
 use wf_unpack::material::{self, MaskLayout, Material, Plan, Source};
 use wf_unpack::model::{Model, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use wf_unpack::packages::PackagesBin;
-use wf_unpack::packages::TextReader;
 use wf_unpack::pbr;
 use wf_unpack::texture::TexturePackages;
 use wf_unpack::texture::{Texture, TextureHeader};
@@ -434,27 +433,6 @@ fn manual_materials(
         .collect())
 }
 
-/// Resolves material `name` of the model at `model_path` and picks its textures.
-/// The material's own properties may sit in its H.Misc entry's attribute text.
-fn material_plan(
-    bin: &PackagesBin,
-    texts: &mut TextReader,
-    misc: &mut Package,
-    texture_exists: impl Fn(&str) -> bool,
-    model_path: &str,
-    name: &str,
-) -> Result<Plan> {
-    let path = material::resolve_path(material::folder(model_path), name);
-    let own = match misc.read_path(&path)? {
-        Some(raw) => CommonHeader::parse(&raw)
-            .map(|h| h.attributes)
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    let m = Material::resolve(bin, texts, &path, &own)?;
-    Ok(Plan::new(&m, texture_exists))
-}
-
 fn describe(s: &Source) -> String {
     let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     match s {
@@ -472,10 +450,7 @@ fn auto_materials(
     meshes: usize,
     out: &Path,
 ) -> Result<Vec<gltf::Material>> {
-    let bin = load_packages_bin(game)?;
-    let mut texts = bin.texts()?;
-    let mut misc = Package::open(&game.join("H.Misc.toc"))?;
-    let mut textures = TexturePackages::open(game)?;
+    let mut baker = pbr::MaterialBaker::open(game)?;
     let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     fs::create_dir_all(out)?;
     let mut result = Vec::new();
@@ -485,14 +460,7 @@ fn auto_materials(
             continue;
         };
         let mut mat = gltf::Material::named(short(name));
-        let plan = match material_plan(
-            &bin,
-            &mut texts,
-            &mut misc,
-            |t| textures.contains(t),
-            model_path,
-            name,
-        ) {
+        let plan = match baker.plan(model_path, name) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("material {name}: {e:#}; exported without textures");
@@ -500,42 +468,8 @@ fn auto_materials(
                 continue;
             }
         };
-        eprintln!(
-            "material {}: albedo {}, tint {}, roughness {}, {} {}, normal {}, emissive {}{}",
-            plan.name,
-            describe(&plan.albedo),
-            plan.tint.as_ref().map_or("none".into(), |t| format!(
-                "{}{}{}",
-                short(&t.mask),
-                if t.layout == MaskLayout::PackAlphaQuadrants {
-                    " (alpha quadrants)"
-                } else {
-                    ""
-                },
-                if t.default_colors {
-                    ", default palette"
-                } else {
-                    ""
-                }
-            )),
-            describe(&plan.roughness),
-            if plan.specular_workflow {
-                "specular"
-            } else {
-                "metal"
-            },
-            describe(&plan.metalness),
-            plan.normal.as_deref().map_or("none".into(), short),
-            plan.emissive
-                .as_ref()
-                .map_or("none".into(), |(t, _, _)| short(t)),
-            if plan.unsupported.is_empty() {
-                String::new()
-            } else {
-                format!("; not reproduced: {}", plan.unsupported.join(", "))
-            }
-        );
-        let baked = pbr::bake(&plan, &mut textures)?;
+        eprintln!("material {}: {}", plan.name, describe_plan(&plan));
+        let baked = baker.bake(&plan)?;
         for (slot, suffix, img) in [
             (gltf::Slot::BaseColor, "base", &baked.base_color),
             (
@@ -559,6 +493,45 @@ fn auto_materials(
         result.push(mat);
     }
     Ok(result)
+}
+
+/// One line describing where each input of a material comes from.
+fn describe_plan(plan: &Plan) -> String {
+    let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    format!(
+        "albedo {}, tint {}, roughness {}, {} {}, normal {}, emissive {}{}",
+        describe(&plan.albedo),
+        plan.tint.as_ref().map_or("none".into(), |t| format!(
+            "{}{}{}",
+            short(&t.mask),
+            if t.layout == MaskLayout::PackAlphaQuadrants {
+                " (alpha quadrants)"
+            } else {
+                ""
+            },
+            if t.default_colors {
+                ", default palette"
+            } else {
+                ""
+            }
+        )),
+        describe(&plan.roughness),
+        if plan.specular_workflow {
+            "specular"
+        } else {
+            "metal"
+        },
+        describe(&plan.metalness),
+        plan.normal.as_deref().map_or("none".into(), short),
+        plan.emissive
+            .as_ref()
+            .map_or("none".into(), |(t, _, _)| short(t)),
+        if plan.unsupported.is_empty() {
+            String::new()
+        } else {
+            format!("; not reproduced: {}", plan.unsupported.join(", "))
+        }
+    )
 }
 
 /// Share of triangles whose winding agrees with their vertex normals.
@@ -679,16 +652,8 @@ fn model_cmd(
     } else {
         manual_materials(game, textures, &h.materials(), h.meshes.len(), out)?
     };
-    gltf::write(
-        &model,
-        &name,
-        &materials,
-        &gltf::Options {
-            lod,
-            mirror_x: true,
-        },
-        out,
-    )?;
+    let scene = wf_unpack::scene::prepare(&model, lod, true)?;
+    gltf::write(&scene, &name, &materials, out)?;
     let tris: usize = (0..h.meshes.len())
         .map(|m| model.lod_indices(m, lod).map_or(0, |t| t.len() / 3))
         .sum();
@@ -812,11 +777,7 @@ fn check_models_cmd(game: &Path) -> Result<()> {
 }
 
 fn load_packages_bin(game: &Path) -> Result<PackagesBin> {
-    let mut pkg = Package::open(&game.join("H.Misc.toc"))?;
-    let raw = pkg
-        .read_path("/Packages.bin")?
-        .context("/Packages.bin is not in H.Misc")?;
-    PackagesBin::parse(&raw).context("parsing /Packages.bin")
+    PackagesBin::load(game)
 }
 
 fn props_cmd(game: &Path, path: &str) -> Result<()> {
@@ -941,7 +902,7 @@ fn check_materials_cmd(game: &Path, survey: bool) -> Result<()> {
             slots += 1;
             let path = material::resolve_path(material::folder(&e.path), name);
             if !plans.contains_key(&path) {
-                let plan = material_plan(
+                let plan = pbr::plan_material(
                     &bin,
                     &mut texts,
                     &mut misc,

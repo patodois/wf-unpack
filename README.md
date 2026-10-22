@@ -68,6 +68,29 @@ The tests in `tests/game_data.rs` run against a real install when
 WF_GAME_DIR=~/Games/Warframe/Cache.Windows cargo test --release
 ```
 
+## Viewer
+
+`viewer/` is `wf-viewer`, a Bevy app that opens models straight from the
+game files, with no export step. It uses the same scene preparation and baked
+materials as the glTF export.
+
+```sh
+cargo build -p wf-viewer
+# One or more model paths; N / P switch between them, drag to orbit, scroll to zoom
+target/debug/wf-viewer /Lotus/Weapons/Tenno/SemiAutoRifle/PrimeBraton.fbx \
+    /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --game $C
+# Skinned models are live: --pose-demo swings the left upper arm (GAME_L1_ARM1)
+target/debug/wf-viewer /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --pose-demo
+# Save a frame and exit (with several paths: out-1.png, out-2.png, ...)
+target/debug/wf-viewer /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx --screenshot out.png
+```
+
+Options: `--game <Cache.Windows>` (default `~/Games/Warframe/Cache.Windows`),
+`--lod N`, `--screenshot <file.png>`, `--pose-demo`. A Bevy debug build
+takes about 3 minutes the first time and about 3 GB in `target/`.
+Dependencies are built optimised and without debug info, so Bevy runs
+smoothly in debug builds and the folder stays small.
+
 ## Format notes
 
 The module docs in `src/toc.rs`, `src/cache.rs`, `src/header.rs` and

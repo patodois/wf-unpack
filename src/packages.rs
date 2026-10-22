@@ -219,6 +219,15 @@ impl PackagesBin {
         })
     }
 
+    /// Reads `/Packages.bin` from the `H.Misc` package of a `Cache.Windows` folder.
+    pub fn load(game: &std::path::Path) -> Result<Self> {
+        let mut pkg = crate::cache::Package::open(&game.join("H.Misc.toc"))?;
+        let raw = pkg
+            .read_path("/Packages.bin")?
+            .context("/Packages.bin is not in H.Misc")?;
+        PackagesBin::parse(&raw).context("parsing /Packages.bin")
+    }
+
     pub fn len(&self) -> usize {
         self.entities.len()
     }

@@ -17,14 +17,21 @@ texture2ddecoder = "0.1.2"
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
 
-# Oodle decoding is far too slow without optimisations; keep our own code debuggable
+[workspace]
+members = ["viewer"]
+
+# Oodle decoding and Bevy are far too slow without optimisations; keep our own code debuggable
 [profile.dev.package."*"]
 opt-level = 3
-# Dependency debug info is large and rarely needed
+# Dependency debug info is large (Bevy) and rarely needed
 debug = false
 
 [profile.dev]
 debug = "line-tables-only"
+
+# The viewer bakes textures pixel by pixel through the library
+[profile.dev.package.wf-unpack]
+opt-level = 3
 
 # oozextract 0.5.5 on crates.io lacks the fix for valid streams it rejected (lvlvllvlvllvlvl/oozextract#3);
 # use the fixed revision until a release is out (lvlvllvlvllvlvl/oozextract#5)

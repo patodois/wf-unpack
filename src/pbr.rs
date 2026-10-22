@@ -13,8 +13,69 @@
 
 use anyhow::{ensure, Result};
 
-use crate::material::{MaskLayout, Plan, Source};
+use std::path::Path;
+
+use crate::cache::Package;
+use crate::header::CommonHeader;
+use crate::material::{self, MaskLayout, Material, Plan, Source};
+use crate::packages::{PackagesBin, TextReader};
 use crate::texture::{Texture, TexturePackages};
+
+/// Resolves material `name` of the model at `model_path` and picks its
+/// textures. The material's own properties may sit in its `H.Misc` entry's
+/// attribute text.
+pub fn plan_material(
+    bin: &PackagesBin,
+    texts: &mut TextReader,
+    misc: &mut Package,
+    texture_exists: impl Fn(&str) -> bool,
+    model_path: &str,
+    name: &str,
+) -> Result<Plan> {
+    let path = material::resolve_path(material::folder(model_path), name);
+    let own = match misc.read_path(&path)? {
+        Some(raw) => CommonHeader::parse(&raw)
+            .map(|h| h.attributes)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let m = Material::resolve(bin, texts, &path, &own)?;
+    Ok(Plan::new(&m, texture_exists))
+}
+
+/// Everything needed to plan and bake materials, opened once.
+pub struct MaterialBaker {
+    pub bin: PackagesBin,
+    pub misc: Package,
+    pub textures: TexturePackages,
+}
+
+impl MaterialBaker {
+    pub fn open(game: &Path) -> Result<Self> {
+        Ok(MaterialBaker {
+            bin: PackagesBin::load(game)?,
+            misc: Package::open(&game.join("H.Misc.toc"))?,
+            textures: TexturePackages::open(game)?,
+        })
+    }
+
+    pub fn plan(&mut self, model_path: &str, name: &str) -> Result<Plan> {
+        let mut texts = self.bin.texts()?;
+        let textures = &self.textures;
+        plan_material(
+            &self.bin,
+            &mut texts,
+            &mut self.misc,
+            |t| textures.contains(t),
+            model_path,
+            name,
+        )
+    }
+
+    pub fn bake(&mut self, plan: &Plan) -> Result<Baked> {
+        bake(plan, &mut self.textures)
+    }
+}
 
 /// An 8-bit RGBA image.
 #[derive(Clone)]

@@ -8,5 +8,6 @@ pub mod material;
 pub mod model;
 pub mod packages;
 pub mod pbr;
+pub mod scene;
 pub mod texture;
 pub mod toc;
