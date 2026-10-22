@@ -14,15 +14,33 @@ use crate::model::Model;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     BaseColor,
+    MetallicRoughness,
     Normal,
     Emissive,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Material {
     pub name: String,
     /// (slot, image file name relative to the .gltf)
     pub images: Vec<(Slot, String)>,
+    pub base_color_factor: [f32; 4],
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub emissive_factor: [f32; 3],
+}
+
+impl Material {
+    pub fn named(name: impl Into<String>) -> Self {
+        Material {
+            name: name.into(),
+            images: Vec::new(),
+            base_color_factor: [1.0; 4],
+            metallic_factor: 0.0,
+            roughness_factor: 0.6,
+            emissive_factor: [1.0; 3],
+        }
+    }
 }
 
 pub struct Options {
@@ -73,13 +91,16 @@ pub fn write(
         .iter()
         .map(|v| normalize([v.normal[0], v.normal[1], v.normal[2] * z]))
         .collect();
-    // Mirroring also flips the bitangent
+    // glTF's bitangent is cross(normal, tangent) * w and must point to the top
+    // of the texture (decreasing v). As stored, cross(normal, tangent) * w
+    // points the other way on every triangle checked, and mirroring flips it
+    // once more; hence the sign.
     let tangents: Vec<[f32; 4]> = model
         .vertices
         .iter()
         .map(|v| {
             let [x, y, w] = normalize([v.tangent[0], v.tangent[1], v.tangent[2] * z]);
-            [x, y, w, v.tangent[3] * z]
+            [x, y, w, -v.tangent[3]]
         })
         .collect();
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -159,16 +180,21 @@ pub fn write(
     };
     let mut gl_materials = Vec::new();
     for m in materials {
-        let mut pbr = json!({"metallicFactor": 0.0, "roughnessFactor": 0.6});
+        let mut pbr = json!({
+            "baseColorFactor": m.base_color_factor,
+            "metallicFactor": m.metallic_factor,
+            "roughnessFactor": m.roughness_factor,
+        });
         let mut mat = json!({"name": m.name});
         for (slot, file) in &m.images {
             let tex = json!({"index": image_index(file)});
             match slot {
                 Slot::BaseColor => pbr["baseColorTexture"] = tex,
+                Slot::MetallicRoughness => pbr["metallicRoughnessTexture"] = tex,
                 Slot::Normal => mat["normalTexture"] = tex,
                 Slot::Emissive => {
                     mat["emissiveTexture"] = tex;
-                    mat["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+                    mat["emissiveFactor"] = json!(m.emissive_factor);
                 }
             }
         }

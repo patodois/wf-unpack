@@ -37,13 +37,18 @@ wf-unpack check $C
 wf-unpack texture /Lotus/Interface/Icons/Miscellaneous/Kuva.png -o kuva.dds --game $C
 wf-unpack texture /Lotus/Interface/Icons/Miscellaneous/Kuva.png -o kuva.png --game $C
 
-# A static model: print its layout, or export it to glTF (+ .bin) with -o.
-# Materials are not resolved yet; --texture attaches a game texture by hand.
+# A static model: print its layout, or export it to glTF (+ .bin + PNGs) with -o.
+# Materials are resolved through Packages.bin and baked to glTF PBR textures;
+# --texture base=/normal=/emissive=PATH replaces that with textures chosen by hand.
 wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx
-wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx -o out/ \
-    --texture base=/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine_t.png \
-    --texture normal=/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine_n.png
+wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx -o out/
 wf-unpack check-models --game $C
+
+# Packages.bin: properties of an asset (and its parents), text search, full decode
+wf-unpack props /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatinePBR
+wf-unpack find-text PrimeGalatine_n.png
+wf-unpack check-packages --game $C
+wf-unpack check-materials --game $C
 
 # Surveys: asset types in an H. package, texture headers vs. B./F. sizes
 wf-unpack kinds $C/H.Misc.toc
@@ -67,8 +72,10 @@ The module docs in `src/toc.rs`, `src/cache.rs`, `src/header.rs` and
 `src/texture.rs` describe the layouts. Starting points were the
 documentation and source of [LotusLib](https://github.com/Puxtril/LotusLib)
 and [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by
-Puxtril (including its model readers for the static model layout); no code
-was copied. Oodle streams are decoded with the pure-Rust
+Puxtril (including its model readers for the static model layout and the
+`dev` branch's Packages.bin reader); no code was copied. Warframe's public
+[texturing guide](https://www.warframe.com/steamworkshop/texturing-guide)
+describes the tint mask layering. Oodle streams are decoded with the pure-Rust
 [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
 with [texture2ddecoder](https://crates.io/crates/texture2ddecoder).
 
@@ -115,22 +122,69 @@ out:
 
 Not handled yet:
 
-- Materials. A model names its materials (`Materials={...}` in the header
-  text), but the material entries in `H.Misc` list only shader sources; the
-  texture paths are in `/Packages.bin`. That file's current layout (version 46)
-  differs from LotusLib's description: about 200 unknown bytes before the
-  reference list, and the entity list is now grouped by folder
-  (`u32 len, folder, u8, u32 count`, then `name, 3 bytes, parent` per entity;
-  21,860 folders and 467,796 entities read cleanly to the end of the file).
-  The property text sits in a zstd blob with a dictionary (the dictionary's
-  magic number is at offset 327,162), but where each entity's frame starts is
-  not worked out. Until then `--texture` attaches textures by hand.
 - Skinned and other model types: 281 (9,057 rigged), 132/134 (animations
   stored under `.fbx`), 105/109 (level geometry), 108 (HLOD), and the
   morph data above. Warframe-Exporter's readers describe most of them.
 - Vertex colours (stored in separate `.vc` entries), the byte after the normal
   (0 or 255), and what exactly the fourth vertex byte after the tangent holds
   (probably ambient occlusion).
+
+### Packages.bin and materials
+
+`src/packages.rs` reads `/Packages.bin` (version 46): every asset's type,
+parent and property text. Its module docs give the layout. Since version 45
+the sections are separated by junk bytes whose lengths come from a 64-bit
+LCG (Knuth's MMIX constants) seeded by a u32 in the header, and entities are
+grouped by folder. LotusLib's `dev` branch documents this; no code was
+copied. The texts are zstd frames without magic numbers, sharing one
+dictionary. `check-packages` decodes all 467,795 entities with no failures:
+203,948 texts, 221.8 MB, in about half a second. The header counts 467,796;
+one path appears twice.
+
+`src/material.rs` resolves a model's materials. A model names them in its
+attribute text (`Materials={...}`), relative to its folder. A material
+inherits every property of its parent chain, usually up to
+`/EE/Materials/Defaults/PBR`. Its own properties are in Packages.bin or in
+the attribute text of its `H.Misc` entry; both are read. `src/pbr.rs` turns
+the result into glTF metallic-roughness textures:
+
+| Game input | glTF | Status |
+|---|---|---|
+| `TX:DiffuseMap` (when `DIFFUSE_MAP=1`) | base colour | known |
+| `TX:PackMap` R | metalness | guessed: binary mask that follows gold accents |
+| `TX:PackMap` G | base colour (grey) when there is no diffuse map | measured: 0.99 correlation with a diffuse map's luminance |
+| `TX:PackMap` B | roughness | guessed: lower on metal, ~0.9 on painted wood |
+| `TX:RoughnessMap`, `TX:SpecularMap` (metal when `SPECULARMAP_IS_METALMAP=1`) | roughness, metalness | used when enabled |
+| `TX:TintMask` RGBA with `PS:TintColor0..3` | multiplies the base colour | layering from Warframe's texturing guide (R bottom, then G, B, A on top); blending in linear space is a guess |
+| `TX:NormalMap` | normal | measured: green points down (DirectX), inverted for glTF; blue rebuilt |
+| `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | colour is `PS:EmissiveTintColorHi`; brightness (`EmissiveMapAtten`) ignored |
+
+Tint colours are the material's own `PS:TintColor0..3` (its default player
+colours), or a neutral grey/gold palette when it sets none. The green-down
+normal convention comes from a curl test: the normal maps are integrable only
+with green pointing down. The tangent's w is set so glTF's bitangent points to
+the top of the texture; it was checked against the UV derivatives of every
+triangle.
+
+`check-materials` over the 49,410 material slots of the 33,689 static
+models:
+
+- Base colour: 21,720 from a diffuse texture, 11,472 from a pack map's grey
+  channel (684 of them tinted by a tint mask), 16,040 constant colour.
+- 22,907 get a metallic-roughness texture; 30,883 a normal map; 8,671 an
+  emissive map.
+- Failures: 178 materials missing from Packages.bin, and 4,626 models with no
+  `Materials=` list (mostly particle-emitter meshes).
+
+Not reproduced (counted per slot by `check-materials`):
+
+- `DETAILING=TINT_MASK_PACK_MAP` (11,879, most weapons and characters). Its
+  tint mask lives inside the pack map somehow; these come out untinted grey.
+- Vertex-colour tinting and layer blending (`VERTEX_*_TINT_STACK`, `LAYERS=`):
+  only the first layer is used.
+- `TINT_COLOR`/`TINT_CHANNELS` and other rarer `DETAILING` modes.
+- Opacity maps, detail maps, ambient-occlusion maps and vertex AO.
+- Weapon skins and other material overrides outside the model's own list.
 
 ## Disclaimer
 

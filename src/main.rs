@@ -9,7 +9,12 @@ use clap::{Parser, Subcommand};
 use wf_unpack::cache::Package;
 use wf_unpack::gltf;
 use wf_unpack::header::CommonHeader;
+use wf_unpack::material::{self, Material, Plan, Source};
 use wf_unpack::model::{Model, ModelHeader, KIND_STATIC};
+use wf_unpack::packages::PackagesBin;
+use wf_unpack::packages::TextReader;
+use wf_unpack::pbr;
+use wf_unpack::texture::TexturePackages;
 use wf_unpack::texture::{Texture, TextureHeader};
 use wf_unpack::toc::glob_match;
 
@@ -78,6 +83,31 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Print the Packages.bin text of an entity and of each entity it derives from
+    Props {
+        path: String,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// List Packages.bin entities whose text contains a string
+    FindText {
+        needle: String,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Decode the text of every Packages.bin entity and summarise failures
+    CheckPackages {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Resolve the materials of every static model and report which texture slots they get
+    CheckMaterials {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+        /// Also count every TX:/flag key seen (for studying the format)
+        #[arg(long)]
+        survey: bool,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -102,6 +132,12 @@ fn main() -> Result<()> {
         Command::Check { dir, only } => check(&dir, only.as_deref()),
         Command::Texture { path, out, game } => texture_cmd(&expand_home(&game), &path, &out),
         Command::Kinds { toc } => kinds_cmd(&toc),
+        Command::CheckMaterials { game, survey } => {
+            check_materials_cmd(&expand_home(&game), survey)
+        }
+        Command::Props { path, game } => props_cmd(&expand_home(&game), &path),
+        Command::FindText { needle, game } => find_text_cmd(&expand_home(&game), &needle),
+        Command::CheckPackages { game } => check_packages_cmd(&expand_home(&game)),
         Command::CheckModels { game } => check_models_cmd(&expand_home(&game)),
         Command::Model {
             path,
@@ -357,6 +393,156 @@ fn kinds_cmd(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Attaches the given textures to every mesh (the `--texture` override).
+fn manual_materials(
+    game: &Path,
+    textures: &[String],
+    names: &[String],
+    meshes: usize,
+    out: &Path,
+) -> Result<Vec<gltf::Material>> {
+    let mut images = Vec::new();
+    for spec in textures {
+        let (slot, tex_path) = spec
+            .split_once('=')
+            .with_context(|| format!("--texture {spec}: expected SLOT=PATH"))?;
+        let slot = match slot {
+            "base" => gltf::Slot::BaseColor,
+            "normal" => gltf::Slot::Normal,
+            "emissive" => gltf::Slot::Emissive,
+            _ => anyhow::bail!("unknown texture slot {slot} (base, normal or emissive)"),
+        };
+        let tex = Texture::load(game, tex_path)?;
+        let file = format!(
+            "{}.png",
+            Path::new(tex_path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        fs::create_dir_all(out)?;
+        fs::write(out.join(&file), tex.to_png()?)?;
+        images.push((slot, file));
+    }
+    Ok((0..meshes)
+        .map(|i| {
+            let mut m =
+                gltf::Material::named(names.get(i).cloned().unwrap_or_else(|| "material".into()));
+            m.images = images.clone();
+            m
+        })
+        .collect())
+}
+
+/// Resolves material `name` of the model at `model_path` and picks its textures.
+/// The material's own properties may sit in its H.Misc entry's attribute text.
+fn material_plan(
+    bin: &PackagesBin,
+    texts: &mut TextReader,
+    misc: &mut Package,
+    texture_exists: impl Fn(&str) -> bool,
+    model_path: &str,
+    name: &str,
+) -> Result<Plan> {
+    let path = material::resolve_path(material::folder(model_path), name);
+    let own = match misc.read_path(&path)? {
+        Some(raw) => CommonHeader::parse(&raw)
+            .map(|h| h.attributes)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let m = Material::resolve(bin, texts, &path, &own)?;
+    Ok(Plan::new(&m, texture_exists))
+}
+
+fn describe(s: &Source) -> String {
+    let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    match s {
+        Source::Channel(p, c) => format!("{} ({})", short(p), ["R", "G", "B", "A"][*c]),
+        Source::Rgb(p) => short(p),
+        Source::Constant(v) => format!("{v}"),
+    }
+}
+
+/// Resolves each mesh's material through Packages.bin and bakes its textures into `out`.
+fn auto_materials(
+    game: &Path,
+    model_path: &str,
+    names: &[String],
+    meshes: usize,
+    out: &Path,
+) -> Result<Vec<gltf::Material>> {
+    let bin = load_packages_bin(game)?;
+    let mut texts = bin.texts()?;
+    let mut misc = Package::open(&game.join("H.Misc.toc"))?;
+    let mut textures = TexturePackages::open(game)?;
+    let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    fs::create_dir_all(out)?;
+    let mut result = Vec::new();
+    for i in 0..meshes {
+        let Some(name) = names.get(i) else {
+            result.push(gltf::Material::named("material"));
+            continue;
+        };
+        let mut mat = gltf::Material::named(short(name));
+        let plan = match material_plan(
+            &bin,
+            &mut texts,
+            &mut misc,
+            |t| textures.contains(t),
+            model_path,
+            name,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("material {name}: {e:#}; exported without textures");
+                result.push(mat);
+                continue;
+            }
+        };
+        eprintln!(
+            "material {}: albedo {}, tint {}, roughness {}, metal {}, normal {}, emissive {}{}",
+            plan.name,
+            describe(&plan.albedo),
+            plan.tint.as_ref().map_or("none".into(), |(t, _)| short(t)),
+            describe(&plan.roughness),
+            describe(&plan.metalness),
+            plan.normal.as_deref().map_or("none".into(), short),
+            plan.emissive
+                .as_ref()
+                .map_or("none".into(), |(t, _, _)| short(t)),
+            if plan.unsupported.is_empty() {
+                String::new()
+            } else {
+                format!("; not reproduced: {}", plan.unsupported.join(", "))
+            }
+        );
+        let baked = pbr::bake(&plan, &mut textures)?;
+        for (slot, suffix, img) in [
+            (gltf::Slot::BaseColor, "base", &baked.base_color),
+            (
+                gltf::Slot::MetallicRoughness,
+                "metal_rough",
+                &baked.metallic_roughness,
+            ),
+            (gltf::Slot::Normal, "normal", &baked.normal),
+            (gltf::Slot::Emissive, "emissive", &baked.emissive),
+        ] {
+            if let Some(img) = img {
+                let file = format!("{}_{suffix}.png", plan.name);
+                fs::write(out.join(&file), img.to_png()?)?;
+                mat.images.push((slot, file));
+            }
+        }
+        mat.base_color_factor = baked.base_color_factor;
+        mat.metallic_factor = baked.metallic_factor;
+        mat.roughness_factor = baked.roughness_factor;
+        mat.emissive_factor = baked.emissive_factor;
+        result.push(mat);
+    }
+    Ok(result)
+}
+
 /// Share of triangles whose winding agrees with their vertex normals.
 fn winding_agreement(model: &Model, tris: &[u32]) -> f64 {
     let (mut agree, mut total) = (0usize, 0usize);
@@ -439,42 +625,11 @@ fn model_cmd(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let mut images = Vec::new();
-    for spec in textures {
-        let (slot, tex_path) = spec
-            .split_once('=')
-            .with_context(|| format!("--texture {spec}: expected SLOT=PATH"))?;
-        let slot = match slot {
-            "base" => gltf::Slot::BaseColor,
-            "normal" => gltf::Slot::Normal,
-            "emissive" => gltf::Slot::Emissive,
-            _ => anyhow::bail!("unknown texture slot {slot} (base, normal or emissive)"),
-        };
-        let tex = Texture::load(game, tex_path)?;
-        let file = format!(
-            "{}.png",
-            Path::new(tex_path)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
-        fs::create_dir_all(out)?;
-        fs::write(out.join(&file), tex.to_png()?)?;
-        images.push((slot, file));
-    }
-    let mut materials: Vec<gltf::Material> = h
-        .materials()
-        .into_iter()
-        .map(|name| gltf::Material {
-            name,
-            images: images.clone(),
-        })
-        .collect();
-    // One material per mesh, named after the attribute list when it has one
-    materials.resize_with(h.meshes.len(), || gltf::Material {
-        name: "material".into(),
-        images: images.clone(),
-    });
+    let materials = if textures.is_empty() {
+        auto_materials(game, path, &h.materials(), h.meshes.len(), out)?
+    } else {
+        manual_materials(game, textures, &h.materials(), h.meshes.len(), out)?
+    };
     gltf::write(
         &model,
         &name,
@@ -567,5 +722,243 @@ fn check_models_cmd(game: &Path) -> Result<()> {
         );
     }
     println!("other .fbx types (not supported): {fbx_kinds:?}");
+    Ok(())
+}
+
+fn load_packages_bin(game: &Path) -> Result<PackagesBin> {
+    let mut pkg = Package::open(&game.join("H.Misc.toc"))?;
+    let raw = pkg
+        .read_path("/Packages.bin")?
+        .context("/Packages.bin is not in H.Misc")?;
+    PackagesBin::parse(&raw).context("parsing /Packages.bin")
+}
+
+fn props_cmd(game: &Path, path: &str) -> Result<()> {
+    let bin = load_packages_bin(game)?;
+    let mut texts = bin.texts()?;
+    let mut misc = Package::open(&game.join("H.Misc.toc"))?;
+    if let Some(raw) = misc.read_path(path)? {
+        let attrs = CommonHeader::parse(&raw)?.attributes;
+        if !attrs.is_empty() {
+            println!("== {path} (H.Misc attribute text)\n{attrs}");
+        }
+    }
+    let mut cur = Some(path.to_string());
+    while let Some(p) = cur {
+        println!("== {p}");
+        match texts.text(&p)? {
+            Some(text) => println!("{text}"),
+            None => println!("(not in Packages.bin)"),
+        }
+        cur = bin.parent(&p).map(str::to_string);
+    }
+    Ok(())
+}
+
+fn check_packages_cmd(game: &Path) -> Result<()> {
+    let started = Instant::now();
+    let bin = load_packages_bin(game)?;
+    let parsed = started.elapsed().as_secs_f64();
+    let mut texts = bin.texts()?;
+    let (mut ok, mut with_text, mut bytes, mut largest) = (0usize, 0usize, 0u64, 0usize);
+    let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut missing_parents = 0usize;
+    for path in bin.paths() {
+        if bin.parent(path).is_some_and(|p| !bin.contains(p)) {
+            missing_parents += 1;
+        }
+        match texts.text(path) {
+            Ok(Some(t)) => {
+                ok += 1;
+                if !t.is_empty() {
+                    with_text += 1;
+                    bytes += t.len() as u64;
+                    largest = largest.max(t.len());
+                }
+            }
+            Ok(None) => unreachable!(),
+            Err(err) => {
+                let key: String = format!("{err:#}")
+                    .chars()
+                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                    .collect();
+                errors.entry(key).or_default().push(path.to_string());
+            }
+        }
+    }
+    let failed: usize = errors.values().map(Vec::len).sum();
+    println!(
+        "Packages.bin version {}: {} entities, {ok} ok ({with_text} with text, {:.1} MB decoded, largest {largest} bytes), {failed} failed; \
+         {missing_parents} parents not in the file; parsed in {parsed:.1}s, all in {:.1}s",
+        bin.version,
+        bin.len(),
+        bytes as f64 / 1e6,
+        started.elapsed().as_secs_f64()
+    );
+    for (msg, list) in &errors {
+        println!(
+            "  {:>6}  {msg}\n          e.g. {}",
+            list.len(),
+            list.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn check_materials_cmd(game: &Path, survey: bool) -> Result<()> {
+    let started = Instant::now();
+    let bin = load_packages_bin(game)?;
+    let mut texts = bin.texts()?;
+    let mut head = Package::open(&game.join("H.Misc.toc"))?;
+    head.set_nocache();
+    let mut misc = Package::open(&game.join("H.Misc.toc"))?;
+    let textures = TexturePackages::open(game)?;
+    let entries: Vec<_> = head
+        .toc
+        .entries
+        .iter()
+        .filter(|e| std::ptr::eq(head.toc.get(&e.path).unwrap(), *e))
+        .cloned()
+        .collect();
+
+    let mut outcomes: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut note = |key: String, example: &str| {
+        outcomes
+            .entry(key)
+            .or_insert_with(|| (0, example.to_string()))
+            .0 += 1;
+    };
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    // Plans are small; keep one per material path (None when it failed)
+    let mut plans: std::collections::HashMap<String, std::result::Result<Plan, String>> =
+        Default::default();
+    let (mut models, mut slots, mut textured_models) = (0usize, 0usize, 0usize);
+    for e in &entries {
+        let Ok(raw) = head.read(e) else { continue };
+        let Ok(common) = CommonHeader::parse(&raw) else {
+            continue;
+        };
+        if common.kind != KIND_STATIC {
+            continue;
+        }
+        let Ok(header) = ModelHeader::parse(&raw) else {
+            continue;
+        };
+        models += 1;
+        let names = header.materials();
+        if names.is_empty() {
+            note("model has no Materials= list".into(), &e.path);
+            continue;
+        }
+        let mut all_textured = true;
+        for name in &names {
+            slots += 1;
+            let path = material::resolve_path(material::folder(&e.path), name);
+            if !plans.contains_key(&path) {
+                let plan = material_plan(
+                    &bin,
+                    &mut texts,
+                    &mut misc,
+                    |t| textures.contains(t),
+                    &e.path,
+                    name,
+                )
+                .map_err(|e| {
+                    let msg = format!("{e:#}");
+                    if msg.contains("not in Packages.bin") {
+                        "material not in Packages.bin".to_string()
+                    } else {
+                        msg
+                    }
+                });
+                if survey {
+                    if let Ok(m) = Material::resolve(&bin, &mut texts, &path, "") {
+                        for (k, (v, _)) in &m.props {
+                            if !k.contains(':') && !k.starts_with("Shader") {
+                                *keys.entry(format!("{k}={v}")).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                plans.insert(path.clone(), plan);
+            }
+            let plan = match &plans[&path] {
+                Ok(p) => p,
+                Err(msg) => {
+                    note(format!("failed: {msg}"), &path);
+                    all_textured = false;
+                    continue;
+                }
+            };
+            let base = match (&plan.albedo, &plan.tint) {
+                (Source::Rgb(_), _) => "diffuse texture",
+                (Source::Channel(..), Some(_)) => "pack map albedo + tint mask",
+                (Source::Channel(..), None) => "pack map albedo, untinted",
+                (Source::Constant(_), Some(_)) => "constant colour + tint mask",
+                (Source::Constant(_), None) => "constant colour only",
+            };
+            all_textured &= !matches!(plan.albedo, Source::Constant(_));
+            note(format!("base colour: {base}"), &path);
+            let tex = |s: &Source| !matches!(s, Source::Constant(_));
+            note(
+                format!(
+                    "metallic-roughness: {}",
+                    if tex(&plan.roughness) || tex(&plan.metalness) {
+                        "texture"
+                    } else {
+                        "constants"
+                    }
+                ),
+                &path,
+            );
+            note(
+                format!(
+                    "normal map: {}",
+                    if plan.normal.is_some() { "yes" } else { "no" }
+                ),
+                &path,
+            );
+            note(
+                format!(
+                    "emissive map: {}",
+                    if plan.emissive.is_some() { "yes" } else { "no" }
+                ),
+                &path,
+            );
+            for u in &plan.unsupported {
+                note(format!("not reproduced: {u}"), &path);
+            }
+        }
+        textured_models += usize::from(all_textured);
+    }
+    println!(
+        "{models} static models, {slots} material slots ({} distinct materials); {textured_models} models get a base colour texture on every mesh; {:.0}s",
+        plans.len(),
+        started.elapsed().as_secs_f64()
+    );
+    for (k, (n, example)) in &outcomes {
+        println!("{n:>7}  {k}   e.g. {example}");
+    }
+    if survey {
+        let mut sorted: Vec<_> = keys.into_iter().collect();
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
+        for (k, n) in sorted.iter().take(80) {
+            println!("{n:>7}  {k}");
+        }
+    }
+    Ok(())
+}
+
+fn find_text_cmd(game: &Path, needle: &str) -> Result<()> {
+    let bin = load_packages_bin(game)?;
+    let mut texts = bin.texts()?;
+    let mut paths: Vec<&str> = bin.paths().collect();
+    paths.sort_unstable();
+    for path in paths {
+        let text = texts.text(path)?.unwrap_or_default();
+        for line in text.lines().filter(|l| l.contains(needle)) {
+            println!("{path}: {}", line.trim());
+        }
+    }
     Ok(())
 }

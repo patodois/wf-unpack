@@ -230,6 +230,45 @@ fn split_levels(sizes: &[usize], layout: &Layout, body: &[u8], full: &[u8]) -> V
     mips
 }
 
+/// The three texture packages, opened once for loading many textures.
+pub struct TexturePackages {
+    head: Package,
+    body: Option<Package>,
+    full: Option<Package>,
+}
+
+impl TexturePackages {
+    pub fn open(dir: &Path) -> Result<Self> {
+        let head = Package::open_in(dir, "H.Texture")?.context("no H.Texture package")?;
+        Ok(TexturePackages {
+            head,
+            body: Package::open_in(dir, "B.Texture")?,
+            full: Package::open_in(dir, "F.Texture")?,
+        })
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.head.toc.get(path).is_some()
+    }
+
+    pub fn load(&mut self, path: &str) -> Result<Texture> {
+        let h = self
+            .head
+            .read_path(path)?
+            .with_context(|| format!("{path} is not in H.Texture"))?;
+        let header = TextureHeader::parse(&h)?;
+        let part = |pkg: &mut Option<Package>| -> Result<Vec<u8>> {
+            Ok(match pkg {
+                Some(p) => p.read_path(path)?.unwrap_or_default(),
+                None => Vec::new(),
+            })
+        };
+        let body = part(&mut self.body)?;
+        let full = part(&mut self.full)?;
+        Texture::from_parts(header, &body, &full).with_context(|| path.to_string())
+    }
+}
+
 impl Texture {
     pub fn from_parts(header: TextureHeader, body: &[u8], full: &[u8]) -> Result<Self> {
         if header.common.kind == KIND_ARRAY || header.common.kind == KIND_CUBEMAP {
@@ -255,17 +294,7 @@ impl Texture {
 
     /// Loads a texture by path from a `Cache.Windows` folder.
     pub fn load(dir: &Path, path: &str) -> Result<Self> {
-        let read = |name: &str| -> Result<Option<Vec<u8>>> {
-            match Package::open_in(dir, name)? {
-                Some(mut pkg) => pkg.read_path(path),
-                None => Ok(None),
-            }
-        };
-        let h = read("H.Texture")?.with_context(|| format!("{path} is not in H.Texture"))?;
-        let header = TextureHeader::parse(&h)?;
-        let body = read("B.Texture")?.unwrap_or_default();
-        let full = read("F.Texture")?.unwrap_or_default();
-        Texture::from_parts(header, &body, &full).with_context(|| path.to_string())
+        TexturePackages::open(dir)?.load(path)
     }
 
     /// A DDS file with every mip level. Block-compressed formats up to BC5
@@ -364,7 +393,12 @@ impl Texture {
                 for p in &row[..w] {
                     // The decoder yields BGRA in little-endian order
                     let [b, g, r, a] = p.to_le_bytes();
-                    rgba.extend_from_slice(&[r, g, b, a]);
+                    if self.format == Format::Bc4 {
+                        // One channel: show it as grey
+                        rgba.extend_from_slice(&[r, r, r, 255]);
+                    } else {
+                        rgba.extend_from_slice(&[r, g, b, a]);
+                    }
                 }
             }
             return Ok(rgba);

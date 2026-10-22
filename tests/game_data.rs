@@ -79,3 +79,35 @@ fn static_model_with_body_and_full_parts() {
         .iter()
         .all(|v| (v.normal.iter().map(|c| c * c).sum::<f32>() - 1.0).abs() < 1e-3));
 }
+
+#[test]
+fn galatine_material_resolves_to_its_textures() {
+    use wf_unpack::cache::Package;
+    use wf_unpack::material::{Material, Plan, Source};
+    use wf_unpack::packages::PackagesBin;
+    let Some(dir) = game_dir() else { return };
+    let mut misc = Package::open(&dir.join("H.Misc.toc")).unwrap();
+    let bin = PackagesBin::parse(&misc.read_path("/Packages.bin").unwrap().unwrap()).unwrap();
+    let mut texts = bin.texts().unwrap();
+    let folder = "/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/";
+    let m = Material::resolve(&bin, &mut texts, &format!("{folder}PrimeGalatinePBR"), "").unwrap();
+    assert_eq!(bin.parent(&m.path), Some("/EE/Materials/Defaults/PBR"));
+    let plan = Plan::new(&m, |_| true);
+    let pack = format!("{folder}PrimeGalatinePackMap");
+    assert_eq!(plan.albedo, Source::Channel(pack.clone(), 1));
+    assert_eq!(plan.roughness, Source::Channel(pack.clone(), 2));
+    assert_eq!(plan.metalness, Source::Channel(pack, 0));
+    assert_eq!(
+        plan.normal.as_deref(),
+        Some(&*format!("{folder}PrimeGalatine_n.png"))
+    );
+    assert_eq!(
+        plan.tint.as_ref().unwrap().0,
+        format!("{folder}PrimeGalatine_t.png")
+    );
+    assert_eq!(
+        plan.emissive.as_ref().unwrap().0,
+        format!("{folder}PrimeGalatine_e.png")
+    );
+    assert_eq!(plan.tint.as_ref().unwrap().1[3], [0.84, 0.56, 0.1, 0.5]);
+}
