@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use wf_unpack::cache::Package;
 use wf_unpack::gltf;
 use wf_unpack::header::CommonHeader;
-use wf_unpack::material::{self, Material, Plan, Source};
+use wf_unpack::material::{self, MaskLayout, Material, Plan, Source};
 use wf_unpack::model::{Model, ModelHeader, KIND_STATIC};
 use wf_unpack::packages::PackagesBin;
 use wf_unpack::packages::TextReader;
@@ -501,11 +501,29 @@ fn auto_materials(
             }
         };
         eprintln!(
-            "material {}: albedo {}, tint {}, roughness {}, metal {}, normal {}, emissive {}{}",
+            "material {}: albedo {}, tint {}, roughness {}, {} {}, normal {}, emissive {}{}",
             plan.name,
             describe(&plan.albedo),
-            plan.tint.as_ref().map_or("none".into(), |(t, _)| short(t)),
+            plan.tint.as_ref().map_or("none".into(), |t| format!(
+                "{}{}{}",
+                short(&t.mask),
+                if t.layout == MaskLayout::PackAlphaQuadrants {
+                    " (alpha quadrants)"
+                } else {
+                    ""
+                },
+                if t.default_colors {
+                    ", default palette"
+                } else {
+                    ""
+                }
+            )),
             describe(&plan.roughness),
+            if plan.specular_workflow {
+                "specular"
+            } else {
+                "metal"
+            },
             describe(&plan.metalness),
             plan.normal.as_deref().map_or("none".into(), short),
             plan.emissive
@@ -899,6 +917,39 @@ fn check_materials_cmd(game: &Path, survey: bool) -> Result<()> {
             };
             all_textured &= !matches!(plan.albedo, Source::Constant(_));
             note(format!("base colour: {base}"), &path);
+            note(
+                format!(
+                    "tint: {}",
+                    match &plan.tint {
+                        None => "none".to_string(),
+                        Some(t) => format!(
+                            "{}{}",
+                            if t.layout == MaskLayout::PackAlphaQuadrants {
+                                "pack map alpha quadrants"
+                            } else {
+                                "separate tint mask"
+                            },
+                            if t.default_colors {
+                                ", default palette"
+                            } else {
+                                ", material colours"
+                            }
+                        ),
+                    }
+                ),
+                &path,
+            );
+            note(
+                format!(
+                    "workflow: {}",
+                    if plan.specular_workflow {
+                        "specular"
+                    } else {
+                        "metalness"
+                    }
+                ),
+                &path,
+            );
             let tex = |s: &Source| !matches!(s, Source::Constant(_));
             note(
                 format!(

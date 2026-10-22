@@ -165,6 +165,26 @@ pub enum Source {
     Constant(f32),
 }
 
+/// Where the four tint mask layers are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskLayout {
+    /// A `_t` texture: layers in R, G, B, A.
+    Channels,
+    /// `DETAILING=TINT_MASK_PACK_MAP`: the pack map's alpha holds the four
+    /// layers as a 2x2 grid of half-size copies, R top-left, G top-right,
+    /// B bottom-left, A bottom-right.
+    PackAlphaQuadrants,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tint {
+    pub mask: String,
+    pub layout: MaskLayout,
+    pub colors: [[f32; 4]; 4],
+    /// True when the material sets no `PS:TintColor*` and [`DEFAULT_TINTS`] are used.
+    pub default_colors: bool,
+}
+
 /// How to turn a material into glTF PBR inputs (see the README for what is guessed).
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -173,9 +193,12 @@ pub struct Plan {
     pub albedo: Source,
     pub diffuse_color: [f32; 4],
     /// Tint mask (R, G, B, A layered bottom to top) and the four colours.
-    pub tint: Option<(String, [[f32; 4]; 4])>,
+    pub tint: Option<Tint>,
     pub roughness: Source,
+    /// Metal mask, or specular level when `specular_workflow` is set.
     pub metalness: Source,
+    /// `SPECULARMAP_IS_METALMAP=0`: the metal source holds specular intensity.
+    pub specular_workflow: bool,
     pub normal: Option<String>,
     /// Emissive texture, whether only its red channel is used, and its colour.
     pub emissive: Option<(String, bool, [f32; 3])>,
@@ -192,9 +215,11 @@ impl Plan {
             .then(|| tex("PackMap"))
             .flatten();
         let roughness_const = m.float("PS:Roughness").unwrap_or(0.5);
-        // Pack map channels, worked out from the content: R = metal mask, G = grey albedo
-        // (0.99 correlation with the luminance of a diffuse map made for the same mesh),
-        // B = roughness. Separate maps win where the material enables them.
+        // Pack map channels, worked out from the content: R = metal mask (specular level
+        // when SPECULARMAP_IS_METALMAP=0), G = grey albedo (0.99 correlation with the
+        // luminance of a diffuse map made for the same mesh), B = roughness, A = tint
+        // mask quadrants for TINT_MASK_PACK_MAP. Separate maps win where enabled.
+        let specular_workflow = !m.flag("SPECULARMAP_IS_METALMAP");
         let from_pack = |c: usize| packmap.clone().map(|p| Source::Channel(p, c));
         let mut albedo = m
             .flag("DIFFUSE_MAP")
@@ -210,7 +235,8 @@ impl Plan {
             .map(|t| Source::Channel(t, 0))
             .or_else(|| from_pack(2))
             .unwrap_or(Source::Constant(roughness_const));
-        let metalness = (m.flag("SPECULAR_MAP") && m.flag("SPECULARMAP_IS_METALMAP"))
+        let metalness = m
+            .flag("SPECULAR_MAP")
             .then(|| tex("SpecularMap"))
             .flatten()
             .map(|t| Source::Channel(t, 0))
@@ -229,14 +255,28 @@ impl Plan {
                 unsupported.push("layer blending (first layer only)".into());
             }
         }
+        let default_colors = (0..4).all(|i| m.color(&format!("PS:TintColor{i}")).is_none());
+        let colors = std::array::from_fn(|i| {
+            m.color(&format!("PS:TintColor{i}"))
+                .unwrap_or(DEFAULT_TINTS[i])
+        });
+        let tint_from = |mask: Option<String>, layout| {
+            mask.map(|mask| Tint {
+                mask,
+                layout,
+                colors,
+                default_colors,
+            })
+        };
         let tint = match m.get("DETAILING") {
-            Some("TINT_MASK") => tex("TintMask").map(|t| {
-                let colors = std::array::from_fn(|i| {
-                    m.color(&format!("PS:TintColor{i}"))
-                        .unwrap_or(DEFAULT_TINTS[i])
-                });
-                (t, colors)
-            }),
+            Some("TINT_MASK") => tint_from(tex("TintMask"), MaskLayout::Channels),
+            Some("TINT_MASK_PACK_MAP" | "TINT_MASK_PACK_MAP_BLEND") => {
+                let tint = tint_from(packmap.clone(), MaskLayout::PackAlphaQuadrants);
+                if m.get("DETAILING") == Some("TINT_MASK_PACK_MAP_BLEND") {
+                    unsupported.push("DETAILING=TINT_MASK_PACK_MAP_BLEND (blend part)".into());
+                }
+                tint
+            }
             Some(other) if other != "NONE" => {
                 unsupported.push(format!("DETAILING={other}"));
                 None
@@ -264,6 +304,7 @@ impl Plan {
             tint,
             roughness,
             metalness,
+            specular_workflow,
             normal,
             emissive,
             unsupported,
@@ -351,14 +392,42 @@ mod plan_tests {
         assert_eq!(plan.roughness, Source::Channel("/Lotus/W/P".into(), 2));
         assert_eq!(plan.metalness, Source::Channel("/Lotus/W/P".into(), 0));
         assert_eq!(plan.normal.as_deref(), Some("/Lotus/W/N.png"));
-        let (mask, colors) = plan.tint.unwrap();
-        assert_eq!(mask, "/Lotus/W/T.png");
-        assert_eq!(colors[0], [1.0, 0.0, 0.0, 0.5]);
-        assert_eq!(colors[3], DEFAULT_TINTS[3]);
+        let tint = plan.tint.unwrap();
+        assert_eq!(
+            (tint.mask.as_str(), tint.layout),
+            ("/Lotus/W/T.png", MaskLayout::Channels)
+        );
+        assert_eq!(tint.colors[0], [1.0, 0.0, 0.0, 0.5]);
+        assert_eq!(tint.colors[3], DEFAULT_TINTS[3]);
+        assert!(!tint.default_colors);
+        // No SPECULARMAP_IS_METALMAP=1: R holds specular level
+        assert!(plan.specular_workflow);
         assert_eq!(
             plan.emissive,
             Some(("/Lotus/W/E.png".into(), true, [0.0, 0.5, 1.0]))
         );
+    }
+
+    #[test]
+    fn tint_mask_in_pack_map() {
+        let m = material(&[
+            ("PACKMAP", "PACK_MAP"),
+            ("TX:PackMap", "P"),
+            ("DETAILING", "TINT_MASK_PACK_MAP"),
+            ("SPECULARMAP_IS_METALMAP", "1"),
+        ]);
+        let plan = Plan::new(&m, |_| true);
+        let tint = plan.tint.unwrap();
+        assert_eq!(
+            (tint.mask.as_str(), tint.layout),
+            ("/Lotus/W/P", MaskLayout::PackAlphaQuadrants)
+        );
+        assert!(tint.default_colors);
+        assert_eq!(tint.colors, DEFAULT_TINTS);
+        assert!(plan.unsupported.is_empty());
+        // Without a pack map there is no mask
+        let m = material(&[("DETAILING", "TINT_MASK_PACK_MAP")]);
+        assert!(Plan::new(&m, |_| true).tint.is_none());
     }
 
     #[test]
@@ -385,13 +454,14 @@ mod plan_tests {
             ("SPECULAR_MAP", "1"),
             ("SPECULARMAP_IS_METALMAP", "1"),
             ("TX:SpecularMap", "S.png"),
-            ("DETAILING", "TINT_MASK_PACK_MAP"),
+            ("DETAILING", "TINT_COLOR"),
             ("PS:Roughness", "0.3"),
         ]);
         let plan = Plan::new(&m, |_| true);
         assert_eq!(plan.albedo, Source::Rgb("/Lotus/W/D.png".into()));
         assert_eq!(plan.metalness, Source::Channel("/Lotus/W/S.png".into(), 0));
-        assert_eq!(plan.unsupported, ["DETAILING=TINT_MASK_PACK_MAP"]);
+        assert!(!plan.specular_workflow);
+        assert_eq!(plan.unsupported, ["DETAILING=TINT_COLOR"]);
         // Textures that are not in the game fall back to constants
         let plan = Plan::new(&m, |t| t.ends_with("D.png"));
         assert_eq!(plan.roughness, Source::Constant(0.3));

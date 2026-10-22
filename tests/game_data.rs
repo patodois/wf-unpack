@@ -102,12 +102,44 @@ fn galatine_material_resolves_to_its_textures() {
         Some(&*format!("{folder}PrimeGalatine_n.png"))
     );
     assert_eq!(
-        plan.tint.as_ref().unwrap().0,
+        plan.tint.as_ref().unwrap().mask,
         format!("{folder}PrimeGalatine_t.png")
     );
     assert_eq!(
         plan.emissive.as_ref().unwrap().0,
         format!("{folder}PrimeGalatine_e.png")
     );
-    assert_eq!(plan.tint.as_ref().unwrap().1[3], [0.84, 0.56, 0.1, 0.5]);
+    assert_eq!(
+        plan.tint.as_ref().unwrap().colors[3],
+        [0.84, 0.56, 0.1, 0.5]
+    );
+}
+
+#[test]
+fn tint_mask_pack_map_material_resolves_its_mask() {
+    use wf_unpack::cache::Package;
+    use wf_unpack::header::CommonHeader;
+    use wf_unpack::material::{MaskLayout, Material, Plan};
+    use wf_unpack::packages::PackagesBin;
+    let Some(dir) = game_dir() else { return };
+    let mut misc = Package::open(&dir.join("H.Misc.toc")).unwrap();
+    let bin = PackagesBin::parse(&misc.read_path("/Packages.bin").unwrap().unwrap()).unwrap();
+    let mut texts = bin.texts().unwrap();
+    let path = "/Lotus/Weapons/Tenno/Pistols/PrimeSicarus/PrimeSicarusPBR";
+    // This material keeps its properties in its H.Misc attribute text
+    let own = CommonHeader::parse(&misc.read_path(path).unwrap().unwrap())
+        .unwrap()
+        .attributes;
+    let m = Material::resolve(&bin, &mut texts, path, &own).unwrap();
+    assert_eq!(m.get("DETAILING"), Some("TINT_MASK_PACK_MAP"));
+    let plan = Plan::new(&m, |_| true);
+    let tint = plan.tint.expect("tint mask");
+    assert_eq!(
+        tint.mask,
+        "/Lotus/Weapons/Tenno/Pistols/PrimeSicarus/PrimeSicarusPackMap"
+    );
+    assert_eq!(tint.layout, MaskLayout::PackAlphaQuadrants);
+    assert!(!tint.default_colors);
+    assert_eq!(tint.colors[3], [0.84, 0.56, 0.1, 0.5]);
+    assert!(plan.unsupported.is_empty());
 }

@@ -13,7 +13,7 @@
 
 use anyhow::{ensure, Result};
 
-use crate::material::{Plan, Source};
+use crate::material::{MaskLayout, Plan, Source};
 use crate::texture::{Texture, TexturePackages};
 
 /// An 8-bit RGBA image.
@@ -104,6 +104,31 @@ pub fn layered_tint(mask: [u8; 4], tints: &[[f32; 3]; 4]) -> [f32; 3] {
     t
 }
 
+/// The four tint layer weights at pixel (x, y) of a `w` x `h` output.
+pub fn mask_at(mask: &Image, layout: MaskLayout, x: u32, y: u32, w: u32, h: u32) -> [u8; 4] {
+    match layout {
+        MaskLayout::Channels => mask.sample(x, y, w, h),
+        MaskLayout::PackAlphaQuadrants => {
+            let (hw, hh) = ((mask.width / 2).max(1), (mask.height / 2).max(1));
+            let qx = (u64::from(x) * u64::from(hw) / u64::from(w)) as u32;
+            let qy = (u64::from(y) * u64::from(hh) / u64::from(h)) as u32;
+            std::array::from_fn(|c| {
+                let (ox, oy) = ((c as u32 % 2) * hw, (c as u32 / 2) * hh);
+                let (sx, sy) = (
+                    (ox + qx).min(mask.width - 1),
+                    (oy + qy).min(mask.height - 1),
+                );
+                mask.rgba[(sy as usize * mask.width as usize + sx as usize) * 4 + 3]
+            })
+        }
+    }
+}
+
+/// Metalness from a specular level (sRGB 0..1): dielectrics sit near 4 % reflectance.
+pub fn metal_from_specular(spec: f32) -> f32 {
+    ((srgb_to_linear(spec) - 0.04) / 0.96).clamp(0.0, 1.0)
+}
+
 /// Converts a DirectX-style normal map pixel (green down) to glTF's convention.
 pub fn convert_normal(px: [u8; 4]) -> [u8; 4] {
     let x = f32::from(px[0]) / 255.0 * 2.0 - 1.0;
@@ -171,55 +196,82 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
         cache: Vec::new(),
     };
 
-    // Base colour
+    // Base colour and metallic-roughness
     let albedo = loader.source(&plan.albedo)?;
     let tint = match &plan.tint {
-        Some((path, colors)) => Some((
-            loader.get(path)?,
-            colors.map(|c| [0, 1, 2].map(|k| srgb_to_linear(c[k]))),
+        Some(t) => Some((
+            loader.get(&t.mask)?,
+            t.layout,
+            t.colors.map(|c| [0, 1, 2].map(|k| srgb_to_linear(c[k]))),
         )),
         None => None,
     };
-    let diffuse_lin = [0, 1, 2].map(|k| srgb_to_linear(plan.diffuse_color[k]));
-    let (base_color, base_color_factor) =
-        match largest([albedo.as_ref(), tint.as_ref().map(|t| &t.0)]) {
-            None => (
-                None,
-                [
-                    plan.diffuse_color[0],
-                    plan.diffuse_color[1],
-                    plan.diffuse_color[2],
-                    1.0,
-                ],
-            ),
-            Some((w, h)) => {
-                let mut out = Image::new(w, h);
-                for y in 0..h {
-                    for x in 0..w {
-                        let a_lin = match (&plan.albedo, &albedo) {
-                            (Source::Rgb(_), Some(i)) => {
-                                let p = i.sample(x, y, w, h);
-                                [0, 1, 2].map(|k| srgb_to_linear(f32::from(p[k]) / 255.0))
-                            }
-                            (Source::Channel(_, c), Some(i)) => {
-                                [srgb_to_linear(f32::from(i.sample(x, y, w, h)[*c]) / 255.0); 3]
-                            }
-                            _ => diffuse_lin,
-                        };
-                        let t = tint.as_ref().map_or([1.0; 3], |(mask, colors)| {
-                            layered_tint(mask.sample(x, y, w, h), colors)
-                        });
-                        let c = [0, 1, 2].map(|k| to_u8(linear_to_srgb(a_lin[k] * t[k])));
-                        out.put(x, y, [c[0], c[1], c[2], 255]);
-                    }
-                }
-                (Some(out), [1.0; 4])
-            }
-        };
-
-    // Metallic-roughness
     let rough_img = loader.source(&plan.roughness)?;
     let metal_img = loader.source(&plan.metalness)?;
+    let metal_at = |x: u32, y: u32, w: u32, h: u32| -> f32 {
+        let v = read(&plan.metalness, metal_img.as_ref(), x, y, w, h);
+        if plan.specular_workflow && !matches!(plan.metalness, Source::Constant(_)) {
+            metal_from_specular(v)
+        } else {
+            v
+        }
+    };
+    let diffuse_lin = [0, 1, 2].map(|k| srgb_to_linear(plan.diffuse_color[k]));
+    // In the specular workflow metals take their colour from the specular map
+    let spec_tints_base = plan.specular_workflow && metal_img.is_some();
+    let base_inputs = [
+        albedo.as_ref(),
+        tint.as_ref().map(|t| &t.0),
+        if spec_tints_base {
+            metal_img.as_ref()
+        } else {
+            None
+        },
+    ];
+    let (base_color, base_color_factor) = match largest(base_inputs) {
+        None => (
+            None,
+            [
+                plan.diffuse_color[0],
+                plan.diffuse_color[1],
+                plan.diffuse_color[2],
+                1.0,
+            ],
+        ),
+        Some((w, h)) => {
+            let mut out = Image::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let a_lin = match (&plan.albedo, &albedo) {
+                        (Source::Rgb(_), Some(i)) => {
+                            let p = i.sample(x, y, w, h);
+                            [0, 1, 2].map(|k| srgb_to_linear(f32::from(p[k]) / 255.0))
+                        }
+                        (Source::Channel(_, c), Some(i)) => {
+                            [srgb_to_linear(f32::from(i.sample(x, y, w, h)[*c]) / 255.0); 3]
+                        }
+                        _ => diffuse_lin,
+                    };
+                    let t = tint.as_ref().map_or([1.0; 3], |(mask, layout, colors)| {
+                        layered_tint(mask_at(mask, *layout, x, y, w, h), colors)
+                    });
+                    let mut c_lin = [0, 1, 2].map(|k| a_lin[k] * t[k]);
+                    if spec_tints_base {
+                        let s =
+                            srgb_to_linear(read(&plan.metalness, metal_img.as_ref(), x, y, w, h));
+                        let m = metal_at(x, y, w, h);
+                        for k in 0..3 {
+                            c_lin[k] += (s * t[k] - c_lin[k]) * m;
+                        }
+                    }
+                    let c = c_lin.map(|v| to_u8(linear_to_srgb(v)));
+                    out.put(x, y, [c[0], c[1], c[2], 255]);
+                }
+            }
+            (Some(out), [1.0; 4])
+        }
+    };
+
     let (metallic_roughness, metallic_factor, roughness_factor) =
         match largest([rough_img.as_ref(), metal_img.as_ref()]) {
             None => (
@@ -232,8 +284,7 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
                 for y in 0..h {
                     for x in 0..w {
                         let r = read(&plan.roughness, rough_img.as_ref(), x, y, w, h);
-                        let m = read(&plan.metalness, metal_img.as_ref(), x, y, w, h);
-                        out.put(x, y, [255, to_u8(r), to_u8(m), 255]);
+                        out.put(x, y, [255, to_u8(r), to_u8(metal_at(x, y, w, h)), 255]);
                     }
                 }
                 (Some(out), 1.0, 1.0)
@@ -314,6 +365,52 @@ mod tests {
         assert!(n[2] >= 254);
         // DirectX green down (0) becomes glTF green up (255)
         assert_eq!(convert_normal([128, 0, 0, 0])[1], 255);
+    }
+
+    #[test]
+    fn tint_mask_from_pack_alpha_quadrants() {
+        // 4x4 pack map: alpha quadrants (2x2 each) hold R=255 (top-left), G=0 (top-right),
+        // B=255 only in the bottom-right pixel of its quadrant, A=128 (bottom-right)
+        let mut pack = Image::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let a = match (x / 2, y / 2) {
+                    (0, 0) => 255,
+                    (1, 0) => 0,
+                    (0, 1) => {
+                        if (x, y) == (1, 3) {
+                            255
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 128,
+                };
+                pack.put(x, y, [9, 9, 9, a]);
+            }
+        }
+        // A 2x2 output maps each output pixel to one pixel per quadrant
+        assert_eq!(
+            mask_at(&pack, MaskLayout::PackAlphaQuadrants, 0, 0, 2, 2),
+            [255, 0, 0, 128]
+        );
+        assert_eq!(
+            mask_at(&pack, MaskLayout::PackAlphaQuadrants, 1, 1, 2, 2),
+            [255, 0, 255, 128]
+        );
+        // The plain layout just reads the pixel
+        assert_eq!(
+            mask_at(&pack, MaskLayout::Channels, 3, 3, 4, 4),
+            [9, 9, 9, 128]
+        );
+    }
+
+    #[test]
+    fn specular_to_metal() {
+        assert_eq!(metal_from_specular(10.0 / 255.0), 0.0);
+        assert!(metal_from_specular(1.0) > 0.99);
+        let mid = metal_from_specular(0.7);
+        assert!(mid > 0.4 && mid < 0.5);
     }
 
     #[test]

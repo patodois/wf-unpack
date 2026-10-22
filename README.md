@@ -151,38 +151,62 @@ the result into glTF metallic-roughness textures:
 | Game input | glTF | Status |
 |---|---|---|
 | `TX:DiffuseMap` (when `DIFFUSE_MAP=1`) | base colour | known |
-| `TX:PackMap` R | metalness | guessed: binary mask that follows gold accents |
+| `TX:PackMap` R | metalness; with `SPECULARMAP_IS_METALMAP=0` a specular level instead | metal mask guessed (binary, follows gold accents); specular reading guessed from the packing note below |
 | `TX:PackMap` G | base colour (grey) when there is no diffuse map | measured: 0.99 correlation with a diffuse map's luminance |
 | `TX:PackMap` B | roughness | guessed: lower on metal, ~0.9 on painted wood |
-| `TX:RoughnessMap`, `TX:SpecularMap` (metal when `SPECULARMAP_IS_METALMAP=1`) | roughness, metalness | used when enabled |
+| `TX:PackMap` A with `DETAILING=TINT_MASK_PACK_MAP` | tint mask | measured: a 2x2 grid of half-size masks, R top-left, G top-right, B bottom-left, A bottom-right |
+| `TX:RoughnessMap`, `TX:SpecularMap` | roughness, metalness or specular level | used when enabled |
 | `TX:TintMask` RGBA with `PS:TintColor0..3` | multiplies the base colour | layering from Warframe's texturing guide (R bottom, then G, B, A on top); blending in linear space is a guess |
 | `TX:NormalMap` | normal | measured: green points down (DirectX), inverted for glTF; blue rebuilt |
 | `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | colour is `PS:EmissiveTintColorHi`; brightness (`EmissiveMapAtten`) ignored |
 
+Each pack map's own `H.Texture` attribute text names the source images it
+was built from (`Diffuse=`, `Roughness=`, `Specular=`, and for
+`TINT_MASK_PACK_MAP` materials also `TintMask=`). For 519 pack maps the named
+tint mask ships too. I compared 26 of them: in the 19 with a non-trivial mask,
+the four alpha quadrants match the tint mask's R, G, B and A channels for
+93-100 % of the pixels after thresholding. (Most of the other seven are blank
+masks; one was built from a different version of the mask.)
+
+With `SPECULARMAP_IS_METALMAP=0` (15,340 slots, e.g. Mag's materials and
+the Prime Braton that inherits from them), R reads as specular level: mostly
+dark with bright metal parts, while G holds the diffuse colour, dark on
+metals. The export turns the specular level into metalness as
+`(linear(s) - 0.04) / 0.96`, and blends the base colour towards the tinted
+specular colour on metal (the materials set `TINT_MASK_AFFECTS_SPECULAR=1`).
+This conversion is an approximation.
+
 Tint colours are the material's own `PS:TintColor0..3` (its default player
-colours), or a neutral grey/gold palette when it sets none. The green-down
-normal convention comes from a curl test: the normal maps are integrable only
-with green pointing down. The tangent's w is set so glTF's bitangent points to
-the top of the texture; it was checked against the UV derivatives of every
+colours). Every tinted material slot in the game sets them, so the neutral
+grey/gold fallback palette is never used for these. The green-down normal
+convention comes from a curl test: the normal maps are integrable only with
+green pointing down. The tangent's w is set so glTF's bitangent points to the
+top of the texture; it was checked against the UV derivatives of every
 triangle.
 
 `check-materials` over the 49,410 material slots of the 33,689 static
 models:
 
 - Base colour: 21,720 from a diffuse texture, 11,472 from a pack map's grey
-  channel (684 of them tinted by a tint mask), 16,040 constant colour.
-- 22,907 get a metallic-roughness texture; 30,883 a normal map; 8,671 an
+  channel, 16,040 constant colour.
+- Tint: 11,744 from pack-map alpha quadrants, 1,386 from a separate tint
+  mask, 36,102 none.
+- Workflow: 33,892 metalness, 15,340 specular.
+- 22,948 get a metallic-roughness texture; 30,883 a normal map; 8,671 an
   emissive map.
 - Failures: 178 materials missing from Packages.bin, and 4,626 models with no
   `Materials=` list (mostly particle-emitter meshes).
 
 Not reproduced (counted per slot by `check-materials`):
 
-- `DETAILING=TINT_MASK_PACK_MAP` (11,879, most weapons and characters). Its
-  tint mask lives inside the pack map somehow; these come out untinted grey.
+- The extra blend of `TINT_MASK_PACK_MAP_BLEND` (927; tinted like
+  `TINT_MASK_PACK_MAP` otherwise) and `TINT_MASK_PACKMAP` (170).
 - Vertex-colour tinting and layer blending (`VERTEX_*_TINT_STACK`, `LAYERS=`):
   only the first layer is used.
 - `TINT_COLOR`/`TINT_CHANNELS` and other rarer `DETAILING` modes.
+- The newer character-detail materials (`/EE/Materials/Defaults/CharacterPBRDetail`,
+  e.g. the 2025 Skana and Lato): they use `TX:MacroPackMap`, `TX:DetailMask`
+  and per-layer normal maps, and come out as constants for now.
 - Opacity maps, detail maps, ambient-occlusion maps and vertex AO.
 - Weapon skins and other material overrides outside the model's own list.
 
