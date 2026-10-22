@@ -19,6 +19,10 @@
 //! Directories are numbered in the order they appear, starting at 1 (0 is
 //! the implicit root), so a full path is built by following `parent` back to
 //! the root. Paths use `/` and start with one, e.g. `/Lotus/Interface/Foo.png`.
+//!
+//! A path can appear more than once (seven times in `H.Misc`, e.g.
+//! `/Packages.bin`); the later entry is the live one and the earlier has a
+//! zero time. [`Toc::get`] returns the later one.
 
 use std::collections::HashMap;
 

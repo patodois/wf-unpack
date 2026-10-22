@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use wf_unpack::cache::Package;
+use wf_unpack::gltf;
 use wf_unpack::header::CommonHeader;
+use wf_unpack::model::{Model, ModelHeader, KIND_STATIC};
 use wf_unpack::texture::{Texture, TextureHeader};
 use wf_unpack::toc::glob_match;
 
@@ -54,6 +56,28 @@ enum Command {
     },
     /// Count the asset types in an H. package (by the common header), with an example path for each
     Kinds { toc: PathBuf },
+    /// Read a static model; print its layout, and export it to glTF with -o
+    Model {
+        /// Path inside the packages, e.g. /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx
+        path: String,
+        /// Output directory for <name>.gltf + <name>.bin
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Level of detail, 0 (finest) to 4
+        #[arg(long, default_value_t = 0)]
+        lod: usize,
+        /// Attach a game texture to every mesh, as base=PATH, normal=PATH or emissive=PATH
+        /// (materials are not resolved automatically yet)
+        #[arg(long = "texture")]
+        textures: Vec<String>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Parse every static model (type 102) in H.Misc with its B./F. parts and summarise failures
+    CheckModels {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -78,6 +102,14 @@ fn main() -> Result<()> {
         Command::Check { dir, only } => check(&dir, only.as_deref()),
         Command::Texture { path, out, game } => texture_cmd(&expand_home(&game), &path, &out),
         Command::Kinds { toc } => kinds_cmd(&toc),
+        Command::CheckModels { game } => check_models_cmd(&expand_home(&game)),
+        Command::Model {
+            path,
+            out,
+            lod,
+            textures,
+            game,
+        } => model_cmd(&expand_home(&game), &path, out.as_deref(), lod, &textures),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
 }
@@ -322,5 +354,218 @@ fn kinds_cmd(path: &Path) -> Result<()> {
         println!("{kind:>5} {n:>7}  e.g. {example}");
     }
     println!("{failed} entries without a readable common header");
+    Ok(())
+}
+
+/// Share of triangles whose winding agrees with their vertex normals.
+fn winding_agreement(model: &Model, tris: &[u32]) -> f64 {
+    let (mut agree, mut total) = (0usize, 0usize);
+    for t in tris.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|i| model.vertices[i as usize]);
+        let e1: [f32; 3] = std::array::from_fn(|k| b.position[k] - a.position[k]);
+        let e2: [f32; 3] = std::array::from_fn(|k| c.position[k] - a.position[k]);
+        let face = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let n: [f32; 3] = std::array::from_fn(|k| a.normal[k] + b.normal[k] + c.normal[k]);
+        let dot = face[0] * n[0] + face[1] * n[1] + face[2] * n[2];
+        if dot != 0.0 {
+            total += 1;
+            agree += usize::from(dot > 0.0);
+        }
+    }
+    agree as f64 / total.max(1) as f64
+}
+
+fn model_cmd(
+    game: &Path,
+    path: &str,
+    out: Option<&Path>,
+    lod: usize,
+    textures: &[String],
+) -> Result<()> {
+    let read = |name: &str| -> Result<Vec<u8>> {
+        Ok(match Package::open_in(game, name)? {
+            Some(mut pkg) => pkg.read_path(path)?.unwrap_or_default(),
+            None => Vec::new(),
+        })
+    };
+    let raw = read("H.Misc")?;
+    anyhow::ensure!(!raw.is_empty(), "{path} is not in H.Misc");
+    let header = ModelHeader::parse(&raw)?;
+    let (body, full) = (read("B.Misc")?, read("F.Misc")?);
+    eprintln!(
+        "header: {} vertices, {} indices, {} morphs, {} bones, {} PhysX shapes {:?}; parts: B. {} bytes, F. {} bytes",
+        header.vertex_count,
+        header.index_count,
+        header.morph_count,
+        header.bone_count,
+        header.physx_lens.len(),
+        header.physx_lens,
+        body.len(),
+        full.len()
+    );
+    let model = Model::from_parts(header, &body, &full)?;
+    let h = &model.header;
+    println!(
+        "{path}: {} vertices ({} in B.), {} indices ({} in B.), scale {:?}",
+        h.vertex_count,
+        h.body_vertex_count,
+        h.index_count,
+        h.body_index_count,
+        h.scale()
+    );
+    let (lo, hi) = model.bounds();
+    println!(
+        "bounds: header {:?}..{:?}, decoded {lo:?}..{hi:?}",
+        &h.bounds_min[..3],
+        &h.bounds_max[..3]
+    );
+    println!("materials: {:?}", h.materials());
+    for (i, m) in h.meshes.iter().enumerate() {
+        let tris = model.lod_indices(i, 0)?;
+        println!(
+            "mesh {i} {:?}: LOD triangles {:?}, LOD0 winding agrees with normals for {:.1}%",
+            m.name,
+            m.lod_counts.map(|c| c / 3),
+            100.0 * winding_agreement(&model, tris)
+        );
+    }
+    let Some(out) = out else { return Ok(()) };
+    let name = Path::new(path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut images = Vec::new();
+    for spec in textures {
+        let (slot, tex_path) = spec
+            .split_once('=')
+            .with_context(|| format!("--texture {spec}: expected SLOT=PATH"))?;
+        let slot = match slot {
+            "base" => gltf::Slot::BaseColor,
+            "normal" => gltf::Slot::Normal,
+            "emissive" => gltf::Slot::Emissive,
+            _ => anyhow::bail!("unknown texture slot {slot} (base, normal or emissive)"),
+        };
+        let tex = Texture::load(game, tex_path)?;
+        let file = format!(
+            "{}.png",
+            Path::new(tex_path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        fs::create_dir_all(out)?;
+        fs::write(out.join(&file), tex.to_png()?)?;
+        images.push((slot, file));
+    }
+    let mut materials: Vec<gltf::Material> = h
+        .materials()
+        .into_iter()
+        .map(|name| gltf::Material {
+            name,
+            images: images.clone(),
+        })
+        .collect();
+    // One material per mesh, named after the attribute list when it has one
+    materials.resize_with(h.meshes.len(), || gltf::Material {
+        name: "material".into(),
+        images: images.clone(),
+    });
+    gltf::write(
+        &model,
+        &name,
+        &materials,
+        &gltf::Options {
+            lod,
+            mirror_z: true,
+        },
+        out,
+    )?;
+    let tris: usize = (0..h.meshes.len())
+        .map(|m| model.lod_indices(m, lod).map_or(0, |t| t.len() / 3))
+        .sum();
+    eprintln!(
+        "wrote {} with {tris} triangles (LOD {lod}) and {} vertices",
+        out.join(format!("{name}.gltf")).display(),
+        model.vertices.len()
+    );
+    Ok(())
+}
+
+fn check_models_cmd(game: &Path) -> Result<()> {
+    let started = Instant::now();
+    let open = |name: &str| -> Result<Package> {
+        let pkg = Package::open(&game.join(format!("{name}.toc")))?;
+        pkg.set_nocache();
+        Ok(pkg)
+    };
+    let (mut head, mut body, mut full) = (open("H.Misc")?, open("B.Misc")?, open("F.Misc")?);
+    // A path can appear twice in a .toc; the later entry is the live one
+    let mut entries: Vec<_> = head
+        .toc
+        .entries
+        .iter()
+        .filter(|e| std::ptr::eq(head.toc.get(&e.path).unwrap(), *e))
+        .cloned()
+        .collect();
+    let duplicates = head.toc.entries.len() - entries.len();
+    entries.sort_by_key(|e| e.offset);
+
+    let mut fbx_kinds: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let (mut ok, mut vertices, mut triangles) = (0usize, 0u64, 0u64);
+    for e in &entries {
+        let Ok(raw) = head.read(e) else { continue };
+        let Ok(common) = CommonHeader::parse(&raw) else {
+            continue;
+        };
+        if common.kind != KIND_STATIC {
+            if e.path.ends_with(".fbx") {
+                *fbx_kinds.entry(common.kind).or_default() += 1;
+            }
+            continue;
+        }
+        let result = ModelHeader::parse(&raw).and_then(|header| {
+            let b = body.read_path(&e.path)?.unwrap_or_default();
+            let f = full.read_path(&e.path)?.unwrap_or_default();
+            let model = Model::from_parts(header, &b, &f)?;
+            model.check_bounds()?;
+            Ok(model)
+        });
+        match result {
+            Ok(model) => {
+                ok += 1;
+                vertices += model.vertices.len() as u64;
+                triangles += (0..model.header.meshes.len())
+                    .map(|m| model.lod_indices(m, 0).map_or(0, |t| t.len() as u64 / 3))
+                    .sum::<u64>();
+            }
+            Err(err) => {
+                let key: String = format!("{err:#}")
+                    .chars()
+                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                    .collect();
+                errors.entry(key).or_default().push(e.path.clone());
+            }
+        }
+    }
+    let failed: usize = errors.values().map(Vec::len).sum();
+    println!(
+        "type {KIND_STATIC}: {ok}/{} ok, {failed} failed ({vertices} vertices, {triangles} LOD0 triangles) in {:.0}s; {duplicates} duplicate H.Misc paths skipped",
+        ok + failed,
+        started.elapsed().as_secs_f64()
+    );
+    for (msg, list) in &errors {
+        println!(
+            "  {:>6}  {msg}\n          e.g. {}",
+            list.len(),
+            list.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    println!("other .fbx types (not supported): {fbx_kinds:?}");
     Ok(())
 }

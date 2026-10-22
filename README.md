@@ -7,6 +7,8 @@ Evolution Engine) from your own install:
   LZF blocks)
 - textures, rebuilt from their `H.` / `B.` / `F.` parts and written as DDS
   (all mip levels) or PNG
+- static models (type 102: weapons, props, level pieces), exported to
+  glTF 2.0 with normals, tangents, both UV sets and every LOD
 
 This project contains no game code or game data. It only reads files from a
 copy of the game you already have installed.
@@ -35,6 +37,14 @@ wf-unpack check $C
 wf-unpack texture /Lotus/Interface/Icons/Miscellaneous/Kuva.png -o kuva.dds --game $C
 wf-unpack texture /Lotus/Interface/Icons/Miscellaneous/Kuva.png -o kuva.png --game $C
 
+# A static model: print its layout, or export it to glTF (+ .bin) with -o.
+# Materials are not resolved yet; --texture attaches a game texture by hand.
+wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx
+wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx -o out/ \
+    --texture base=/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine_t.png \
+    --texture normal=/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine_n.png
+wf-unpack check-models --game $C
+
 # Surveys: asset types in an H. package, texture headers vs. B./F. sizes
 wf-unpack kinds $C/H.Misc.toc
 wf-unpack textures --game $C
@@ -57,7 +67,8 @@ The module docs in `src/toc.rs`, `src/cache.rs`, `src/header.rs` and
 `src/texture.rs` describe the layouts. Starting points were the
 documentation and source of [LotusLib](https://github.com/Puxtril/LotusLib)
 and [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by
-Puxtril; no code was copied. Oodle streams are decoded with the pure-Rust
+Puxtril (including its model readers for the static model layout); no code
+was copied. Oodle streams are decoded with the pure-Rust
 [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
 with [texture2ddecoder](https://crates.io/crates/texture2ddecoder).
 
@@ -79,24 +90,47 @@ Not handled yet: texture arrays (type 166), cubemaps (177, the
 `_cmcross.hdr` files), volume textures (`_v`, type 174) and colour lookup tables
 (`.cube`, format code 33); models, levels, sounds and the rest of `Misc`.
 
-### Models (first look, not implemented)
+### Models
 
-- Models live in `H.Misc` / `B.Misc` / `F.Misc` under `.fbx` paths. The
-  common header's type selects the layout: 102/105/106/86/96 static, 99/105
-  and 103/109/112/113 level geometry, 159-170 terrain, 269-288 rigged,
-  289-317 "packed" (current characters and weapons; `kinds` on `H.Misc` finds
-  33,689 entries of type 102 and 9,057 of 281).
-- The `H.` part is a long, version-specific header: physics shapes, bone
-  names, vertex/face/bone/morph counts (also separate counts for what lives in
-  `B.`), a bone tree, mesh infos (material names, index ranges per LOD) and
-  PhysX meshes. Warframe-Exporter has one reader per type number, mostly
-  fixed-size skips between known fields.
-- The `B.` part starts with the PhysX mesh blobs, then inverse bind matrices
-  (3x4 floats per weighted bone), bone rest poses, and then vertices:
-  positions as four `i16` normalised by 32767 (scaled by two "ensmallening"
-  vectors from the header), then normals, tangents, two UV sets, AO, bone
-  indices and weights; indices follow. When `B.` has fewer vertices than the
-  header, the full-detail buffers are in `F.`.
+`src/model.rs` reads type 102, the static models (weapons, props, level
+pieces). `check-models` reads all 33,689 of them with their `B.`/`F.` parts:
+33,132 decode and pass the checks (header read to its last byte, part sizes
+exact, positions inside the header's bounding box); 548 have a non-zero morph
+count (mostly particle-emitter meshes) and carry extra data that is not
+understood; 9 more have a `B.` part of unexpected size.
+
+Beyond Warframe-Exporter's description of the layout, this version worked
+out:
+
+- Normals and tangents are 24-bit octahedral vectors (12 bits per
+  coordinate, big-endian across the three bytes); Warframe-Exporter does not
+  export normals. Against normals rebuilt from the triangles the decoded ones
+  average a cosine of 0.998; tangents come out perpendicular to them, and the
+  position's fourth i16 (+/-255) is the bitangent sign.
+- The space is left-handed: exported as stored, a sign's artwork comes out
+  mirrored relative to its texture. The glTF export negates z and swaps the
+  winding.
+- Models without an `F.` part leave the `B.` counts at zero; everything is
+  in `B.` then. An axis with a zero extent has every position at 0.
+
+Not handled yet:
+
+- Materials. A model names its materials (`Materials={...}` in the header
+  text), but the material entries in `H.Misc` list only shader sources; the
+  texture paths are in `/Packages.bin`. That file's current layout (version 46)
+  differs from LotusLib's description: about 200 unknown bytes before the
+  reference list, and the entity list is now grouped by folder
+  (`u32 len, folder, u8, u32 count`, then `name, 3 bytes, parent` per entity;
+  21,860 folders and 467,796 entities read cleanly to the end of the file).
+  The property text sits in a zstd blob with a dictionary (the dictionary's
+  magic number is at offset 327,162), but where each entity's frame starts is
+  not worked out. Until then `--texture` attaches textures by hand.
+- Skinned and other model types: 281 (9,057 rigged), 132/134 (animations
+  stored under `.fbx`), 105/109 (level geometry), 108 (HLOD), and the
+  morph data above. Warframe-Exporter's readers describe most of them.
+- Vertex colours (stored in separate `.vc` entries), the byte after the normal
+  (0 or 255), and what exactly the fourth vertex byte after the tangent holds
+  (probably ambient occlusion).
 
 ## Disclaimer
 

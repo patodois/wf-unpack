@@ -54,3 +54,28 @@ fn texture_with_body_and_full_parts() {
     assert_eq!(rgba[3], 0);
     assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 255));
 }
+
+#[test]
+fn static_model_with_body_and_full_parts() {
+    use wf_unpack::model::Model;
+    let Some(dir) = game_dir() else { return };
+    let model = Model::load(
+        &dir,
+        "/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx",
+    )
+    .unwrap();
+    assert_eq!(model.vertices.len(), 4138);
+    assert_eq!(model.indices.len(), 36393);
+    assert_eq!(model.header.meshes.len(), 1);
+    let lod_triangles: Vec<usize> = (0..5)
+        .map(|l| model.lod_indices(0, l).unwrap().len() / 3)
+        .collect();
+    assert_eq!(lod_triangles, [4112, 3084, 2262, 1645, 1028]);
+    assert_eq!(model.header.materials(), ["PrimeGalatinePBR"]);
+    model.check_bounds().unwrap();
+    // Unit normals
+    assert!(model
+        .vertices
+        .iter()
+        .all(|v| (v.normal.iter().map(|c| c * c).sum::<f32>() - 1.0).abs() < 1e-3));
+}

@@ -2,6 +2,8 @@
 
 pub mod bytes;
 pub mod cache;
+pub mod gltf;
 pub mod header;
+pub mod model;
 pub mod texture;
 pub mod toc;

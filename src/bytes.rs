@@ -62,6 +62,26 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn f32x4(&mut self) -> Result<[f32; 4]> {
+        Ok([self.f32()?, self.f32()?, self.f32()?, self.f32()?])
+    }
+
+    /// String prefixed with its u32 length, at most `max` bytes long.
+    pub fn str32(&mut self, max: usize) -> Result<String> {
+        let len = self.u32()? as usize;
+        if len > max {
+            bail!(
+                "string length {len} at {} is over the limit of {max}",
+                self.pos - 4
+            );
+        }
+        Ok(String::from_utf8_lossy(self.bytes(len)?).into_owned())
+    }
+
     /// NUL-terminated string.
     pub fn cstr(&mut self) -> Result<String> {
         let rest = &self.buf[self.pos..];
@@ -72,5 +92,33 @@ impl<'a> Reader<'a> {
         let s = String::from_utf8_lossy(&rest[..len]).into_owned();
         self.pos += len + 1;
         Ok(s)
+    }
+}
+
+/// Converts an IEEE 754 half-precision float.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1F);
+    let frac = f32::from(h & 0x3FF);
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 if frac == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halves() {
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
     }
 }

@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 oozextract = "0.5.5"
 png = "0.18.1"
+serde_json = { version = "1", features = ["preserve_order"] }
 texture2ddecoder = "0.1.2"
 
 # Oodle decoding is far too slow without optimisations; keep our own code debuggable
