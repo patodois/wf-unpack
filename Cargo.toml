@@ -1,0 +1,29 @@
+[package]
+name = "wf-unpack"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for Evolution Engine .toc/.cache packages (Warframe game data)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+oozextract = "0.5.5"
+png = "0.18.1"
+texture2ddecoder = "0.1.2"
+
+# Oodle decoding is far too slow without optimisations; keep our own code debuggable
+[profile.dev.package."*"]
+opt-level = 3
+# Dependency debug info is large and rarely needed
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"
+
+# oozextract 0.5.5 on crates.io lacks the fix for valid streams it rejected (lvlvllvlvllvlvl/oozextract#3);
+# use the fixed revision until a release is out (lvlvllvlvllvlvl/oozextract#5)
+[patch.crates-io]
+oozextract = { git = "https://github.com/lvlvllvlvllvlvl/oozextract", rev = "71ca5f5" }
