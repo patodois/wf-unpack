@@ -7,8 +7,10 @@ Evolution Engine) from your own install:
   LZF blocks)
 - textures, rebuilt from their `H.` / `B.` / `F.` parts and written as DDS
   (all mip levels) or PNG
-- static models (type 102: weapons, props, level pieces), exported to
-  glTF 2.0 with normals, tangents, both UV sets and every LOD
+- static models (type 102: weapons, props, level pieces) and skinned models
+  (type 281: Warframe bodies, helmets, rigged weapons), exported to glTF 2.0
+  with normals, tangents, both UV sets, materials and, for skinned models, the
+  skeleton, inverse bind matrices, joints and weights
 
 This project contains no game code or game data. It only reads files from a
 copy of the game you already have installed.
@@ -99,12 +101,37 @@ Not handled yet: texture arrays (type 166), cubemaps (177, the
 
 ### Models
 
-`src/model.rs` reads type 102, the static models (weapons, props, level
-pieces). `check-models` reads all 33,689 of them with their `B.`/`F.` parts:
-33,132 decode and pass the checks (header read to its last byte, part sizes
-exact, positions inside the header's bounding box); 548 have a non-zero morph
-count (mostly particle-emitter meshes) and carry extra data that is not
-understood; 9 more have a `B.` part of unexpected size.
+`src/model.rs` reads type 102 (static) and type 281 (skinned). `check-models`
+reads every model of both types with its `B.`/`F.` parts. A model passes when
+its header is read to the last byte, the part sizes are exact, the positions
+lie inside the header's bounding box and, for skinned models, every joint
+index is in range and the weights sum to 1.
+
+- **Type 102:** 33,132 of 33,689 pass. 548 have a non-zero morph count
+  (mostly particle-emitter meshes) and carry extra data that is not
+  understood; 9 more have a `B.` part of unexpected size.
+- **Type 281:** 9,013 of 9,057 pass; 44 have a `B.` part of unexpected size.
+
+Skinned models (type 281) differ from type 102 as follows. The module docs
+in `src/model.rs` and `read_skeleton` give the details.
+
+- The header lists the weighted bone names, then the bone tree (name, u16
+  parent, u16 unknown), and per mesh a bone map from the bone indices stored
+  in vertices to weighted bones. Its counts come in a different order
+  (indices, bones, vertices, morphs).
+- `B.` adds, between the PhysX shapes and the vertices, one 3x4 row-major
+  inverse bind matrix per weighted bone. Then comes the rest pose of every
+  bone: quaternion (x, y, z, w), translation, and 12 unknown bytes. Two u16
+  per bone twice and 8 bytes follow.
+- Vertices are 32 bytes: the 24 of type 102, then four u8 bone indices and a
+  u32 with three 10-bit weights; the fourth weight is what is left of 1.
+- The skeleton is inside each model; no separate rig asset is needed. In
+  8,544 of the 9,013 models the rest pose matches the inverse bind matrices
+  to within 1e-3 (3.6e-7 for Excalibur). In the other 469 the stored rest pose differs
+  from the bind pose, so the export places joints at their bind pose
+  (inverse of the inverse bind matrix). Weighted bones with no name take the
+  bone at their own index. Bones missing from the tree (attachments that ride
+  another model's skeleton) become root-level joints at their bind pose.
 
 Beyond Warframe-Exporter's description of the layout, this version worked
 out:
@@ -115,16 +142,19 @@ out:
   average a cosine of 0.998; tangents come out perpendicular to them, and the
   position's fourth i16 (+/-255) is the bitangent sign.
 - The space is left-handed: exported as stored, a sign's artwork comes out
-  mirrored relative to its texture. The glTF export negates z and swaps the
-  winding.
+  mirrored relative to its texture. The glTF export negates x (bones too:
+  translation x and the quaternion's y and z) and swaps the winding;
+  characters then face +z, glTF's front. A test pose confirms it: rotating
+  `GAME_L1_ARM1` moves the character's left arm.
 - Models without an `F.` part leave the `B.` counts at zero; everything is
   in `B.` then. An axis with a zero extent has every position at 0.
 
 Not handled yet:
 
-- Skinned and other model types: 281 (9,057 rigged), 132/134 (animations
-  stored under `.fbx`), 105/109 (level geometry), 108 (HLOD), and the
-  morph data above. Warframe-Exporter's readers describe most of them.
+- Other model types: 132/134 (animations stored under `.fbx`), 105/109
+  (level geometry), 108 (HLOD), the morph data above, and the newer packed
+  rigged types (289-317). Warframe-Exporter's readers describe most of them.
+- Animations.
 - Vertex colours (stored in separate `.vc` entries), the byte after the normal
   (0 or 255), and what exactly the fourth vertex byte after the tangent holds
   (probably ambient occlusion).
@@ -181,8 +211,9 @@ colours). Every tinted material slot in the game sets them, so the neutral
 grey/gold fallback palette is never used for these. The green-down normal
 convention comes from a curl test: the normal maps are integrable only with
 green pointing down. The tangent's w is set so glTF's bitangent points to the
-top of the texture; it was checked against the UV derivatives of every
-triangle.
+top of the texture. It is checked against the UV derivatives of every
+triangle (99.9-100 % agree). Versions before the skinned-model commit had
+this sign backwards.
 
 `check-materials` over the 49,410 material slots of the 33,689 static
 models:

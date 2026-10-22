@@ -45,8 +45,9 @@ impl Material {
 
 pub struct Options {
     pub lod: usize,
-    /// Negate z, turning the game's left-handed space into glTF's right-handed one.
-    pub mirror_z: bool,
+    /// Negate x, turning the game's left-handed space into glTF's right-handed one.
+    /// (Negating x rather than z keeps characters facing +z, glTF's front.)
+    pub mirror_x: bool,
 }
 
 fn normalize(v: [f32; 3]) -> [f32; 3] {
@@ -66,7 +67,7 @@ pub fn write(
     out_dir: &Path,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)?;
-    let z = if opts.mirror_z { -1.0 } else { 1.0 };
+    let mx = if opts.mirror_x { -1.0 } else { 1.0 };
 
     let mut bin: Vec<u8> = Vec::new();
     let mut views = Vec::new();
@@ -84,23 +85,32 @@ pub fn write(
     let positions: Vec<[f32; 3]> = model
         .vertices
         .iter()
-        .map(|v| [v.position[0], v.position[1], v.position[2] * z])
+        .map(|v| [v.position[0] * mx, v.position[1], v.position[2]])
         .collect();
     let normals: Vec<[f32; 3]> = model
         .vertices
         .iter()
-        .map(|v| normalize([v.normal[0], v.normal[1], v.normal[2] * z]))
+        .map(|v| normalize([v.normal[0] * mx, v.normal[1], v.normal[2]]))
         .collect();
     // glTF's bitangent is cross(normal, tangent) * w and must point to the top
     // of the texture (decreasing v). As stored, cross(normal, tangent) * w
-    // points the other way on every triangle checked, and mirroring flips it
-    // once more; hence the sign.
+    // points the other way; the mirror reverses the cross product, which puts
+    // it right. Checked against the UV derivatives of every triangle.
     let tangents: Vec<[f32; 4]> = model
         .vertices
         .iter()
         .map(|v| {
-            let [x, y, w] = normalize([v.tangent[0], v.tangent[1], v.tangent[2] * z]);
-            [x, y, w, -v.tangent[3]]
+            let [x, y, w] = normalize([v.tangent[0] * mx, v.tangent[1], v.tangent[2]]);
+            [
+                x,
+                y,
+                w,
+                if opts.mirror_x {
+                    v.tangent[3]
+                } else {
+                    -v.tangent[3]
+                },
+            ]
         })
         .collect();
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -143,6 +153,25 @@ pub fn write(
         json!({"bufferView": uv1_view, "componentType": 5126, "count": n, "type": "VEC2"}),
         json!({"bufferView": tan_view, "componentType": 5126, "count": n, "type": "VEC4"}),
     ];
+    let mut attributes =
+        json!({"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TEXCOORD_1": 3, "TANGENT": 4});
+    if model.skeleton.is_some() {
+        let joints: Vec<u8> = model
+            .vertices
+            .iter()
+            .flat_map(|v| v.joints)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let view = push_view(&mut bin, &joints, 34962);
+        accessors
+            .push(json!({"bufferView": view, "componentType": 5123, "count": n, "type": "VEC4"}));
+        attributes["JOINTS_0"] = json!(accessors.len() - 1);
+        let weights = floats(&mut model.vertices.iter().flat_map(|v| v.weights));
+        let view = push_view(&mut bin, &weights, 34962);
+        accessors
+            .push(json!({"bufferView": view, "componentType": 5126, "count": n, "type": "VEC4"}));
+        attributes["WEIGHTS_0"] = json!(accessors.len() - 1);
+    }
 
     let mut primitives = Vec::new();
     for mesh in 0..model.header.meshes.len() {
@@ -151,7 +180,7 @@ pub fn write(
             continue;
         }
         let mut idx: Vec<u32> = tris.to_vec();
-        if opts.mirror_z {
+        if opts.mirror_x {
             // Mirroring flips the winding; swap two corners to keep faces pointing out
             for t in idx.as_chunks_mut::<3>().0 {
                 t.swap(1, 2);
@@ -161,7 +190,7 @@ pub fn write(
         let view = push_view(&mut bin, &bytes, 34963);
         accessors.push(json!({"bufferView": view, "componentType": 5125, "count": idx.len(), "type": "SCALAR"}));
         let mut prim = json!({
-            "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TEXCOORD_1": 3, "TANGENT": 4},
+            "attributes": attributes,
             "indices": accessors.len() - 1,
         });
         if mesh < materials.len() {
@@ -205,12 +234,77 @@ pub fn write(
         .map(|i| json!({"source": i, "sampler": 0}))
         .collect();
 
+    // Skeleton: bones become nodes 1.., mirrored like the mesh
+    let mut nodes = vec![json!({"name": name, "mesh": 0})];
+    let mut scene_nodes = vec![0];
+    let mut skins = Vec::new();
+    if let Some(sk) = &model.skeleton {
+        nodes[0]["skin"] = json!(0);
+        let locals = sk.bind_pose_locals();
+        for (i, b) in sk.bones.iter().enumerate() {
+            let (t, [x, y, rz, w], sc) = locals[i];
+            let mut node = json!({
+                "name": b.name,
+                "translation": [t[0] * mx, t[1], t[2]],
+                // Reflecting x maps the quaternion (x, y, z, w) to (x, -y, -z, w)
+                "rotation": [x, y * mx, rz * mx, w],
+            });
+            if sc.iter().any(|s| (s - 1.0).abs() > 1e-4) {
+                node["scale"] = json!(sc);
+            }
+            let children: Vec<usize> = sk
+                .bones
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.parent == Some(i))
+                .map(|(c, _)| c + 1)
+                .collect();
+            if !children.is_empty() {
+                node["children"] = json!(children);
+            }
+            nodes.push(node);
+            if b.parent.is_none() {
+                scene_nodes.push(i + 1);
+            }
+        }
+        // Inverse binds: S * M * S with S = diag(mx, 1, 1), stored column-major
+        let mut ibm = Vec::with_capacity(sk.inverse_binds.len() * 64);
+        for m in &sk.inverse_binds {
+            let sign = |r: usize, c: usize| if (r == 0) != (c == 0) { mx } else { 1.0 };
+            for c in 0..4 {
+                for r in 0..4 {
+                    let v = if r == 3 {
+                        if c == 3 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        m[r * 4 + c] * sign(r, c)
+                    };
+                    ibm.extend(f32::to_le_bytes(v));
+                }
+            }
+        }
+        let view = push_view(&mut bin, &ibm, 0);
+        views[view].as_object_mut().unwrap().remove("target");
+        accessors.push(json!({"bufferView": view, "componentType": 5126, "count": sk.inverse_binds.len(), "type": "MAT4"}));
+        let mut skin = json!({
+            "joints": sk.joints.iter().map(|j| j + 1).collect::<Vec<_>>(),
+            "inverseBindMatrices": accessors.len() - 1,
+        });
+        if let Some(root) = sk.bones.iter().position(|b| b.parent.is_none()) {
+            skin["skeleton"] = json!(root + 1);
+        }
+        skins.push(skin);
+    }
+
     let bin_name = format!("{name}.bin");
     let mut doc = json!({
         "asset": {"version": "2.0", "generator": "wf-unpack"},
         "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"name": name, "mesh": 0}],
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes,
         "meshes": [{"name": name, "primitives": primitives}],
         "accessors": accessors,
         "bufferViews": views,
@@ -218,6 +312,9 @@ pub fn write(
     });
     if !gl_materials.is_empty() {
         doc["materials"] = json!(gl_materials);
+    }
+    if !skins.is_empty() {
+        doc["skins"] = json!(skins);
     }
     if !images.is_empty() {
         doc["images"] = json!(images);

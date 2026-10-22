@@ -143,3 +143,31 @@ fn tint_mask_pack_map_material_resolves_its_mask() {
     assert_eq!(tint.colors[3], [0.84, 0.56, 0.1, 0.5]);
     assert!(plan.unsupported.is_empty());
 }
+
+#[test]
+fn excalibur_body_with_skeleton() {
+    use wf_unpack::model::Model;
+    let Some(dir) = game_dir() else { return };
+    let model = Model::load(&dir, "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx").unwrap();
+    assert_eq!(model.vertices.len(), 3882);
+    assert_eq!(model.indices.len(), 57348);
+    let sk = model.skeleton.as_ref().unwrap();
+    assert_eq!(sk.bones.len(), 83);
+    assert_eq!(sk.joints.len(), 81);
+    assert_eq!(sk.bones[0].name, "GAME_C1_ROOT");
+    assert_eq!(
+        sk.bones[sk
+            .bones
+            .iter()
+            .position(|b| b.name == "GAME_L1_ARM1")
+            .unwrap()]
+        .parent
+        .map(|p| sk.bones[p].name.as_str()),
+        Some("GAME_L1_CLAV1")
+    );
+    assert!(sk.bind_error() < 1e-5);
+    for v in &model.vertices {
+        assert!((v.weights.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        assert!(v.joints.iter().all(|&j| (j as usize) < sk.joints.len()));
+    }
+}

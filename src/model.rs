@@ -64,9 +64,9 @@
 //! cosine of 0.998, and decoded tangents are perpendicular to them.
 //!
 //! Coordinates are left-handed: exported as they are, a sign's lettering
-//! comes out mirrored relative to its texture. [`crate::gltf`] negates z
+//! comes out mirrored relative to its texture. [`crate::gltf`] negates x
 //! (and swaps two corners of every triangle) to get glTF's right-handed
-//! space; y is up in both.
+//! space; y is up in both, and characters then face +z as glTF expects.
 //!
 //! The layout follows Warframe-Exporter's reader for type 102; the checks in
 //! [`Model::from_parts`] (header consumed exactly, part sizes, decoded
@@ -81,7 +81,10 @@ use crate::cache::Package;
 use crate::header::CommonHeader;
 
 pub const KIND_STATIC: u16 = 102;
+pub const KIND_SKINNED: u16 = 281;
 pub const VERTEX_SIZE: usize = 24;
+/// Skinned vertices add four bone indices and packed weights.
+pub const SKINNED_VERTEX_SIZE: usize = 32;
 pub const LOD_COUNT: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -92,6 +95,29 @@ pub struct MeshInfo {
     /// Index ranges per LOD, finest first.
     pub lod_offsets: [u32; LOD_COUNT],
     pub lod_counts: [u32; LOD_COUNT],
+}
+
+/// One entry of a skinned model's bone tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneNode {
+    pub name: String,
+    /// Index of the parent; the root points at itself.
+    pub parent: u16,
+    pub unknown: u16,
+}
+
+/// The skeleton part of a type-281 header.
+#[derive(Debug, Clone, Default)]
+pub struct SkeletonHeader {
+    /// Bones that carry weights, in the order of the inverse bind matrices.
+    pub weighted: Vec<String>,
+    pub tree: Vec<BoneNode>,
+    /// Per mesh: local bone index (as stored in vertices) to weighted bone index.
+    pub bone_maps: Vec<Vec<u32>>,
+    /// Bytes between the inverse bind matrices and the rest poses in B.
+    pub rest_skip: u32,
+    /// Morph data in B. before the indices, in units of 8 bytes.
+    pub morph_skip: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +135,73 @@ pub struct ModelHeader {
     /// Sizes of the PhysX shapes at the start of the B. part.
     pub physx_lens: Vec<u32>,
     pub messages: Vec<String>,
+    /// Present for skinned models (type 281).
+    pub skeleton: Option<SkeletonHeader>,
+}
+
+fn read_meshes(r: &mut Reader) -> Result<Vec<MeshInfo>> {
+    let mesh_count = r.u32()?;
+    ensure!(mesh_count <= 64, "implausible mesh count {mesh_count}");
+    let mut meshes = Vec::with_capacity(mesh_count as usize);
+    for _ in 0..mesh_count {
+        let min = r.f32x4()?;
+        let max = r.f32x4()?;
+        let name = r.str32(1024).context("mesh name")?;
+        let mut lod_offsets = [0; LOD_COUNT];
+        let mut lod_counts = [0; LOD_COUNT];
+        for v in &mut lod_offsets {
+            *v = r.u32()?;
+        }
+        for v in &mut lod_counts {
+            *v = r.u32()?;
+        }
+        r.skip(0x20)?;
+        r.str32(1024).context("mesh second name")?;
+        r.skip(0x10)?;
+        meshes.push(MeshInfo {
+            name,
+            min,
+            max,
+            lod_offsets,
+            lod_counts,
+        });
+    }
+    let n = r.u32()?;
+    ensure!(n <= 64, "implausible u16 array length {n}");
+    r.skip(2 * n as usize)?;
+    Ok(meshes)
+}
+
+/// Skips the per-mesh morph structures and returns the size of the morph data in B. (8-byte units).
+fn skip_morph_structs(r: &mut Reader, meshes: usize) -> Result<u32> {
+    let count = r.u32()? as usize;
+    ensure!(
+        count == 0 || count == meshes,
+        "{count} morph structures for {meshes} meshes"
+    );
+    let mut total = 0u32;
+    for _ in 0..count {
+        ensure!(r.u32()? == 5, "unexpected morph structure");
+        let mult = r.u32()?;
+        r.skip(16)?;
+        ensure!(r.u32()? == 5, "unexpected morph structure");
+        r.skip(20)?;
+        ensure!(r.u32()? == 5, "unexpected morph structure");
+        r.skip(20)?;
+        ensure!(r.u32()? == 5, "unexpected morph structure");
+        let base = r.u32()?;
+        r.skip(16)?;
+        total = total.saturating_add(base.saturating_mul(mult.max(1)));
+        let names = r.u32()?;
+        ensure!(names <= 64, "implausible morph name count {names}");
+        for _ in 0..names {
+            r.str32(1024)?;
+        }
+        let n = r.u32()?;
+        ensure!(n <= 64, "implausible morph array {n}");
+        r.skip(4 * n as usize)?;
+    }
+    Ok(total)
 }
 
 fn skip_physics_ref(r: &mut Reader) -> Result<()> {
@@ -125,60 +218,114 @@ impl ModelHeader {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let common = CommonHeader::parse(data).context("common header")?;
         ensure!(
-            common.kind == KIND_STATIC,
-            "model type {} is not supported (only {KIND_STATIC})",
+            common.kind == KIND_STATIC || common.kind == KIND_SKINNED,
+            "model type {} is not supported (only {KIND_STATIC} and {KIND_SKINNED})",
             common.kind
         );
         let mut r = Reader::at(data, common.len)?;
         r.skip(0x30)?;
         skip_physics_ref(&mut r)?;
-        r.skip(0x28)?;
-        let bounds_min = r.f32x4()?;
-        let bounds_max = r.f32x4()?;
-        let vertex_count = r.u32()?;
-        let index_count = r.u32()?;
-        let morph_count = r.u32()?;
-        let bone_count = r.u32()?;
-        r.skip(0x22)?;
-        let body_vertex_count = r.u32()?;
-        let body_index_count = r.u32()?;
+        let (
+            vertex_count,
+            index_count,
+            morph_count,
+            bone_count,
+            body_vertex_count,
+            body_index_count,
+        );
+        let (bounds_min, bounds_max, meshes, skeleton);
+        if common.kind == KIND_STATIC {
+            r.skip(0x28)?;
+            bounds_min = r.f32x4()?;
+            bounds_max = r.f32x4()?;
+            vertex_count = r.u32()?;
+            index_count = r.u32()?;
+            morph_count = r.u32()?;
+            bone_count = r.u32()?;
+            r.skip(0x22)?;
+            body_vertex_count = r.u32()?;
+            body_index_count = r.u32()?;
+            r.skip(0x3D)?;
+            meshes = read_meshes(&mut r)?;
+            skeleton = None;
+        } else {
+            r.skip(0x2C)?;
+            bounds_min = r.f32x4()?;
+            bounds_max = r.f32x4()?;
+            let n = r.u32()?;
+            ensure!(n <= 1024, "implausible weighted bone count {n}");
+            let weighted = (0..n).map(|_| r.str32(1024)).collect::<Result<Vec<_>>>()?;
+            index_count = r.u32()?;
+            bone_count = r.u32()?;
+            vertex_count = r.u32()?;
+            morph_count = r.u32()? & 0xFFFF;
+            r.skip(0x13)?;
+            body_vertex_count = r.u32()?;
+            body_index_count = r.u32()?;
+            r.skip(0x25)?;
+            let n = r.u32()?;
+            ensure!(n <= 2048, "implausible bone tree size {n}");
+            let mut tree = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let name = r.str32(1024)?;
+                let parent = r.u16()?;
+                let unknown = r.u16()?;
+                tree.push(BoneNode {
+                    name,
+                    parent,
+                    unknown,
+                });
+            }
+            let unknown_structs = r.u32()?;
+            ensure!(
+                unknown_structs <= 1024,
+                "implausible structure count {unknown_structs}"
+            );
+            for _ in 0..unknown_structs {
+                r.skip(0x10)?;
+                r.str32(1024)?;
+                r.skip(0x4C)?;
+            }
+            r.skip(0x1A)?;
+            let rest_skip = r.u32()?;
+            ensure!(rest_skip <= 1 << 20, "implausible skip {rest_skip}");
+            r.skip(0x10 * unknown_structs as usize + 8)?;
+            meshes = read_meshes(&mut r)?;
+            let morph_names = r.u32()?;
+            ensure!(
+                morph_names <= 4096,
+                "implausible morph name count {morph_names}"
+            );
+            for _ in 0..morph_names {
+                r.str32(1024)?;
+                r.skip(4)?;
+            }
+            let maps = r.u32()?;
+            ensure!(maps <= 64, "implausible bone map count {maps}");
+            let mut bone_maps = Vec::with_capacity(maps as usize);
+            for _ in 0..maps {
+                let k = r.u32()?;
+                ensure!(k <= 1024, "implausible bone map size {k}");
+                bone_maps.push((0..k).map(|_| r.u32()).collect::<Result<Vec<_>>>()?);
+            }
+            let morph_skip = skip_morph_structs(&mut r, meshes.len())?;
+            r.skip(0x2F)?;
+            skip_physics_ref(&mut r)?;
+            skeleton = Some(SkeletonHeader {
+                weighted,
+                tree,
+                bone_maps,
+                rest_skip,
+                morph_skip,
+            });
+        }
         ensure!(
             body_vertex_count <= vertex_count && body_index_count <= index_count,
             "B. counts {body_vertex_count}/{body_index_count} exceed the totals {vertex_count}/{index_count}"
         );
-        r.skip(0x3D)?;
-
-        let mesh_count = r.u32()?;
-        ensure!(mesh_count <= 64, "implausible mesh count {mesh_count}");
-        let mut meshes = Vec::with_capacity(mesh_count as usize);
-        for _ in 0..mesh_count {
-            let min = r.f32x4()?;
-            let max = r.f32x4()?;
-            let name = r.str32(1024).context("mesh name")?;
-            let mut lod_offsets = [0; LOD_COUNT];
-            let mut lod_counts = [0; LOD_COUNT];
-            for v in &mut lod_offsets {
-                *v = r.u32()?;
-            }
-            for v in &mut lod_counts {
-                *v = r.u32()?;
-            }
-            r.skip(0x20)?;
-            r.str32(1024).context("mesh second name")?;
-            r.skip(0x10)?;
-            meshes.push(MeshInfo {
-                name,
-                min,
-                max,
-                lod_offsets,
-                lod_counts,
-            });
+        if common.kind == KIND_STATIC {
+            skip_physics_ref(&mut r)?;
         }
-
-        let n = r.u32()?;
-        ensure!(n <= 64, "implausible u16 array length {n}");
-        r.skip(2 * n as usize)?;
-        skip_physics_ref(&mut r)?;
 
         let physx_count = r.u32()?;
         ensure!(
@@ -226,6 +373,7 @@ impl ModelHeader {
             meshes,
             physx_lens,
             messages,
+            skeleton,
         })
     }
 
@@ -261,6 +409,9 @@ pub struct Vertex {
     pub ao: f32,
     pub uv0: [f32; 2],
     pub uv1: [f32; 2],
+    /// Skinned models: joint (weighted bone) indices and their weights; zero otherwise.
+    pub joints: [u16; 4],
+    pub weights: [f32; 4],
 }
 
 /// Decodes a 24-bit octahedral unit vector (see the module docs).
@@ -292,13 +443,364 @@ pub fn decode_vertex(raw: &[u8], scale: [f32; 3]) -> Vertex {
         ao: f32::from(raw[15]) / 255.0,
         uv0: [half_at(16), half_at(18)],
         uv1: [half_at(20), half_at(22)],
+        joints: [0; 4],
+        weights: [0.0; 4],
     }
+}
+
+/// Decodes one 32-byte skinned vertex: the 24-byte layout, then four u8 bone
+/// indices (local to the mesh's bone map) and a u32 holding three 10-bit
+/// weights (lowest bits first); the fourth weight is what is left of 1.
+pub fn decode_skinned_vertex(raw: &[u8], scale: [f32; 3]) -> Vertex {
+    let mut v = decode_vertex(&raw[..VERTEX_SIZE], scale);
+    v.joints = [raw[24], raw[25], raw[26], raw[27]].map(u16::from);
+    let packed = u32::from_le_bytes(raw[28..32].try_into().unwrap());
+    let mut w = [0.0f32; 4];
+    for (k, item) in w.iter_mut().take(3).enumerate() {
+        *item = ((packed >> (10 * k)) & 0x3FF) as f32 / 1023.0;
+    }
+    w[3] = (1.0 - w[0] - w[1] - w[2]).max(0.0);
+    if w[3] < 1e-4 {
+        w[3] = 0.0;
+    }
+    let sum: f32 = w.iter().sum();
+    if sum > 0.0 {
+        w = w.map(|x| x / sum);
+    }
+    v.weights = w;
+    v
+}
+
+/// A bone of the rest pose, in the game's (left-handed) space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bone {
+    pub name: String,
+    pub parent: Option<usize>,
+    /// Local rotation as a quaternion (x, y, z, w).
+    pub rotation: [f32; 4],
+    /// Local translation.
+    pub translation: [f32; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct Skeleton {
+    pub bones: Vec<Bone>,
+    /// Bone index of each joint (weighted bone); vertex joint indices point here.
+    pub joints: Vec<usize>,
+    /// Inverse bind matrix per joint, 3x4 row-major (the last row is 0, 0, 0, 1).
+    pub inverse_binds: Vec<[f32; 12]>,
+}
+
+impl Skeleton {
+    /// Local transform of a bone as a row-major 4x4 matrix (translation x rotation).
+    pub fn local_matrix(&self, bone: usize) -> [[f32; 4]; 4] {
+        let [x, y, z, w] = self.bones[bone].rotation;
+        let t = self.bones[bone].translation;
+        [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+                t[0],
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+                t[1],
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+                t[2],
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    }
+
+    /// Largest difference between `inverse_bind x rest-pose global transform`
+    /// and the identity over all joints; near zero when the rest pose and the
+    /// inverse bind matrices agree.
+    pub fn bind_error(&self) -> f32 {
+        self.joint_bind_errors().into_iter().fold(0.0, f32::max)
+    }
+
+    /// Per joint: largest difference from the identity of `inverse_bind x global`.
+    pub fn joint_bind_errors(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.joints.len());
+        for (j, &bone) in self.joints.iter().enumerate() {
+            let mut worst = 0.0f32;
+            let ib = &self.inverse_binds[j];
+            let ib = [
+                [ib[0], ib[1], ib[2], ib[3]],
+                [ib[4], ib[5], ib[6], ib[7]],
+                [ib[8], ib[9], ib[10], ib[11]],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            let p = mat_mul(&ib, &self.global_matrix(bone));
+            for (r, row) in p.iter().enumerate() {
+                for (c, v) in row.iter().enumerate() {
+                    worst = worst.max((v - if r == c { 1.0 } else { 0.0 }).abs());
+                }
+            }
+            out.push(worst);
+        }
+        out
+    }
+
+    /// Local transforms (translation, rotation, scale) that put every joint at
+    /// its bind pose (the inverse of its inverse bind matrix); bones without
+    /// one keep their stored rest transform. Some models store a rest pose
+    /// that differs from the bind pose; exporting the bind pose keeps the
+    /// mesh in shape.
+    pub fn bind_pose_locals(&self) -> Vec<([f32; 3], [f32; 4], [f32; 3])> {
+        let mut joint_of = vec![None; self.bones.len()];
+        for (j, &b) in self.joints.iter().enumerate() {
+            joint_of[b] = Some(j);
+        }
+        let mut globals: Vec<[[f32; 4]; 4]> = Vec::with_capacity(self.bones.len());
+        let mut out = Vec::with_capacity(self.bones.len());
+        for (i, bone) in self.bones.iter().enumerate() {
+            let parent_global = bone.parent.map(|p| globals[p]);
+            let global = match joint_of[i] {
+                Some(j) => affine_inverse(&row_major(&self.inverse_binds[j])),
+                None => {
+                    let local = self.local_matrix(i);
+                    parent_global.map_or(local, |pg| mat_mul(&pg, &local))
+                }
+            };
+            let local = parent_global.map_or(global, |pg| mat_mul(&affine_inverse(&pg), &global));
+            out.push(decompose(&local));
+            globals.push(global);
+        }
+        out
+    }
+
+    /// Model-space transform of a bone in the rest pose.
+    pub fn global_matrix(&self, bone: usize) -> [[f32; 4]; 4] {
+        let local = self.local_matrix(bone);
+        match self.bones[bone].parent {
+            Some(p) => mat_mul(&self.global_matrix(p), &local),
+            None => local,
+        }
+    }
+}
+
+/// A 3x4 row-major matrix as 4x4.
+pub fn row_major(m: &[f32; 12]) -> [[f32; 4]; 4] {
+    [
+        [m[0], m[1], m[2], m[3]],
+        [m[4], m[5], m[6], m[7]],
+        [m[8], m[9], m[10], m[11]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Inverse of an affine 4x4 matrix (last row 0, 0, 0, 1).
+pub fn affine_inverse(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let a = |r: usize, c: usize| f64::from(m[r][c]);
+    let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+        - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    let inv_det = if det.abs() < 1e-12 { 0.0 } else { 1.0 / det };
+    // Inverse of the 3x3 part: transposed cofactors over the determinant
+    let r: [[f64; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let (r0, r1) = ((j + 1) % 3, (j + 2) % 3);
+            let (c0, c1) = ((i + 1) % 3, (i + 2) % 3);
+            (a(r0, c0) * a(r1, c1) - a(r0, c1) * a(r1, c0)) * inv_det
+        })
+    });
+    let t = [a(0, 3), a(1, 3), a(2, 3)];
+    let mut out = [[0.0f32; 4]; 4];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = r[i][j] as f32;
+        }
+        out[i][3] = -(r[i][0] * t[0] + r[i][1] * t[1] + r[i][2] * t[2]) as f32;
+    }
+    out[3][3] = 1.0;
+    out
+}
+
+/// Splits an affine matrix into translation, rotation quaternion (x, y, z, w) and scale.
+pub fn decompose(m: &[[f32; 4]; 4]) -> ([f32; 3], [f32; 4], [f32; 3]) {
+    let t = [m[0][3], m[1][3], m[2][3]];
+    let scale: [f32; 3] =
+        std::array::from_fn(|c| (m[0][c] * m[0][c] + m[1][c] * m[1][c] + m[2][c] * m[2][c]).sqrt());
+    let r = |i: usize, j: usize| {
+        if scale[j] > 0.0 {
+            m[i][j] / scale[j]
+        } else {
+            0.0
+        }
+    };
+    let trace = r(0, 0) + r(1, 1) + r(2, 2);
+    let q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [
+            (r(2, 1) - r(1, 2)) / s,
+            (r(0, 2) - r(2, 0)) / s,
+            (r(1, 0) - r(0, 1)) / s,
+            0.25 * s,
+        ]
+    } else if r(0, 0) > r(1, 1) && r(0, 0) > r(2, 2) {
+        let s = (1.0 + r(0, 0) - r(1, 1) - r(2, 2)).sqrt() * 2.0;
+        [
+            0.25 * s,
+            (r(0, 1) + r(1, 0)) / s,
+            (r(0, 2) + r(2, 0)) / s,
+            (r(2, 1) - r(1, 2)) / s,
+        ]
+    } else if r(1, 1) > r(2, 2) {
+        let s = (1.0 + r(1, 1) - r(0, 0) - r(2, 2)).sqrt() * 2.0;
+        [
+            (r(0, 1) + r(1, 0)) / s,
+            0.25 * s,
+            (r(1, 2) + r(2, 1)) / s,
+            (r(0, 2) - r(2, 0)) / s,
+        ]
+    } else {
+        let s = (1.0 + r(2, 2) - r(0, 0) - r(1, 1)).sqrt() * 2.0;
+        [
+            (r(0, 2) + r(2, 0)) / s,
+            (r(1, 2) + r(2, 1)) / s,
+            0.25 * s,
+            (r(1, 0) - r(0, 1)) / s,
+        ]
+    };
+    let n = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+    (t, q.map(|v| v / n), scale)
+}
+
+pub fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..4).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
 pub struct Model {
     pub header: ModelHeader,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    pub skeleton: Option<Skeleton>,
+}
+
+/// Reads inverse binds and rest poses, and maps vertex bone indices from
+/// each mesh's local numbering to joint indices.
+fn read_skeleton(
+    sh: &SkeletonHeader,
+    data: &[u8],
+    meshes: &[MeshInfo],
+    indices: &[u32],
+    vertices: &mut [Vertex],
+) -> Result<Skeleton> {
+    let mut r = Reader::new(data);
+    let f = |r: &mut Reader| r.f32();
+    let mut inverse_binds = Vec::with_capacity(sh.weighted.len());
+    for _ in 0..sh.weighted.len() {
+        let mut m = [0.0; 12];
+        for v in &mut m {
+            *v = f(&mut r)?;
+        }
+        inverse_binds.push(m);
+    }
+    r.skip(sh.rest_skip as usize)?;
+    let mut bones = Vec::with_capacity(sh.tree.len());
+    for (i, node) in sh.tree.iter().enumerate() {
+        let rotation = [f(&mut r)?, f(&mut r)?, f(&mut r)?, f(&mut r)?];
+        let translation = [f(&mut r)?, f(&mut r)?, f(&mut r)?];
+        r.skip(12)?;
+        let parent = usize::from(node.parent);
+        ensure!(
+            parent < sh.tree.len(),
+            "bone {} has parent {parent} of {}",
+            node.name,
+            sh.tree.len()
+        );
+        ensure!(parent <= i, "bone {} comes before its parent", node.name);
+        bones.push(Bone {
+            name: node.name.clone(),
+            parent: (parent != i).then_some(parent),
+            rotation,
+            translation,
+        });
+    }
+    // Joints are found by name. An unnamed joint is the bone at its own index;
+    // a name missing from the tree (attachments that ride another model's
+    // skeleton) gets a root-level bone placed at its bind pose.
+    let mut joints = Vec::with_capacity(sh.weighted.len());
+    for (j, w) in sh.weighted.iter().enumerate() {
+        let found = if w.is_empty() {
+            (j < sh.tree.len()).then_some(j)
+        } else {
+            bones.iter().position(|b| &b.name == w)
+        };
+        let index = match found {
+            Some(i) => i,
+            None => {
+                let g = affine_inverse(&row_major(&inverse_binds[j]));
+                let (translation, rotation, _) = decompose(&g);
+                bones.push(Bone {
+                    name: if w.is_empty() {
+                        format!("joint{j}")
+                    } else {
+                        w.clone()
+                    },
+                    parent: None,
+                    rotation,
+                    translation,
+                });
+                bones.len() - 1
+            }
+        };
+        joints.push(index);
+    }
+
+    // Each vertex takes the bone map of the first mesh that uses it
+    let mut owner = vec![usize::MAX; vertices.len()];
+    for (m, mesh) in meshes.iter().enumerate() {
+        for lod in 0..LOD_COUNT {
+            let start = mesh.lod_offsets[lod] as usize;
+            let end = (start + mesh.lod_counts[lod] as usize).min(indices.len());
+            for &i in &indices[start.min(end)..end] {
+                if owner[i as usize] == usize::MAX {
+                    owner[i as usize] = m;
+                }
+            }
+        }
+    }
+    for (v, &m) in vertices.iter_mut().zip(&owner) {
+        if m == usize::MAX {
+            // Not used by any mesh or LOD
+            v.joints = [0; 4];
+            continue;
+        }
+        let map = sh.bone_maps.get(m);
+        for k in 0..4 {
+            if v.weights[k] == 0.0 {
+                v.joints[k] = 0;
+                continue;
+            }
+            let local = usize::from(v.joints[k]);
+            let joint = match map {
+                Some(map) => *map.get(local).with_context(|| {
+                    format!("bone index {local} outside mesh {m}'s map of {}", map.len())
+                })? as usize,
+                None => local,
+            };
+            ensure!(
+                joint < joints.len(),
+                "joint {joint} out of range ({} joints)",
+                joints.len()
+            );
+            v.joints[k] = joint as u16;
+        }
+    }
+    Ok(Skeleton {
+        bones,
+        joints,
+        inverse_binds,
+    })
 }
 
 impl Model {
@@ -316,8 +818,26 @@ impl Model {
             header.index_count as usize - bi,
         );
         let physx: usize = header.physx_lens.iter().map(|&l| l as usize).sum();
-        let expected_body = physx + 2 + bv * VERTEX_SIZE + bi * 2;
-        let expected_full = fv * VERTEX_SIZE + fi * 2;
+        let vsize = if header.skeleton.is_some() {
+            SKINNED_VERTEX_SIZE
+        } else {
+            VERTEX_SIZE
+        };
+        // Skinned models put the skeleton between the PhysX shapes and the vertices
+        let (skel_len, morph_len) = match &header.skeleton {
+            Some(s) => {
+                let bones = s.tree.len();
+                let len = s.weighted.len() * 48
+                    + s.rest_skip as usize
+                    + bones * 40
+                    + bones * 4
+                    + if bones > 0 { 8 } else { 0 };
+                (len, s.morph_skip as usize * 8)
+            }
+            None => (0, 0),
+        };
+        let expected_body = physx + 2 + skel_len + bv * vsize + morph_len + bi * 2;
+        let expected_full = fv * vsize + fi * 2;
         if header.morph_count > 0 && (body.len(), full.len()) != (expected_body, expected_full) {
             bail!(
                 "models with morph targets are not supported ({} morphs)",
@@ -337,14 +857,21 @@ impl Model {
 
         let scale = header.scale();
         let body = &body[physx + 2..];
-        let (body_verts, body_idx) = body.split_at(bv * VERTEX_SIZE);
-        let (full_verts, full_idx) = full.split_at(fv * VERTEX_SIZE);
-        let vertices: Vec<Vertex> = body_verts
-            .as_chunks::<VERTEX_SIZE>()
-            .0
-            .iter()
-            .chain(full_verts.as_chunks::<VERTEX_SIZE>().0)
-            .map(|v| decode_vertex(v, scale))
+        let (skel_data, body) = body.split_at(skel_len);
+        let (body_verts, rest) = body.split_at(bv * vsize);
+        let body_idx = &rest[morph_len..];
+        let (full_verts, full_idx) = full.split_at(fv * vsize);
+        let decode = |v: &[u8]| {
+            if vsize == SKINNED_VERTEX_SIZE {
+                decode_skinned_vertex(v, scale)
+            } else {
+                decode_vertex(v, scale)
+            }
+        };
+        let mut vertices: Vec<Vertex> = body_verts
+            .chunks_exact(vsize)
+            .chain(full_verts.chunks_exact(vsize))
+            .map(decode)
             .collect();
         let indices: Vec<u32> = body_idx
             .as_chunks::<2>()
@@ -353,6 +880,16 @@ impl Model {
             .chain(full_idx.as_chunks::<2>().0)
             .map(|&c| u32::from(u16::from_le_bytes(c)))
             .collect();
+        let skeleton = match &header.skeleton {
+            Some(sh) => Some(read_skeleton(
+                sh,
+                skel_data,
+                &header.meshes,
+                &indices,
+                &mut vertices,
+            )?),
+            None => None,
+        };
 
         if let Some(&max) = indices.iter().max() {
             ensure!(
@@ -380,6 +917,7 @@ impl Model {
             header,
             vertices,
             indices,
+            skeleton,
         })
     }
 
@@ -629,5 +1167,192 @@ mod tests {
         assert!(ModelHeader::parse(&raw).is_err());
         let raw = crate::header::tests::build(&[], "", 281);
         assert!(ModelHeader::parse(&raw).is_err());
+    }
+
+    fn s32(h: &mut Vec<u8>, s: &str) {
+        h.extend((s.len() as u32).to_le_bytes());
+        h.extend(s.as_bytes());
+    }
+
+    #[test]
+    fn decodes_skinned_vertex() {
+        let mut raw = vertex_bytes(
+            [0, 0, 0, 255],
+            [0x7F, 0xF7, 0xFF, 0],
+            [0x7F, 0xFF, 0xFF, 0],
+            [0; 2],
+            [0; 2],
+        );
+        raw.extend([3, 1, 0, 0]);
+        // Weights 512/1023 and 256/1023 in the low 20 bits; the third is 0; the fourth is the rest
+        let packed: u32 = 512 | 256 << 10;
+        raw.extend(packed.to_le_bytes());
+        let v = decode_skinned_vertex(&raw, [1.0; 3]);
+        assert_eq!(v.joints, [3, 1, 0, 0]);
+        assert!((v.weights[0] - 512.0 / 1023.0).abs() < 1e-6);
+        assert!((v.weights[1] - 256.0 / 1023.0).abs() < 1e-6);
+        assert_eq!(v.weights[2], 0.0);
+        assert!((v.weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // Three full weights leave nothing for the fourth
+        let mut raw2 = raw.clone();
+        raw2[28..32].copy_from_slice(&(341u32 | 341 << 10 | 341 << 20).to_le_bytes());
+        let v = decode_skinned_vertex(&raw2, [1.0; 3]);
+        assert!(v.weights[3] < 0.01 && (v.weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    fn two_bone_skeleton() -> Skeleton {
+        // Root at the origin; child 1 m up, turned 90 degrees about z
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let bones = vec![
+            Bone {
+                name: "root".into(),
+                parent: None,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                translation: [0.0; 3],
+            },
+            Bone {
+                name: "arm".into(),
+                parent: Some(0),
+                rotation: [0.0, 0.0, h, h],
+                translation: [0.0, 1.0, 0.0],
+            },
+        ];
+        let mut sk = Skeleton {
+            bones,
+            joints: vec![0, 1],
+            inverse_binds: Vec::new(),
+        };
+        sk.inverse_binds = (0..2)
+            .map(|b| {
+                let inv = affine_inverse(&sk.global_matrix(b));
+                std::array::from_fn(|k| inv[k / 4][k % 4])
+            })
+            .collect();
+        sk
+    }
+
+    #[test]
+    fn bone_hierarchy_and_bind_pose() {
+        let sk = two_bone_skeleton();
+        let g = sk.global_matrix(1);
+        // The child's x axis points along the parent's y after the turn
+        assert!((g[1][0] - 1.0).abs() < 1e-6 && (g[1][3] - 1.0).abs() < 1e-6);
+        assert!(sk.bind_error() < 1e-6);
+        let locals = sk.bind_pose_locals();
+        assert!((locals[1].0[1] - 1.0).abs() < 1e-6);
+        assert!((locals[1].1[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        // A rest pose that differs from the bind pose: the export follows the bind pose
+        let mut moved = sk.clone();
+        moved.bones[1].translation = [0.0, 3.0, 0.0];
+        assert!(moved.bind_error() > 1.0);
+        assert!((moved.bind_pose_locals()[1].0[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn affine_round_trip() {
+        let sk = two_bone_skeleton();
+        let g = sk.global_matrix(1);
+        let p = mat_mul(&g, &affine_inverse(&g));
+        for (r, row) in p.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                assert!((v - if r == c { 1.0 } else { 0.0 }).abs() < 1e-6);
+            }
+        }
+        let (t, q, s) = decompose(&g);
+        assert_eq!(t, [0.0, 1.0, 0.0]);
+        assert!(s.iter().all(|v| (v - 1.0).abs() < 1e-6));
+        assert!((q[2].abs() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+    }
+
+    /// A type-281 header with two weighted bones, one mesh whose bone map
+    /// sends local 0 -> joint 1 and local 1 -> joint 0, all data in B.
+    fn skinned_header_bytes() -> Vec<u8> {
+        let mut h = crate::header::tests::build(&["/Lotus/c.fbx"], "", 281);
+        h.extend([0; 0x30]);
+        h.extend([0; 12]);
+        h.extend([0; 0x2C]);
+        for f in [-1.0f32, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0] {
+            h.extend(f.to_le_bytes());
+        }
+        h.extend(2u32.to_le_bytes());
+        s32(&mut h, "root");
+        s32(&mut h, "arm");
+        for v in [3u32, 2, 3, 0] {
+            h.extend(v.to_le_bytes()); // indices, bones, vertices, morphs
+        }
+        h.extend([0; 0x13]);
+        h.extend([0u8; 8]); // B. counts zero: everything in B.
+        h.extend([0; 0x25]);
+        h.extend(2u32.to_le_bytes());
+        s32(&mut h, "root");
+        h.extend([0, 0, 0, 0]);
+        s32(&mut h, "arm");
+        h.extend([0, 0, 0, 0]);
+        h.extend(0u32.to_le_bytes()); // unknown structures
+        h.extend([0; 0x1A]);
+        h.extend(0u32.to_le_bytes()); // rest skip
+        h.extend([0; 8]);
+        h.extend(1u32.to_le_bytes());
+        h.extend([0; 32]);
+        s32(&mut h, "mesh");
+        for v in [0u32, 0, 0, 0, 0, 3, 0, 0, 0, 0] {
+            h.extend(v.to_le_bytes());
+        }
+        h.extend([0; 0x20]);
+        h.extend(0u32.to_le_bytes());
+        h.extend([0; 0x10]);
+        h.extend(0u32.to_le_bytes()); // u16 array
+        h.extend(0u32.to_le_bytes()); // morph names
+        h.extend(1u32.to_le_bytes()); // bone maps
+        h.extend(2u32.to_le_bytes());
+        h.extend(1u32.to_le_bytes());
+        h.extend(0u32.to_le_bytes());
+        h.extend(0u32.to_le_bytes()); // morph structures
+        h.extend([0; 0x2F]);
+        h.extend([0; 12]);
+        h.extend(0u32.to_le_bytes()); // PhysX
+        h.extend(0u32.to_le_bytes()); // messages
+        h
+    }
+
+    #[test]
+    fn parses_skinned_model() {
+        let header = ModelHeader::parse(&skinned_header_bytes()).unwrap();
+        let sh = header.skeleton.clone().unwrap();
+        assert_eq!(sh.weighted, ["root", "arm"]);
+        assert_eq!(sh.tree[1].name, "arm");
+        assert_eq!(sh.bone_maps, [vec![1, 0]]);
+
+        let sk = two_bone_skeleton();
+        let mut body = vec![0, 0];
+        for ib in &sk.inverse_binds {
+            for f in ib {
+                body.extend(f.to_le_bytes());
+            }
+        }
+        for b in &sk.bones {
+            for f in b.rotation.iter().chain(&b.translation).chain(&[0.0; 3]) {
+                body.extend(f.to_le_bytes());
+            }
+        }
+        body.extend([0; 2 * 4 + 8]); // two u16 per bone twice, then 8 bytes
+        for local in [0u8, 1, 0] {
+            let mut v = vertex_bytes([0; 4], [128; 4], [128; 4], [0; 2], [0; 2]);
+            v.extend([local, 0, 0, 0]);
+            v.extend(1023u32.to_le_bytes());
+            body.extend(v);
+        }
+        for i in [0u16, 1, 2] {
+            body.extend(i.to_le_bytes());
+        }
+        let model = Model::from_parts(header, &body, &[]).unwrap();
+        let sk2 = model.skeleton.unwrap();
+        assert_eq!(sk2.joints, [0, 1]);
+        assert_eq!(sk2.bones[1].parent, Some(0));
+        assert!(sk2.bind_error() < 1e-6);
+        // Local 0 maps to joint 1 through the bone map
+        let joints: Vec<u16> = model.vertices.iter().map(|v| v.joints[0]).collect();
+        assert_eq!(joints, [1, 0, 1]);
+        assert_eq!(model.vertices[0].weights, [1.0, 0.0, 0.0, 0.0]);
     }
 }

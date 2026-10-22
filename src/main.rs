@@ -10,7 +10,7 @@ use wf_unpack::cache::Package;
 use wf_unpack::gltf;
 use wf_unpack::header::CommonHeader;
 use wf_unpack::material::{self, MaskLayout, Material, Plan, Source};
-use wf_unpack::model::{Model, ModelHeader, KIND_STATIC};
+use wf_unpack::model::{Model, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use wf_unpack::packages::PackagesBin;
 use wf_unpack::packages::TextReader;
 use wf_unpack::pbr;
@@ -628,6 +628,37 @@ fn model_cmd(
         &h.bounds_max[..3]
     );
     println!("materials: {:?}", h.materials());
+    if let Some(sk) = &model.skeleton {
+        let weighted = model
+            .vertices
+            .iter()
+            .filter(|v| v.weights.iter().any(|&w| w > 0.0))
+            .count();
+        println!(
+            "skeleton: {} bones, {} joints, bind pose error {:.2e}; {weighted} of {} vertices weighted; root {}",
+            sk.bones.len(),
+            sk.joints.len(),
+            sk.bind_error(),
+            model.vertices.len(),
+            sk.bones.first().map_or("-", |b| b.name.as_str())
+        );
+        let errors = sk.joint_bind_errors();
+        for (j, e) in errors
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e > 1e-3)
+            .take(8)
+        {
+            let b = &sk.bones[sk.joints[j]];
+            println!(
+                "  joint {j} {} (parent {:?}): bind error {e:.3}, rotation {:?}, translation {:?}",
+                b.name,
+                b.parent.map(|p| &sk.bones[p].name),
+                b.rotation,
+                b.translation
+            );
+        }
+    }
     for (i, m) in h.meshes.iter().enumerate() {
         let tris = model.lod_indices(i, 0)?;
         println!(
@@ -654,7 +685,7 @@ fn model_cmd(
         &materials,
         &gltf::Options {
             lod,
-            mirror_z: true,
+            mirror_x: true,
         },
         out,
     )?;
@@ -688,56 +719,93 @@ fn check_models_cmd(game: &Path) -> Result<()> {
     let duplicates = head.toc.entries.len() - entries.len();
     entries.sort_by_key(|e| e.offset);
 
+    #[derive(Default)]
+    struct Stats {
+        ok: usize,
+        vertices: u64,
+        triangles: u64,
+        bones: u64,
+        rest_differs: usize,
+        errors: BTreeMap<String, Vec<String>>,
+    }
+    let mut stats: BTreeMap<u16, Stats> = BTreeMap::new();
     let mut fbx_kinds: BTreeMap<u16, usize> = BTreeMap::new();
-    let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let (mut ok, mut vertices, mut triangles) = (0usize, 0u64, 0u64);
     for e in &entries {
         let Ok(raw) = head.read(e) else { continue };
         let Ok(common) = CommonHeader::parse(&raw) else {
             continue;
         };
-        if common.kind != KIND_STATIC {
+        if common.kind != KIND_STATIC && common.kind != KIND_SKINNED {
             if e.path.ends_with(".fbx") {
                 *fbx_kinds.entry(common.kind).or_default() += 1;
             }
             continue;
         }
+        let st = stats.entry(common.kind).or_default();
         let result = ModelHeader::parse(&raw).and_then(|header| {
             let b = body.read_path(&e.path)?.unwrap_or_default();
             let f = full.read_path(&e.path)?.unwrap_or_default();
             let model = Model::from_parts(header, &b, &f)?;
             model.check_bounds()?;
+            if model.skeleton.is_some() {
+                for v in &model.vertices {
+                    let sum: f32 = v.weights.iter().sum();
+                    anyhow::ensure!(
+                        sum == 0.0 || (sum - 1.0).abs() < 1e-3,
+                        "vertex weights sum to {sum}"
+                    );
+                }
+            }
             Ok(model)
         });
         match result {
             Ok(model) => {
-                ok += 1;
-                vertices += model.vertices.len() as u64;
-                triangles += (0..model.header.meshes.len())
+                st.ok += 1;
+                st.vertices += model.vertices.len() as u64;
+                st.triangles += (0..model.header.meshes.len())
                     .map(|m| model.lod_indices(m, 0).map_or(0, |t| t.len() as u64 / 3))
                     .sum::<u64>();
+                if let Some(sk) = &model.skeleton {
+                    st.bones += sk.bones.len() as u64;
+                    st.rest_differs += usize::from(sk.bind_error() >= 1e-3);
+                }
             }
             Err(err) => {
                 let key: String = format!("{err:#}")
                     .chars()
                     .map(|c| if c.is_ascii_digit() { '#' } else { c })
                     .collect();
-                errors.entry(key).or_default().push(e.path.clone());
+                st.errors.entry(key).or_default().push(e.path.clone());
             }
         }
     }
-    let failed: usize = errors.values().map(Vec::len).sum();
     println!(
-        "type {KIND_STATIC}: {ok}/{} ok, {failed} failed ({vertices} vertices, {triangles} LOD0 triangles) in {:.0}s; {duplicates} duplicate H.Misc paths skipped",
-        ok + failed,
+        "{:.0}s; {duplicates} duplicate H.Misc paths skipped",
         started.elapsed().as_secs_f64()
     );
-    for (msg, list) in &errors {
-        println!(
-            "  {:>6}  {msg}\n          e.g. {}",
-            list.len(),
-            list.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+    for (kind, st) in &stats {
+        let failed: usize = st.errors.values().map(Vec::len).sum();
+        print!(
+            "type {kind}: {}/{} ok, {failed} failed ({} vertices, {} LOD0 triangles",
+            st.ok,
+            st.ok + failed,
+            st.vertices,
+            st.triangles
         );
+        if *kind == KIND_SKINNED {
+            print!(
+                ", {} bones; {} with a stored rest pose that differs from the bind pose",
+                st.bones, st.rest_differs
+            );
+        }
+        println!(")");
+        for (msg, list) in &st.errors {
+            println!(
+                "  {:>6}  {msg}\n          e.g. {}",
+                list.len(),
+                list.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
     }
     println!("other .fbx types (not supported): {fbx_kinds:?}");
     Ok(())
