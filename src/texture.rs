@@ -239,11 +239,18 @@ pub struct TexturePackages {
 
 impl TexturePackages {
     pub fn open(dir: &Path) -> Result<Self> {
-        let head = Package::open_in(dir, "H.Texture")?.context("no H.Texture package")?;
+        Self::open_family(dir, "Texture")
+    }
+
+    /// Opens `H.<family>`, `B.<family>` and `F.<family>`: `Texture`, or
+    /// `LightMap` for the baked lighting of levels.
+    pub fn open_family(dir: &Path, family: &str) -> Result<Self> {
+        let head = Package::open_in(dir, &format!("H.{family}"))?
+            .with_context(|| format!("no H.{family} package"))?;
         Ok(TexturePackages {
             head,
-            body: Package::open_in(dir, "B.Texture")?,
-            full: Package::open_in(dir, "F.Texture")?,
+            body: Package::open_in(dir, &format!("B.{family}"))?,
+            full: Package::open_in(dir, &format!("F.{family}"))?,
         })
     }
 

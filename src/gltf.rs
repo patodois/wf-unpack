@@ -243,3 +243,229 @@ pub fn write(scene: &Scene, name: &str, materials: &[Material], out_dir: &Path) 
     )?;
     Ok(())
 }
+
+/// A model's vertex data in a [`LevelWriter`]: shared by every mesh and node that uses it.
+pub struct ModelHandle {
+    attributes: Value,
+    /// (material slot, index accessor) per primitive.
+    primitives: Vec<(usize, usize)>,
+}
+
+/// Writes a whole level as one glTF: each model's vertices are stored once,
+/// meshes reuse them (one per distinct material set), and nodes place meshes.
+#[derive(Default)]
+pub struct LevelWriter {
+    bin: Vec<u8>,
+    views: Vec<Value>,
+    accessors: Vec<Value>,
+    meshes: Vec<Value>,
+    materials: Vec<Value>,
+    images: Vec<Value>,
+    nodes: Vec<Value>,
+    scene_nodes: Vec<usize>,
+    lights: Vec<Value>,
+}
+
+impl LevelWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Size of the binary buffer so far.
+    pub fn buffer_len(&self) -> usize {
+        self.bin.len()
+    }
+
+    fn push_view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
+        while !self.bin.len().is_multiple_of(4) {
+            self.bin.push(0);
+        }
+        let mut view =
+            json!({"buffer": 0, "byteOffset": self.bin.len(), "byteLength": bytes.len()});
+        if let Some(t) = target {
+            view["target"] = json!(t);
+        }
+        self.views.push(view);
+        self.bin.extend_from_slice(bytes);
+        self.views.len() - 1
+    }
+
+    fn push_accessor(&mut self, view: usize, ty: &str, component: u32, count: usize) -> usize {
+        self.accessors.push(
+            json!({"bufferView": view, "componentType": component, "count": count, "type": ty}),
+        );
+        self.accessors.len() - 1
+    }
+
+    fn image_index(&mut self, file: &str) -> usize {
+        if let Some(i) = self.images.iter().position(|v| v["uri"] == file) {
+            return i;
+        }
+        self.images.push(json!({ "uri": file }));
+        self.images.len() - 1
+    }
+
+    /// Adds a material; returns its index.
+    pub fn add_material(&mut self, m: &Material) -> usize {
+        let mut pbr = json!({
+            "baseColorFactor": m.base_color_factor,
+            "metallicFactor": m.metallic_factor,
+            "roughnessFactor": m.roughness_factor,
+        });
+        let mut mat = json!({"name": m.name});
+        for (slot, file) in &m.images {
+            let tex = json!({"index": self.image_index(file)});
+            match slot {
+                Slot::BaseColor => pbr["baseColorTexture"] = tex,
+                Slot::MetallicRoughness => pbr["metallicRoughnessTexture"] = tex,
+                Slot::Normal => mat["normalTexture"] = tex,
+                Slot::Emissive => {
+                    mat["emissiveTexture"] = tex;
+                    mat["emissiveFactor"] = json!(m.emissive_factor);
+                }
+            }
+        }
+        mat["pbrMetallicRoughness"] = pbr;
+        self.materials.push(mat);
+        self.materials.len() - 1
+    }
+
+    /// Stores the vertices and indices of a static model.
+    pub fn add_model(&mut self, scene: &Scene) -> ModelHandle {
+        let n = scene.positions.len();
+        let (lo, hi) = scene.bounds;
+        let floats = |vals: &mut dyn Iterator<Item = f32>| {
+            vals.flat_map(f32::to_le_bytes).collect::<Vec<u8>>()
+        };
+        const VERTICES: Option<u32> = Some(34962);
+        let mut attributes = json!({});
+        let sets: [(&str, &str, Vec<u8>); 5] = [
+            (
+                "POSITION",
+                "VEC3",
+                floats(&mut scene.positions.iter().flatten().copied()),
+            ),
+            (
+                "NORMAL",
+                "VEC3",
+                floats(&mut scene.normals.iter().flatten().copied()),
+            ),
+            (
+                "TEXCOORD_0",
+                "VEC2",
+                floats(&mut scene.uv0.iter().flatten().copied()),
+            ),
+            (
+                "TEXCOORD_1",
+                "VEC2",
+                floats(&mut scene.uv1.iter().flatten().copied()),
+            ),
+            (
+                "TANGENT",
+                "VEC4",
+                floats(&mut scene.tangents.iter().flatten().copied()),
+            ),
+        ];
+        for (name, ty, bytes) in sets {
+            let view = self.push_view(&bytes, VERTICES);
+            let acc = self.push_accessor(view, ty, 5126, n);
+            if name == "POSITION" {
+                self.accessors[acc]["min"] = json!(lo);
+                self.accessors[acc]["max"] = json!(hi);
+            }
+            attributes[name] = json!(acc);
+        }
+        let primitives = scene
+            .primitives
+            .iter()
+            .map(|p| {
+                let bytes: Vec<u8> = p.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                let view = self.push_view(&bytes, Some(34963));
+                (
+                    p.mesh,
+                    self.push_accessor(view, "SCALAR", 5125, p.indices.len()),
+                )
+            })
+            .collect();
+        ModelHandle {
+            attributes,
+            primitives,
+        }
+    }
+
+    /// A mesh over a stored model; `materials[slot]` is the glTF material of each mesh slot.
+    pub fn add_mesh(
+        &mut self,
+        name: &str,
+        model: &ModelHandle,
+        materials: &[Option<usize>],
+    ) -> usize {
+        let primitives: Vec<Value> = model
+            .primitives
+            .iter()
+            .map(|&(slot, indices)| {
+                let mut prim = json!({"attributes": model.attributes, "indices": indices});
+                if let Some(Some(m)) = materials.get(slot) {
+                    prim["material"] = json!(m);
+                }
+                prim
+            })
+            .collect();
+        self.meshes
+            .push(json!({"name": name, "primitives": primitives}));
+        self.meshes.len() - 1
+    }
+
+    /// Adds a node to the scene; `node` holds its name, transform and extras.
+    pub fn add_node(&mut self, node: Value) -> usize {
+        self.nodes.push(node);
+        let i = self.nodes.len() - 1;
+        self.scene_nodes.push(i);
+        i
+    }
+
+    /// Adds a KHR_lights_punctual light definition; returns its index.
+    pub fn add_light(&mut self, light: Value) -> usize {
+        self.lights.push(light);
+        self.lights.len() - 1
+    }
+
+    /// Writes `<name>.gltf` and `<name>.bin` into `out_dir`.
+    pub fn finish(self, name: &str, out_dir: &Path) -> Result<()> {
+        fs::create_dir_all(out_dir)?;
+        let bin_name = format!("{name}.bin");
+        let mut doc = json!({
+            "asset": {"version": "2.0", "generator": "wf-unpack"},
+            "scene": 0,
+            "scenes": [{"name": name, "nodes": self.scene_nodes}],
+            "nodes": self.nodes,
+        });
+        if !self.meshes.is_empty() {
+            doc["meshes"] = json!(self.meshes);
+            doc["accessors"] = json!(self.accessors);
+            doc["bufferViews"] = json!(self.views);
+            doc["buffers"] = json!([{"uri": bin_name, "byteLength": self.bin.len()}]);
+        }
+        if !self.materials.is_empty() {
+            doc["materials"] = json!(self.materials);
+        }
+        if !self.images.is_empty() {
+            let textures: Vec<Value> = (0..self.images.len())
+                .map(|i| json!({"source": i, "sampler": 0}))
+                .collect();
+            doc["images"] = json!(self.images);
+            doc["textures"] = json!(textures);
+            doc["samplers"] = json!([{"wrapS": 10497, "wrapT": 10497}]);
+        }
+        if !self.lights.is_empty() {
+            doc["extensionsUsed"] = json!(["KHR_lights_punctual"]);
+            doc["extensions"] = json!({"KHR_lights_punctual": {"lights": self.lights}});
+        }
+        fs::write(out_dir.join(&bin_name), &self.bin)?;
+        fs::write(
+            out_dir.join(format!("{name}.gltf")),
+            serde_json::to_vec_pretty(&doc)?,
+        )?;
+        Ok(())
+    }
+}

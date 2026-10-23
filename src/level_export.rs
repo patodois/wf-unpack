@@ -1,0 +1,369 @@
+//! Exports a [`LevelDescription`] to glTF: models are stored once and
+//! instanced by nodes, materials are baked as for single models.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+use crate::cache::Package;
+use crate::gltf::{LevelWriter, ModelHandle};
+use crate::gltf::{Material as GltfMaterial, Slot};
+use crate::level::{InstanceRole, LevelDescription, Transform};
+use crate::material::{folder, resolve_path};
+use crate::model::Model;
+use crate::pbr::{Image, MaterialBaker};
+use crate::scene;
+
+#[derive(Debug, Clone)]
+pub struct ExportOptions {
+    /// Level of detail of every model (0 is the finest).
+    pub lod: usize,
+    /// Also place instances with `StartHidden=1`.
+    pub include_hidden: bool,
+    /// Bake textures; without it materials are flat colours.
+    pub textures: bool,
+    /// Shrink baked textures to at most this many pixels on a side.
+    pub max_texture: Option<u32>,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        ExportOptions {
+            lod: 0,
+            include_hidden: false,
+            textures: true,
+            max_texture: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ExportReport {
+    pub models_written: usize,
+    pub meshes: usize,
+    pub nodes: usize,
+    pub lights: usize,
+    /// Triangles stored once, and triangles the placed instances add up to.
+    pub triangles_stored: u64,
+    pub triangles_placed: u64,
+    pub materials: usize,
+    pub material_failures: Vec<(String, String)>,
+    /// Models that could not be loaded, and the instances lost with them.
+    pub model_failures: Vec<(String, String)>,
+    pub instances_lost: usize,
+    pub hidden_skipped: usize,
+    pub buffer_bytes: usize,
+}
+
+/// Halves an image until it fits `max` (a box filter over 2x2 blocks).
+fn shrink(img: &Image, max: u32) -> Image {
+    let mut cur = img.clone();
+    while cur.width.max(cur.height) > max && cur.width > 1 && cur.height > 1 {
+        let (w, h) = (cur.width / 2, cur.height / 2);
+        let mut out = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0u32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let i = (((2 * y + dy) * cur.width + 2 * x + dx) * 4) as usize;
+                    for (a, &v) in acc.iter_mut().zip(&cur.rgba[i..i + 4]) {
+                        *a += u32::from(v);
+                    }
+                }
+                let o = ((y * w + x) * 4) as usize;
+                for (dst, a) in out.rgba[o..o + 4].iter_mut().zip(acc) {
+                    *dst = ((a + 2) / 4) as u8;
+                }
+            }
+        }
+        cur = out;
+    }
+    cur
+}
+
+struct Materials<'a> {
+    baker: Option<MaterialBaker>,
+    out_dir: &'a Path,
+    opts: &'a ExportOptions,
+    cache: HashMap<String, usize>,
+}
+
+impl Materials<'_> {
+    /// The glTF material for a resolved material path.
+    fn get(&mut self, w: &mut LevelWriter, path: &str, report: &mut ExportReport) -> usize {
+        if let Some(&i) = self.cache.get(path) {
+            return i;
+        }
+        let short = path.rsplit('/').next().unwrap_or(path).to_string();
+        let mut mat = GltfMaterial::named(short.clone());
+        if let Some(baker) = &mut self.baker {
+            match baker.plan(path, path).and_then(|plan| {
+                let baked = baker.bake(&plan)?;
+                Ok((plan, baked))
+            }) {
+                Ok((_, baked)) => {
+                    let n = self.cache.len();
+                    for (slot, suffix, img) in [
+                        (Slot::BaseColor, "base", &baked.base_color),
+                        (
+                            Slot::MetallicRoughness,
+                            "metal_rough",
+                            &baked.metallic_roughness,
+                        ),
+                        (Slot::Normal, "normal", &baked.normal),
+                        (Slot::Emissive, "emissive", &baked.emissive),
+                    ] {
+                        let Some(img) = img else { continue };
+                        let file = format!("m{n:03}_{short}_{suffix}.png");
+                        let png = match self.opts.max_texture {
+                            Some(max) if img.width.max(img.height) > max => {
+                                shrink(img, max).to_png()
+                            }
+                            _ => img.to_png(),
+                        };
+                        match png.and_then(|p| Ok(fs::write(self.out_dir.join(&file), p)?)) {
+                            Ok(()) => mat.images.push((slot, file)),
+                            Err(e) => report
+                                .material_failures
+                                .push((path.to_string(), format!("{e:#}"))),
+                        }
+                    }
+                    mat.base_color_factor = baked.base_color_factor;
+                    mat.metallic_factor = baked.metallic_factor;
+                    mat.roughness_factor = baked.roughness_factor;
+                    mat.emissive_factor = baked.emissive_factor;
+                }
+                Err(e) => report
+                    .material_failures
+                    .push((path.to_string(), format!("{e:#}"))),
+            }
+        }
+        let i = w.add_material(&mat);
+        self.cache.insert(path.to_string(), i);
+        report.materials += 1;
+        i
+    }
+}
+
+/// glTF wants column-major matrices.
+fn column_major(m: [[f32; 4]; 4]) -> Vec<f32> {
+    (0..16).map(|k| m[k % 4][k / 4]).collect()
+}
+
+fn node_for(t: &Transform, name: &str, extras: Value) -> Value {
+    let rh = t.to_right_handed();
+    json!({"name": name, "matrix": column_major(rh.matrix()), "extras": extras})
+}
+
+fn short_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+struct Stored {
+    handle: ModelHandle,
+    /// The model's own material paths per slot, resolved.
+    materials: Vec<String>,
+    triangles: u64,
+    slots: usize,
+}
+
+/// Writes `<name>.gltf` (+ `.bin` and PNGs) for the level.
+pub fn export_level(
+    game: &Path,
+    d: &LevelDescription,
+    out_dir: &Path,
+    name: &str,
+    opts: &ExportOptions,
+) -> Result<ExportReport> {
+    fs::create_dir_all(out_dir)?;
+    let mut report = ExportReport::default();
+    let mut w = LevelWriter::new();
+    let mut head = Package::open_in(game, "H.Misc")?.context("no H.Misc")?;
+    let mut body = Package::open_in(game, "B.Misc")?;
+    let mut full = Package::open_in(game, "F.Misc")?;
+    let mut materials = Materials {
+        baker: if opts.textures {
+            Some(MaterialBaker::open(game)?)
+        } else {
+            None
+        },
+        out_dir,
+        opts,
+        cache: HashMap::new(),
+    };
+
+    // Models, one at a time; only those some placed instance uses
+    let used: Vec<bool> = {
+        let mut u = vec![false; d.models.len()];
+        for i in &d.instances {
+            if opts.include_hidden || !i.hidden {
+                u[i.model] = true;
+            }
+        }
+        u
+    };
+    let mut stored: Vec<Option<Stored>> = Vec::with_capacity(d.models.len());
+    for (m, path) in d.models.iter().enumerate() {
+        if !used[m] {
+            stored.push(None);
+            continue;
+        }
+        let loaded =
+            Model::load_from(&mut head, body.as_mut(), full.as_mut(), path).and_then(|model| {
+                let prepared = scene::prepare(&model, opts.lod, true)?;
+                Ok((model, prepared))
+            });
+        match loaded {
+            Ok((model, prepared)) if prepared.triangles() > 0 => {
+                let handle = w.add_model(&prepared);
+                let mats = model
+                    .header
+                    .materials()
+                    .iter()
+                    .map(|n| resolve_path(folder(path), n))
+                    .collect();
+                stored.push(Some(Stored {
+                    handle,
+                    materials: mats,
+                    triangles: prepared.triangles() as u64,
+                    slots: model.header.meshes.len(),
+                }));
+                report.models_written += 1;
+                report.triangles_stored += prepared.triangles() as u64;
+            }
+            Ok(_) => {
+                report
+                    .model_failures
+                    .push((path.clone(), "no triangles at this LOD".into()));
+                stored.push(None);
+            }
+            Err(e) => {
+                report.model_failures.push((path.clone(), format!("{e:#}")));
+                stored.push(None);
+            }
+        }
+    }
+
+    // Meshes: one per model and material set
+    let mut mesh_of: HashMap<(usize, Vec<String>), usize> = HashMap::new();
+    for inst in &d.instances {
+        if inst.hidden && !opts.include_hidden {
+            report.hidden_skipped += 1;
+            continue;
+        }
+        let Some(s) = &stored[inst.model] else {
+            report.instances_lost += 1;
+            continue;
+        };
+        let wanted: Vec<String> = (0..s.slots)
+            .map(|slot| match inst.materials.get(slot) {
+                Some(o) if !o.is_empty() => o.clone(),
+                _ => s.materials.get(slot).cloned().unwrap_or_default(),
+            })
+            .collect();
+        let key = (inst.model, wanted);
+        let mesh = match mesh_of.get(&key) {
+            Some(&m) => m,
+            None => {
+                let ids: Vec<Option<usize>> = key
+                    .1
+                    .iter()
+                    .map(|p| (!p.is_empty()).then(|| materials.get(&mut w, p, &mut report)))
+                    .collect();
+                let m = w.add_mesh(short_name(&d.models[inst.model]), &s.handle, &ids);
+                mesh_of.insert(key, m);
+                report.meshes += 1;
+                m
+            }
+        };
+        let mut node = node_for(
+            &inst.transform,
+            &format!("{}{}", inst.scope, short_name(&d.models[inst.model])),
+            json!({
+                "type": inst.type_path,
+                "scope": inst.scope,
+                "object": inst.object,
+                "hidden": inst.hidden,
+                "zone": inst.role == InstanceRole::Zone,
+                "model": d.models[inst.model],
+                "lightmap": inst.lightmap.as_ref().map(|l| json!({
+                    "textures": l.textures, "coords": l.coords,
+                    "normalize": l.normalize, "normalize1": l.normalize1})),
+            }),
+        );
+        node["mesh"] = json!(mesh);
+        w.add_node(node);
+        report.nodes += 1;
+        report.triangles_placed += s.triangles;
+    }
+
+    // Lights, spawns and volumes as nodes with the level's values in extras
+    for l in &d.lights {
+        let t = Transform {
+            translation: l.position,
+            rotation: l.rotation,
+            ..Transform::IDENTITY
+        };
+        let rgb = l
+            .color
+            .map_or([1.0; 3], |c| [c[0] / 255.0, c[1] / 255.0, c[2] / 255.0]);
+        let spot = l
+            .angle
+            .filter(|_| !l.light_type.as_deref().is_some_and(|t| t.contains("OMNI")));
+        let mut light =
+            json!({"type": if spot.is_some() { "spot" } else { "point" }, "color": rgb});
+        if let Some(a) = spot {
+            light["spot"] =
+                json!({"outerConeAngle": (a.to_radians() / 2.0).min(std::f32::consts::FRAC_PI_2)});
+        }
+        if let Some(r) = l.radius {
+            light["range"] = json!(r);
+        }
+        let idx = w.add_light(light);
+        let mut node = node_for(
+            &t,
+            &format!("{}light {}", l.scope, short_name(&l.type_path)),
+            json!({
+                "light": true,
+                "type": l.type_path, "scope": l.scope, "object": l.object,
+                "color": l.color, "temperature": l.temperature, "colorMode": l.color_mode,
+                "brightness": l.brightness, "lumens": l.lumens, "radius": l.radius,
+                "angle": l.angle, "length": l.length, "width": l.width, "height": l.height,
+                "falloff": l.falloff, "falloffExponent": l.falloff_exponent,
+                "lightType": l.light_type, "texture": l.texture, "ies": l.ies,
+                "on": l.on, "directional": l.directional, "direction": l.direction,
+            }),
+        );
+        node["extensions"] = json!({"KHR_lights_punctual": {"light": idx}});
+        w.add_node(node);
+        report.lights += 1;
+    }
+    for s in &d.spawns {
+        let t = Transform {
+            translation: s.position,
+            rotation: s.rotation,
+            ..Transform::IDENTITY
+        };
+        w.add_node(node_for(
+            &t,
+            &format!("{}spawn {}", s.scope, short_name(&s.type_path)),
+            json!({"spawn": format!("{:?}", s.kind), "type": s.type_path, "scope": s.scope,
+                   "object": s.object, "tag": s.tag}),
+        ));
+    }
+    for v in &d.volumes {
+        w.add_node(node_for(
+            &v.transform,
+            &format!("{}volume {}", v.scope, short_name(&v.type_path)),
+            json!({"volume": true, "type": v.type_path, "scope": v.scope, "object": v.object,
+                   "dimensions": v.dimensions, "length": v.length, "width": v.width,
+                   "height": v.height, "radius": v.radius}),
+        ));
+    }
+    report.buffer_bytes = w.buffer_len();
+    w.finish(name, out_dir)?;
+    Ok(report)
+}
