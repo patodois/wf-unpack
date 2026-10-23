@@ -18,8 +18,8 @@ zstd = { version = "0.13", features = ["experimental"] }
 # Shared model types for crossovers with other game rewrites
 rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "263b74c550c49873e9a8b0298ca8434803037fd8", optional = true }
 
-# Only for the F_NOCACHE hint in cache.rs
-[target.'cfg(target_os = "macos")'.dependencies]
+# The F_NOCACHE hint in cache.rs and the peak memory report of check-levels
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]

@@ -8,6 +8,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod level_cmd;
+
 use wf_unpack::cache::Package;
 use wf_unpack::gltf;
 use wf_unpack::header::CommonHeader;
@@ -59,6 +61,9 @@ enum Command {
         /// The Cache.Windows folder
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
+        /// Package family holding the texture: Texture, or LightMap for level lightmaps
+        #[arg(long, default_value = "Texture")]
+        package: String,
     },
     /// Count the asset types in an H. package (by the common header), with an example path for each
     Kinds { toc: PathBuf },
@@ -144,6 +149,42 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// List what a level places (models, lights, volumes, spawns); with -o, export it to glTF
+    Level {
+        /// Path inside the packages, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level
+        path: String,
+        /// Print every light, spawn and volume and the full model list
+        #[arg(short, long)]
+        verbose: bool,
+        /// Output directory for <name>.gltf, <name>.bin and the baked PNGs
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Level of detail of every model, 0 (finest) to 4
+        #[arg(long, default_value_t = 0)]
+        lod: usize,
+        /// Also place objects that start hidden
+        #[arg(long)]
+        include_hidden: bool,
+        /// Skip texture baking: flat material colours only
+        #[arg(long)]
+        no_textures: bool,
+        /// Also write <name>_collision.gltf with the models' PhysX shapes
+        #[arg(long)]
+        collision: bool,
+        /// Shrink baked textures to at most this many pixels on a side
+        #[arg(long)]
+        max_texture: Option<u32>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Parse every level and summarise failures, with the peak memory used
+    CheckLevels {
+        /// Also build every level's description and read the geometry and PhysX shapes of the models it places
+        #[arg(long)]
+        deep: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -169,7 +210,12 @@ fn main() -> Result<()> {
         Command::List { toc, filter } => list(&toc, filter.as_deref()),
         Command::Extract { toc, pattern, out } => extract(&toc, &pattern, &out),
         Command::Check { dir, only } => check(&dir, only.as_deref()),
-        Command::Texture { path, out, game } => texture_cmd(&expand_home(&game), &path, &out),
+        Command::Texture {
+            path,
+            out,
+            game,
+            package,
+        } => texture_cmd(&expand_home(&game), &path, &out, &package),
         Command::Kinds { toc } => kinds_cmd(&toc),
         #[cfg(feature = "bridge")]
         Command::CheckBridge {
@@ -206,6 +252,30 @@ fn main() -> Result<()> {
             game,
         } => anim_cmd::anim_cmd(&expand_home(&game), &target, filter.as_deref()),
         Command::CheckAnims { game } => anim_cmd::check_anims_cmd(&expand_home(&game)),
+        Command::Level {
+            path,
+            verbose,
+            out,
+            lod,
+            include_hidden,
+            no_textures,
+            collision,
+            max_texture,
+            game,
+        } => level_cmd::level_cmd(
+            &expand_home(&game),
+            &path,
+            verbose,
+            out.as_deref(),
+            collision,
+            &wf_unpack::level_export::ExportOptions {
+                lod,
+                include_hidden,
+                textures: !no_textures,
+                max_texture,
+            },
+        ),
+        Command::CheckLevels { deep, game } => level_cmd::check_levels(&expand_home(&game), deep),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
 }
@@ -366,8 +436,8 @@ fn check(dir: &Path, only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn texture_cmd(game: &Path, path: &str, out: &Path) -> Result<()> {
-    let tex = Texture::load(game, path)?;
+fn texture_cmd(game: &Path, path: &str, out: &Path, package: &str) -> Result<()> {
+    let tex = TexturePackages::open_family(game, package)?.load(path)?;
     let png = out
         .extension()
         .is_some_and(|x| x.eq_ignore_ascii_case("png"));

@@ -308,3 +308,100 @@ fn excalibur_jog_animation() {
     let game_x = a.tracks[1].translation.as_ref().unwrap()[0][0];
     assert_eq!(hip.values[0], -game_x);
 }
+
+#[test]
+fn dojo_obstacle_course_level() {
+    use wf_unpack::level::{load_description, InstanceRole};
+    use wf_unpack::model::Model;
+    use wf_unpack::physx::{read_shapes, Collider};
+    let Some(dir) = game_dir() else { return };
+    let path = "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level";
+    let mut d = load_description(&dir, path).unwrap();
+    // One CSG zone and 498 placed models of 38 kinds; nothing starts hidden
+    assert_eq!((d.instances.len(), d.models.len()), (499, 39));
+    assert_eq!(
+        d.instances
+            .iter()
+            .filter(|i| i.role == InstanceRole::Zone)
+            .count(),
+        1
+    );
+    assert_eq!(d.instances.iter().filter(|i| i.hidden).count(), 0);
+    assert_eq!((d.lights.len(), d.volumes.len(), d.spawns.len()), (8, 4, 0));
+    assert!(d.static_levels.is_empty() && d.sheets.is_empty());
+    let l = &d.lights[0];
+    assert_eq!(l.color, Some([204.0, 220.0, 255.0, 255.0]));
+    assert_eq!(
+        (l.brightness, l.lumens, l.radius),
+        (Some(6.25), Some(10000.0), Some(30.0))
+    );
+    assert_eq!(l.temperature, Some(10000.0));
+    let zone = d
+        .instances
+        .iter()
+        .find(|i| i.role == InstanceRole::Zone)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        d.models[zone.model],
+        "/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_c.fbx"
+    );
+    assert_eq!(zone.lightmap.as_ref().unwrap().textures.len(), 2);
+
+    // The zone's geometry: 9005 vertices, 8 materials, and a PhysX triangle mesh of it
+    let geometry = Model::load(&dir, &d.models[zone.model]).unwrap();
+    assert_eq!(
+        (geometry.vertices.len(), geometry.indices.len()),
+        (9005, 18498)
+    );
+    assert_eq!(geometry.header.materials().len(), 8);
+    geometry.check_bounds().unwrap();
+    let mut body = Package::open_in(&dir, "B.Misc").unwrap().unwrap();
+    let raw = body.read_path(&d.models[zone.model]).unwrap().unwrap();
+    let shapes = read_shapes(&geometry.header.physx_shapes, &raw).unwrap();
+    let Collider::Triangles(mesh) = &shapes[0].collider else {
+        panic!("expected a triangle mesh")
+    };
+    assert_eq!((mesh.vertices.len(), mesh.indices.len() / 3), (2774, 5766));
+
+    // The placed models stand inside the zone's box, and every one has readable collision
+    let (lo, hi) = geometry.bounds();
+    for i in &d.instances {
+        let p = i.transform.translation;
+        for k in 0..3 {
+            assert!(
+                p[k] >= lo[k] - 1.0 && p[k] <= hi[k] + 1.0,
+                "{p:?} outside {lo:?}..{hi:?}"
+            );
+        }
+    }
+    let failures = d.load_collision(&dir).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(d.collision.len(), d.models.len());
+    assert!(d.collision.iter().flatten().any(|s| !s.is_empty()));
+    assert_eq!(d.collision_shapes(zone.model).unwrap().len(), 1);
+}
+
+#[test]
+fn static_level_of_a_hub() {
+    use wf_unpack::level::StaticLevel;
+    let Some(dir) = game_dir() else { return };
+    let path = "/Lotus/Levels/Hub/TennoProtoRelayHUBSummer/0.static";
+    let read = |name: &str| {
+        Package::open_in(&dir, name)
+            .unwrap()
+            .unwrap()
+            .read_path(path)
+            .unwrap()
+            .unwrap()
+    };
+    let s = StaticLevel::parse(&read("H.AnimRetarget"), &read("B.AnimRetarget")).unwrap();
+    assert_eq!((s.objects.len(), s.models.len()), (9335, 969));
+    assert!(s.models[0].starts_with("/Lotus/Objects/Lasria/"));
+    // Every object is listed under at least one zone group
+    let mut listed = vec![false; s.objects.len()];
+    for &i in &s.group_indices {
+        listed[i as usize] = true;
+    }
+    assert!(listed.iter().all(|&b| b));
+}

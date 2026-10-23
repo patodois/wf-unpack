@@ -68,6 +68,33 @@
 //! (and swaps two corners of every triangle) to get glTF's right-handed
 //! space; y is up in both, and characters then face +z as glTF expects.
 //!
+//! # Level meshes (types 105 and 109)
+//!
+//! The geometry of levels uses the same container. The header differs in
+//! three places: the physics reference tests its two words as bit masks (`& 8`)
+//! instead of comparing them with 8, a list of material paths follows the
+//! mesh list (absolute `/EE/...` or `/Lotus/...` paths, one per mesh), and
+//! there is no skeleton.
+//!
+//! - Type 105 (`N_a.fbx`) has the vertex layout of type 102, in `B.` and `F.`.
+//! - Type 109 (`N_c.fbx`, the geometry of a level's CSG zones) keeps
+//!   everything in `B.` and has 32-byte vertices with float positions:
+//!
+//! ```text
+//! f32[3]  position   in level units; the fourth float is 1.0
+//! u8[3]   normal     octahedral, then an unused 0
+//! u8[3]   tangent    octahedral, then 0 (no bitangent sign is stored)
+//! f16[2]  uv0
+//! f16[2]  uv1        the lightmap coordinates
+//! ```
+//!
+//! After the PhysX data come zero or more 0x120-byte blocks of unknown
+//! meaning (this reader skips as many as the part size implies), then two
+//! bytes, the vertices and the u16 indices. Computed from the UV
+//! derivatives of all 9,005 vertices of one level mesh, `cross(normal,
+//! tangent)` always points towards increasing v, which is the `+1` sign of
+//! type 102.
+//!
 //! The layout follows Warframe-Exporter's reader for type 102; the checks in
 //! [`Model::from_parts`] (header consumed exactly, part sizes, decoded
 //! bounds equal to the header's) hold for every model `check-models` reads.
@@ -82,7 +109,15 @@ use crate::header::CommonHeader;
 
 pub const KIND_STATIC: u16 = 102;
 pub const KIND_SKINNED: u16 = 281;
+/// Level geometry with the packed vertices of type 102 (`N_a.fbx`).
+pub const KIND_LEVEL_PACKED: u16 = 105;
+/// Level geometry with float positions, all in `B.` (`N_c.fbx`, CSG zones).
+pub const KIND_LEVEL_FLOAT: u16 = 109;
 pub const VERTEX_SIZE: usize = 24;
+/// Type 109 vertices have float positions.
+pub const FLOAT_VERTEX_SIZE: usize = 32;
+/// Unknown blocks between the PhysX data and the vertices of some type 109 models.
+pub const EXTRA_BLOCK: usize = 0x120;
 /// Skinned vertices add four bone indices and packed weights.
 pub const SKINNED_VERTEX_SIZE: usize = 32;
 pub const LOD_COUNT: usize = 5;
@@ -120,6 +155,19 @@ pub struct SkeletonHeader {
     pub morph_skip: u32,
 }
 
+/// A PhysX shape listed in a model header; its cooked data is at the start of `B.`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysxShape {
+    /// Shape type (0 to 7; see the module docs of [`crate::physx`]).
+    pub kind: u32,
+    /// The bytes after the type: 0x4C, 0x60 or 0x50 of them.
+    pub raw: Vec<u8>,
+    pub vector1: [f32; 4],
+    pub vector2: [f32; 4],
+    /// Size of the shape's cooked data in `B.`.
+    pub len: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelHeader {
     pub common: CommonHeader,
@@ -134,9 +182,13 @@ pub struct ModelHeader {
     pub meshes: Vec<MeshInfo>,
     /// Sizes of the PhysX shapes at the start of the B. part.
     pub physx_lens: Vec<u32>,
+    /// The same shapes with the fields of their header entries.
+    pub physx_shapes: Vec<PhysxShape>,
     pub messages: Vec<String>,
     /// Present for skinned models (type 281).
     pub skeleton: Option<SkeletonHeader>,
+    /// Level meshes (105, 109): one material path per mesh.
+    pub material_paths: Vec<String>,
 }
 
 fn read_meshes(r: &mut Reader) -> Result<Vec<MeshInfo>> {
@@ -204,27 +256,38 @@ fn skip_morph_structs(r: &mut Reader, meshes: usize) -> Result<u32> {
     Ok(total)
 }
 
-fn skip_physics_ref(r: &mut Reader) -> Result<()> {
+fn skip_physics_ref(r: &mut Reader, bit_mask: bool) -> Result<()> {
     let a = r.u32()?;
     let b = r.u32()?;
-    if a == 8 || b == 8 {
+    let flagged = |v: u32| if bit_mask { v & 8 != 0 } else { v == 8 };
+    if flagged(a) || flagged(b) {
         r.skip(2)?;
     }
     r.str32(1024).context("physics reference")?;
     Ok(())
 }
 
+fn read_material_paths(r: &mut Reader) -> Result<Vec<String>> {
+    let n = r.u32()?;
+    ensure!(n <= 100, "implausible material count {n}");
+    (0..n).map(|_| r.str32(1024)).collect()
+}
+
 impl ModelHeader {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let common = CommonHeader::parse(data).context("common header")?;
         ensure!(
-            common.kind == KIND_STATIC || common.kind == KIND_SKINNED,
-            "model type {} is not supported (only {KIND_STATIC} and {KIND_SKINNED})",
+            matches!(
+                common.kind,
+                KIND_STATIC | KIND_SKINNED | KIND_LEVEL_PACKED | KIND_LEVEL_FLOAT
+            ),
+            "model type {} is not supported (only {KIND_STATIC}, {KIND_SKINNED}, {KIND_LEVEL_PACKED} and {KIND_LEVEL_FLOAT})",
             common.kind
         );
+        let level_mesh = matches!(common.kind, KIND_LEVEL_PACKED | KIND_LEVEL_FLOAT);
         let mut r = Reader::at(data, common.len)?;
         r.skip(0x30)?;
-        skip_physics_ref(&mut r)?;
+        skip_physics_ref(&mut r, level_mesh)?;
         let (
             vertex_count,
             index_count,
@@ -234,7 +297,26 @@ impl ModelHeader {
             body_index_count,
         );
         let (bounds_min, bounds_max, meshes, skeleton);
-        if common.kind == KIND_STATIC {
+        let mut material_paths = Vec::new();
+        if common.kind == KIND_LEVEL_FLOAT {
+            r.skip(0x28)?;
+            bounds_min = r.f32x4()?;
+            bounds_max = r.f32x4()?;
+            vertex_count = r.u32()?;
+            index_count = r.u32()?;
+            morph_count = r.u32()?;
+            bone_count = r.u32()?;
+            ensure!(
+                morph_count == 0 && bone_count == 0,
+                "level mesh with {morph_count} morphs and {bone_count} bones"
+            );
+            r.skip(0x67)?;
+            // Everything is in B.
+            (body_vertex_count, body_index_count) = (vertex_count, index_count);
+            meshes = read_meshes(&mut r)?;
+            material_paths = read_material_paths(&mut r)?;
+            skeleton = None;
+        } else if common.kind == KIND_STATIC || common.kind == KIND_LEVEL_PACKED {
             r.skip(0x28)?;
             bounds_min = r.f32x4()?;
             bounds_max = r.f32x4()?;
@@ -247,6 +329,9 @@ impl ModelHeader {
             body_index_count = r.u32()?;
             r.skip(0x3D)?;
             meshes = read_meshes(&mut r)?;
+            if common.kind == KIND_LEVEL_PACKED {
+                material_paths = read_material_paths(&mut r)?;
+            }
             skeleton = None;
         } else {
             r.skip(0x2C)?;
@@ -310,7 +395,7 @@ impl ModelHeader {
             }
             let morph_skip = skip_morph_structs(&mut r, meshes.len())?;
             r.skip(0x2F)?;
-            skip_physics_ref(&mut r)?;
+            skip_physics_ref(&mut r, false)?;
             skeleton = Some(SkeletonHeader {
                 weighted,
                 tree,
@@ -323,8 +408,8 @@ impl ModelHeader {
             body_vertex_count <= vertex_count && body_index_count <= index_count,
             "B. counts {body_vertex_count}/{body_index_count} exceed the totals {vertex_count}/{index_count}"
         );
-        if common.kind == KIND_STATIC {
-            skip_physics_ref(&mut r)?;
+        if common.kind != KIND_SKINNED {
+            skip_physics_ref(&mut r, level_mesh)?;
         }
 
         let physx_count = r.u32()?;
@@ -333,19 +418,30 @@ impl ModelHeader {
             "implausible PhysX shape count {physx_count}"
         );
         let mut physx_lens = Vec::with_capacity(physx_count as usize);
+        let mut physx_shapes = Vec::with_capacity(physx_count as usize);
         for _ in 0..physx_count {
-            let ty = r.u32()?;
-            r.skip(match ty {
-                1 => 0x4C,
-                7 => 0x60,
-                _ => 0x50,
-            })?;
-            r.skip(32)?;
-            if !matches!(ty, 0 | 2 | 3) {
+            let kind = r.u32()?;
+            let raw = r
+                .bytes(match kind {
+                    1 => 0x4C,
+                    7 => 0x60,
+                    _ => 0x50,
+                })?
+                .to_vec();
+            let (vector1, vector2) = (r.f32x4()?, r.f32x4()?);
+            if !matches!(kind, 0 | 2 | 3) {
                 r.skip(4)?;
             }
             r.skip(4)?;
-            physx_lens.push(r.u32()?);
+            let len = r.u32()?;
+            physx_lens.push(len);
+            physx_shapes.push(PhysxShape {
+                kind,
+                raw,
+                vector1,
+                vector2,
+                len,
+            });
             r.skip(8)?;
         }
 
@@ -372,8 +468,10 @@ impl ModelHeader {
             body_index_count,
             meshes,
             physx_lens,
+            physx_shapes,
             messages,
             skeleton,
+            material_paths,
         })
     }
 
@@ -383,8 +481,11 @@ impl ModelHeader {
         std::array::from_fn(|k| self.bounds_min[k].abs().max(self.bounds_max[k].abs()))
     }
 
-    /// Material names from the attribute text, one per mesh.
+    /// Material names, one per mesh: the header's list for level meshes, else the attribute text's.
     pub fn materials(&self) -> Vec<String> {
+        if !self.material_paths.is_empty() {
+            return self.material_paths.clone();
+        }
         let attrs = &self.common.attributes;
         let Some(start) = attrs.find("Materials={") else {
             return Vec::new();
@@ -443,6 +544,25 @@ pub fn decode_vertex(raw: &[u8], scale: [f32; 3]) -> Vertex {
         ao: f32::from(raw[15]) / 255.0,
         uv0: [half_at(16), half_at(18)],
         uv1: [half_at(20), half_at(22)],
+        joints: [0; 4],
+        weights: [0.0; 4],
+    }
+}
+
+/// Decodes one 32-byte type 109 vertex (see the module docs).
+pub fn decode_float_vertex(raw: &[u8]) -> Vertex {
+    let f32_at = |o: usize| f32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+    let half_at = |o: usize| f16_to_f32(u16::from_le_bytes([raw[o], raw[o + 1]]));
+    Vertex {
+        position: [f32_at(0), f32_at(4), f32_at(8)],
+        normal: decode_octahedral([raw[16], raw[17], raw[18]]),
+        tangent: {
+            let [x, y, z] = decode_octahedral([raw[20], raw[21], raw[22]]);
+            [x, y, z, 1.0]
+        },
+        ao: f32::from(raw[23]) / 255.0,
+        uv0: [half_at(24), half_at(26)],
+        uv1: [half_at(28), half_at(30)],
         joints: [0; 4],
         weights: [0.0; 4],
     }
@@ -818,8 +938,11 @@ impl Model {
             header.index_count as usize - bi,
         );
         let physx: usize = header.physx_lens.iter().map(|&l| l as usize).sum();
+        let float_positions = header.common.kind == KIND_LEVEL_FLOAT;
         let vsize = if header.skeleton.is_some() {
             SKINNED_VERTEX_SIZE
+        } else if float_positions {
+            FLOAT_VERTEX_SIZE
         } else {
             VERTEX_SIZE
         };
@@ -836,7 +959,19 @@ impl Model {
             }
             None => (0, 0),
         };
-        let expected_body = physx + 2 + skel_len + bv * vsize + morph_len + bi * 2;
+        let mut expected_body = physx + 2 + skel_len + bv * vsize + morph_len + bi * 2;
+        // Some type 109 models carry whole unknown blocks after the PhysX data
+        let mut physx = physx;
+        if float_positions && body.len() > expected_body {
+            let extra = body.len() - expected_body;
+            ensure!(
+                extra.is_multiple_of(EXTRA_BLOCK),
+                "B. part is {} bytes, expected {expected_body} plus whole blocks of {EXTRA_BLOCK}",
+                body.len()
+            );
+            expected_body += extra;
+            physx += extra;
+        }
         let expected_full = fv * vsize + fi * 2;
         if header.morph_count > 0 && (body.len(), full.len()) != (expected_body, expected_full) {
             bail!(
@@ -862,8 +997,10 @@ impl Model {
         let body_idx = &rest[morph_len..];
         let (full_verts, full_idx) = full.split_at(fv * vsize);
         let decode = |v: &[u8]| {
-            if vsize == SKINNED_VERTEX_SIZE {
+            if header.skeleton.is_some() {
                 decode_skinned_vertex(v, scale)
+            } else if float_positions {
+                decode_float_vertex(v)
             } else {
                 decode_vertex(v, scale)
             }
@@ -1180,6 +1317,113 @@ mod tests {
         let n = bad.len();
         bad[n - 2..].copy_from_slice(&9u16.to_le_bytes());
         assert!(Model::from_parts(header, &body, &bad).is_err());
+    }
+
+    /// A type 109 (or 105) header with one mesh of `indices` indices and two material paths listed.
+    fn level_mesh_header(kind: u32, vertices: u32, indices: u32) -> Vec<u8> {
+        let mut h = crate::header::tests::build(&["/Lotus/Levels/X/0_c.fbx"], "", kind);
+        h.extend([0; 0x30]);
+        h.extend([5, 0, 0, 0, 9, 0, 0, 0]); // physics reference: 9 & 8 set, so two extra bytes
+        h.extend([0; 2]);
+        s32(&mut h, "/EE/Types/Physics/Materials/Default");
+        h.extend([0; 0x28]);
+        for f in [-1.0f32, 0.0, -2.0, 0.0, 3.0, 4.0, 5.0, 0.0] {
+            h.extend(f.to_le_bytes());
+        }
+        for v in [vertices, indices, 0, 0] {
+            h.extend(v.to_le_bytes());
+        }
+        if kind == 109 {
+            h.extend([0; 0x67]);
+        } else {
+            h.extend([0; 0x22]);
+            h.extend(0u32.to_le_bytes());
+            h.extend(0u32.to_le_bytes());
+            h.extend([0; 0x3D]);
+        }
+        h.extend(1u32.to_le_bytes());
+        h.extend([0; 32]);
+        s32(&mut h, "/EE/Materials/Default");
+        for v in [0, 0, 0, 0, 0, indices, 0, 0, 0, 0] {
+            h.extend(u32::to_le_bytes(v));
+        }
+        h.extend([0; 0x20]);
+        h.extend(0u32.to_le_bytes());
+        h.extend([0; 0x10]);
+        h.extend(0u32.to_le_bytes()); // u16 array
+        h.extend(1u32.to_le_bytes()); // material paths
+        s32(&mut h, "/EE/Materials/Default");
+        h.extend([5, 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+        s32(&mut h, "");
+        h.extend(0u32.to_le_bytes()); // PhysX
+        h.extend(0u32.to_le_bytes()); // messages
+        h
+    }
+
+    fn float_vertex(p: [f32; 3], uv1: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        for f in p {
+            v.extend(f.to_le_bytes());
+        }
+        v.extend(1.0f32.to_le_bytes());
+        v.extend([0x7F, 0xF7, 0xFF, 0]); // normal +z
+        v.extend([0x7F, 0xFF, 0xFF, 0]); // tangent +y
+        v.extend([0x00, 0x38, 0x00, 0x3C]); // uv0 (0.5, 1.0)
+        v.extend(uv1.to_le_bytes());
+        v.extend(0u16.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn reads_level_geometry_with_float_positions() {
+        let header = ModelHeader::parse(&level_mesh_header(109, 3, 3)).unwrap();
+        assert_eq!(header.common.kind, KIND_LEVEL_FLOAT);
+        assert_eq!(header.material_paths, ["/EE/Materials/Default"]);
+        assert_eq!(header.materials(), ["/EE/Materials/Default"]);
+        assert_eq!((header.body_vertex_count, header.body_index_count), (3, 3));
+        assert_eq!(header.meshes[0].lod_counts[0], 3);
+
+        let mut body = vec![0, 0];
+        for p in [[0.0, 0.0, 0.0], [10.5, 0.0, 0.0], [0.0, 20.25, -3.0]] {
+            body.extend(float_vertex(p, 0x3C00));
+        }
+        for i in [0u16, 1, 2] {
+            body.extend(i.to_le_bytes());
+        }
+        let model = Model::from_parts(header.clone(), &body, &[]).unwrap();
+        assert_eq!(model.vertices[1].position, [10.5, 0.0, 0.0]);
+        assert_eq!(model.vertices[2].position, [0.0, 20.25, -3.0]);
+        assert_eq!(model.vertices[0].uv0, [0.5, 1.0]);
+        assert_eq!(model.vertices[0].uv1, [1.0, 0.0]);
+        assert_eq!(model.vertices[0].tangent[3], 1.0);
+        let near = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3);
+        assert!(near(&model.vertices[0].normal, &[0.0, 0.0, 1.0]));
+        assert!(near(&model.vertices[0].tangent[..3], &[0.0, 1.0, 0.0]));
+        assert_eq!(model.lod_indices(0, 0).unwrap(), [0, 1, 2]);
+
+        // Whole 0x120-byte blocks after the PhysX data are skipped; other sizes fail
+        let mut with_extra = vec![0xAA; EXTRA_BLOCK];
+        with_extra.extend(&body);
+        assert_eq!(
+            Model::from_parts(header.clone(), &with_extra, &[])
+                .unwrap()
+                .vertices
+                .len(),
+            3
+        );
+        assert!(Model::from_parts(header.clone(), &body[..body.len() - 1], &[]).is_err());
+        let mut odd = vec![0; 5];
+        odd.extend(&body);
+        assert!(Model::from_parts(header, &odd, &[]).is_err());
+    }
+
+    #[test]
+    fn reads_packed_level_geometry_header() {
+        let header = ModelHeader::parse(&level_mesh_header(105, 4, 6)).unwrap();
+        assert_eq!(header.common.kind, KIND_LEVEL_PACKED);
+        assert_eq!(header.material_paths.len(), 1);
+        assert_eq!((header.vertex_count, header.index_count), (4, 6));
+        assert_eq!((header.body_vertex_count, header.body_index_count), (0, 0));
     }
 
     #[test]
