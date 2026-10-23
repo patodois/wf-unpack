@@ -442,6 +442,38 @@ impl Pick {
     pub fn clips(&self) -> BTreeSet<i32> {
         self.table.iter().copied().filter(|&c| c >= 0).collect()
     }
+
+    /// The values of the variables that select table entry `index`: the first variable
+    /// varies slowest. `cards` gives the number of values of each variable (see
+    /// [`Tree::cardinalities`]); with two or more variables the last may be unknown, and
+    /// is then the quotient of the table size.
+    pub fn values_of(&self, index: usize, cards: &BTreeMap<u32, usize>) -> Option<Vec<usize>> {
+        let mut dims: Vec<Option<usize>> =
+            self.vars.iter().map(|v| cards.get(v).copied()).collect();
+        let known: usize = dims.iter().flatten().product();
+        match dims.iter().filter(|d| d.is_none()).count() {
+            0 => {}
+            1 if known > 0 && self.table.len().is_multiple_of(known) => {
+                let missing = self.table.len() / known;
+                dims.iter_mut()
+                    .filter(|d| d.is_none())
+                    .for_each(|d| *d = Some(missing));
+            }
+            _ => return None,
+        }
+        if dims.iter().flatten().product::<usize>() != self.table.len() || index >= self.table.len()
+        {
+            return None;
+        }
+        let mut rest = index;
+        let mut out = vec![0; dims.len()];
+        for (i, d) in dims.iter().enumerate().rev() {
+            let d = d.unwrap();
+            out[i] = rest % d;
+            rest /= d;
+        }
+        Some(out)
+    }
 }
 
 /// Plays a clip chosen by `pick`.
@@ -1227,6 +1259,88 @@ fn parse_masks(r: &mut Reader) -> Result<Node> {
 }
 
 // ---------------------------------------------------------------------------
+// Movement sets and aim-pose sets
+
+pub const KIND_MOVEMENT_SET: u16 = 14;
+pub const KIND_AIM_POSE_SET: u16 = 19;
+
+/// The numbers that follow the clip names of a movement set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovementParams {
+    /// 0 in the sprint sets, 1 in the aim-walk sets.
+    pub a: u32,
+    /// 12 in the sprint sets, 5 in the aim-walk sets.
+    pub b: f32,
+    /// 180 or 1080.
+    pub angle: f32,
+    /// 360 or 720 (degrees per second, by the size).
+    pub turn: f32,
+    pub c: f32,
+    /// 10 or 30.
+    pub d: f32,
+    pub flags: [u8; 4],
+}
+
+/// A movement set (type 14: the clips of a directional locomotion, e.g. forward, back, left and
+/// right) or an aim-pose set (type 19: the clip and the bone it aims). The tables in the `B.`
+/// part are not read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovementSet {
+    pub kind: u16,
+    /// The files the set was built from.
+    pub sources: Vec<String>,
+    /// The names in the body, in the order the set uses them (a file name, or a path).
+    pub names: Vec<String>,
+    /// Type 19: the bone it aims.
+    pub bone: Option<String>,
+    pub params: Option<MovementParams>,
+}
+
+impl MovementSet {
+    pub fn parse(head: &[u8]) -> Result<Self> {
+        let common = CommonHeader::parse(head).context("common header")?;
+        let mut r = Reader::at(head, common.len)?;
+        match common.kind {
+            KIND_MOVEMENT_SET => {
+                let n = r.u32()? as usize;
+                ensure!(n <= 64, "implausible clip count {n}");
+                let names = (0..n)
+                    .map(|_| r.str32(MAX_STR))
+                    .collect::<Result<Vec<_>>>()?;
+                let params = MovementParams {
+                    a: r.u32()?,
+                    b: r.f32()?,
+                    angle: r.f32()?,
+                    turn: r.f32()?,
+                    c: r.f32()?,
+                    d: r.f32()?,
+                    flags: r.bytes(4)?.try_into().unwrap(),
+                };
+                Ok(MovementSet {
+                    kind: common.kind,
+                    sources: common.sources,
+                    names,
+                    bone: None,
+                    params: Some(params),
+                })
+            }
+            KIND_AIM_POSE_SET => {
+                let name = r.str32(MAX_STR)?;
+                let bone = r.str32(MAX_STR)?;
+                Ok(MovementSet {
+                    kind: common.kind,
+                    sources: common.sources,
+                    names: vec![name],
+                    bone: Some(bone),
+                    params: None,
+                })
+            }
+            k => bail!("type {k} is not a movement or aim-pose set"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reading from the packages
 
 /// `H.Misc`/`B.Misc` (state machines, movement sets) and `H.AnimRetarget`/`B.AnimRetarget`
@@ -1291,6 +1405,16 @@ impl GraphPackages {
             .read_path(path)?
             .with_context(|| format!("{path} has no B.Misc part"))?;
         Fsm::parse(&head, &body)
+            .with_context(|| path.to_string())
+            .map(Some)
+    }
+
+    /// A movement set or aim-pose set; `None` when the path is not in `H.Misc`.
+    pub fn movement_set(&mut self, path: &str) -> Result<Option<MovementSet>> {
+        let Some(head) = self.misc_head.read_path(path)? else {
+            return Ok(None);
+        };
+        MovementSet::parse(&head)
             .with_context(|| path.to_string())
             .map(Some)
     }
@@ -1515,6 +1639,25 @@ pub fn variable_hints<'a>(
 }
 
 impl Tree {
+    /// The number of values of each variable, from the animation tables that have only that
+    /// variable (a table has one entry per value).
+    pub fn cardinalities(&self) -> BTreeMap<u32, usize> {
+        let mut out = BTreeMap::new();
+        for n in &self.nodes {
+            if let Node::Animation(a) | Node::NamedAnimation(a) | Node::CinematicAnimation(a) = n {
+                if let [v] = a.pick.vars[..] {
+                    out.entry(v).or_insert(a.pick.table.len());
+                }
+            }
+            if let Node::Listener(l) = n {
+                if let [v] = l.pick.vars[..] {
+                    out.entry(v).or_insert(l.pick.table.len());
+                }
+            }
+        }
+        out
+    }
+
     /// For every node, the nodes that list it as a child.
     pub fn parents(&self) -> Vec<Vec<usize>> {
         let mut out = vec![Vec::new(); self.nodes.len()];
@@ -1564,6 +1707,175 @@ impl Tree {
         }
         None
     }
+}
+
+/// How the path to a leaf passes a node: which slot of which node is taken, and the variable
+/// value that takes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Selection {
+    pub node: usize,
+    pub kind: String,
+    /// The variable the node switches on, when it switches on one.
+    pub var: Option<u32>,
+    /// Child slot taken; for a `Select` it is the value of `var`.
+    pub slot: usize,
+}
+
+/// A clip a leaf node plays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipUse {
+    pub clip: String,
+    /// Speed (m/s) at which a speed blend plays the clip at its own rate.
+    pub speed: Option<f32>,
+    /// Playback rate multiplier a speed blend gives it.
+    pub rate: Option<f32>,
+    /// Variable values that choose it in an animation table.
+    pub when: Vec<(u32, usize)>,
+}
+
+/// A node that plays clips, and the first path found to it from a start node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leaf {
+    pub node: usize,
+    pub kind: String,
+    pub path: Vec<Selection>,
+    /// Seconds the node blends in, for animation nodes.
+    pub blend: Option<f32>,
+    pub clips: Vec<ClipUse>,
+}
+
+fn matches_folder(path: &str, folder_name: &str) -> bool {
+    let (dir, _) = path.rsplit_once('/').unwrap_or(("", path));
+    dir.split('/').any(|s| s.eq_ignore_ascii_case(folder_name))
+}
+
+impl Tree {
+    /// Every node under `start` that plays clips, each once, with the way to it. With `stance`
+    /// (a folder name such as `Sword` or `Unarmed`), only leaves with a clip in a folder of that
+    /// name, and only those clips.
+    pub fn leaves(&self, start: usize, stance: Option<&str>) -> Vec<Leaf> {
+        let cards = self.cardinalities();
+        let mut seen = vec![false; self.nodes.len()];
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        self.collect_leaves(start, stance, &cards, &mut seen, &mut path, &mut out);
+        out
+    }
+
+    fn collect_leaves(
+        &self,
+        node: usize,
+        stance: Option<&str>,
+        cards: &BTreeMap<u32, usize>,
+        seen: &mut Vec<bool>,
+        path: &mut Vec<Selection>,
+        out: &mut Vec<Leaf>,
+    ) {
+        if std::mem::replace(&mut seen[node], true) {
+            return;
+        }
+        let keep = |p: &str| stance.is_none_or(|s| matches_folder(p, s));
+        let mut clips = Vec::new();
+        let mut blend = None;
+        match &self.nodes[node] {
+            Node::Animation(a) | Node::NamedAnimation(a) | Node::CinematicAnimation(a) => {
+                blend = Some(a.blend);
+                for (i, &c) in a.pick.table.iter().enumerate() {
+                    let Some(p) = self.clip(c) else { continue };
+                    if keep(p) {
+                        let when = a.pick.values_of(i, cards).map_or_else(Vec::new, |vals| {
+                            a.pick.vars.iter().copied().zip(vals).collect()
+                        });
+                        clips.push(ClipUse {
+                            clip: p.to_string(),
+                            speed: None,
+                            rate: None,
+                            when,
+                        });
+                    }
+                }
+            }
+            Node::SpeedBlend { points, .. } => {
+                for p in points {
+                    if let Some(c) = self.clips.get(p.clip as usize).filter(|c| keep(c)) {
+                        clips.push(ClipUse {
+                            clip: c.clone(),
+                            speed: Some(p.speed),
+                            rate: Some(p.rate),
+                            when: Vec::new(),
+                        });
+                    }
+                }
+            }
+            Node::Parametric { path } if keep(path) => clips.push(ClipUse {
+                clip: path.clone(),
+                speed: None,
+                rate: None,
+                when: Vec::new(),
+            }),
+            _ => {}
+        }
+        if !clips.is_empty() {
+            out.push(Leaf {
+                node,
+                kind: self.graph.type_name(node).to_string(),
+                path: path.clone(),
+                blend,
+                clips,
+            });
+        }
+        let var = match &self.nodes[node] {
+            Node::Select { var, .. } | Node::SingleAxis { var, .. } => Some(*var),
+            _ => None,
+        };
+        for (slot, &c) in self.graph.edges[node].iter().enumerate() {
+            let Ok(c) = usize::try_from(c) else { continue };
+            path.push(Selection {
+                node,
+                kind: self.graph.type_name(node).to_string(),
+                var,
+                slot,
+            });
+            self.collect_leaves(c, stance, cards, seen, path, out);
+            path.pop();
+        }
+    }
+}
+
+/// The weight of a bone in a blend mask.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneWeight {
+    pub bone: String,
+    pub weight: f32,
+    pub additive: bool,
+}
+
+/// Reads a mask entity (`Masks={{Name=GAME_C1_SPINE1 Weight=0.75 Additive=0}...}`) from Packages.bin.
+pub fn bone_mask(
+    types: &mut crate::level::TypeResolver,
+    path: &str,
+) -> Result<Option<Vec<BoneWeight>>> {
+    let Some(info) = types.resolve(path)? else {
+        return Ok(None);
+    };
+    let Some((masks, _)) = info.props.get("Masks") else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    for m in masks.items() {
+        let Some(bone) = m.get("Name").and_then(|v| v.text()) else {
+            continue;
+        };
+        out.push(BoneWeight {
+            bone: bone.to_string(),
+            weight: m.get("Weight").and_then(|v| v.float()).unwrap_or(0.0),
+            additive: m
+                .get("Additive")
+                .and_then(|v| v.text())
+                .is_some_and(|t| t.trim() == "1"),
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Where a tree's locomotion state machine is.

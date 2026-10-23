@@ -13,6 +13,8 @@ Evolution Engine) from your own install:
   skeleton, inverse bind matrices, joints and weights
 - skeletal animations (type 132): idle, walk, run, sprint, jump, slide and the other ~25,000 clips, as
   glTF animations on a model's skeleton
+- animation state machines (`.animfsm`) and trees (`.animtree`): which clip plays when, with the blend times,
+  for Excalibur's locomotion and the rest of the player's controller
 - levels (`.level`, `.static`): the objects a level places, with their types, transforms and attributes; its
   geometry (types 105/109), PhysX collision shapes, lights, spawn points and portals, exported to glTF with each
   model stored once and instanced by nodes
@@ -57,6 +59,13 @@ wf-unpack anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --filter /Te
 wf-unpack anim /Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/JogForward_anim.fbx
 wf-unpack model /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx -o out/ --animations Tenno/Movement/MeleeWeapon/Sword/
 wf-unpack check-anims --game $C
+
+# What Excalibur's controller does: the locomotion state machine (states, transitions, blend times,
+# conditions), the variables, the clips of each state (--stance Sword: only that folder's clips) and
+# the blend masks; check-animtrees decodes every state machine and tree
+wf-unpack animtree /Lotus/Powersuits/Excalibur/ExcaliburBaseSuit
+wf-unpack animtree /Lotus/Powersuits/Excalibur/ExcaliburBaseSuit --stance Sword
+wf-unpack check-animtrees --game $C
 
 # Packages.bin: properties of an asset (and its parents), text search, full decode
 wf-unpack props /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatinePBR
@@ -277,8 +286,7 @@ names `Excalibur_skel.fbx`); the controller is the default
 and some suits override it with `DefaultAnimControllerOverride`. The `.animtree`
 files (in `H.AnimRetarget`), the `.animfsm` state machines (type 383) and the
 movement sets (types 14 and 19, e.g. `/Lotus/Animations/Tenno/Movement/Unarmed/UnarmedMovement`)
-list clip paths as plain text; they are not decoded, so which clip the game
-picks when is not derived.
+list clip paths as plain text; the next section decodes them.
 
 Movement clips for an Excalibur with his sword out
 (`/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/`; the same names exist
@@ -316,11 +324,111 @@ Not read, and why:
   scheme and are decoded, but nothing in the data checks them.
 - Interpolation: the data has no interpolation field; keys are exported as
   linear (spherical for rotations).
-- The `Rate` play-speed attribute, additive and partial-body blending
-  (`BlendMaskSmooth`, masks in the trees), foot IK, and everything in the
-  animation trees and state machines.
+- The `Rate` play-speed attribute (the trees carry the rates they play clips at; see below),
+  the blending itself and foot IK.
 - Clips of other skeletons (creatures, weapon rigs, cameras) decode, but
   `--animations` only adds clips whose every bone is in the model.
+
+### Animation trees and state machines
+
+`src/animtree.rs` reads `.animfsm` (type 383, 419 files in `H.Misc`/`B.Misc`) and `.animtree` (type 388, 906
+files in `H.AnimRetarget`/`B.AnimRetarget`), and follows Packages.bin from a suit to the tree its controller
+runs. The module docs have the byte layouts; the facts that matter:
+
+- **One container.** Both are a graph of nodes: the `H.` part holds a type list and each node's body, the `B.`
+  part the child lists (`-1` is an empty slot). Node `i`'s children mean what its type says: a `Select` has one
+  slot per value of its variable, a state machine node one per exposed state, a blend two inputs. A tree ends with
+  four string pools (clips, state machines, sub-trees, errors) that nodes index.
+- **State machines.** Every node is a state: name, the child slot that plays in it, conditions, transitions
+  (blend time in seconds, a small mode word, conditions), events, and the transition's target taken from the edge
+  list. The last transition of a state is stored in another layout and its target is the first edge. A condition is
+  `variable operator text value`: `v108 == JOG(1.0)`. The operator is 0 `==`, 1 `!=`; 2, 3, 4, 5 are
+  `<`, `<=`, `>`, `>=` (read from the speed checks: `Moving` goes to `Idle` on `v126 < 0.05`).
+- **Trees.** 36 node types decode: clip nodes (a table from up to three variables to a clip index, plus a blend time),
+  `Select` (one child per value of a variable), `SpeedBlend` (clip, speed, rate), `SingleAxisBlend` (direction and
+  pitch points), partial-body and additive blends, request listeners, random/sequence nodes, sub-trees, IK nodes.
+  `check-animtrees`: all 419 state machines (3,258 states, 9,576 transitions) and 581 of 906 trees (134,139 nodes);
+  the rest need one of 13 more node types that are not read (`AimPosesAnimationNode` 101 trees, `ParametricMovementNode` 81,
+  `LookIK` 65, `GenericParametric3DBlendNode` 37, ...).
+- **Variables are numbers.** The data never names them. What it keeps are the texts they are compared with
+  (`JOG`, `FBA_ROLL`, `MELEE_ONE_HAND`) and, where an editor expression was cut into pieces, the name inside it
+  (`18 || Action == 19` gives `Action` for v2, `Turn Angle` for v142). The controller's actions set `IV_` variables to
+  enum names, which names v77 `IV_JUMP`, v79 `IV_JUMP_STYLE`, v105 `IV_MOVE_ACTION`. The rest stay `vNN`.
+
+Excalibur's chain: `ExcaliburBaseSuit` (`Mesh=ExcaliburBody_skel.fbx`, default customization
+`AnimationSet=ExcaliburNobleAnims`, which replaces `PRN_IDLE_OVERRIDE` with `ExcaliburNobleIdleSubTree.animtree`),
+no `DefaultAnimControllerOverride`, so `/Lotus/Types/Player/TennoAnimController`
+(`AnimTree=Animation/SimpleTennoAnimTree.animtree`, with the actions that set `IV_` variables). That tree has 1,936
+nodes, 910 clips, 45 state machines, 10 sub-trees. Its root machine `FsmRoot` exposes `Injury`, `Locomotion`,
+`Requested Animation`...; the `Locomotion` child leads through IK blends to `FsmTestLocomotion`:
+
+| State (exposed child) | Goes to (blend in seconds) |
+|---|---|
+| Idle | ZipLine, `EnterWallrun`, GrapplingHook (0.3) on `v108` == ZIPLINE, WALLRUN, GRAPPLINGHOOK; branch state #8 (0.3) on `v126 > 0.1`, which leads to Moving or SprintStart (0.3); branch state #1 on `v15`/`v90` |
+| Moving | Sprinting (0.3) `v108 == SPRINT`; Slide (0.3) `v108 == SLIDE`; ZipLine, `EnterWallrun`, GrapplingHook (0.3); Idle (0.3) `v126 < 0.05`; branch state #1 |
+| Sprinting | SprintStop (0.3) `v126 < 0.05`; Moving (0.3) when `v108 != SPRINT` and `v76 == WS_FIRE`, else Moving (0.05) when `v108 != SPRINT`; branch #1 on `v62 != FBA_NONE` |
+| SprintStart, SprintStop | Sprinting, Idle (0.3), no condition |
+| Slide | Idle (0.3) when `v108 != SLIDE` |
+| ZipLine, GrapplingHook, `ExitWallrun` | Moving (0.3) |
+| branch #1 (`v62 == FBA_ROLL`) | FullBodyAction, Roll (0.2); Roll goes to branch #2 (`v126 > 0.1`: Idle or Moving, 0.3), FullBodyAction to Idle (0.3) |
+
+(`v108` is the move state: WALK 0, JOG 1, SPRINT 2, SLIDE 3, ZIPLINE 4, WALLRUN 5, GRAPPLINGHOOK 6; `v126` is the
+movement speed, which every `SpeedBlend` is keyed on.) The 38 transitions of this machine blend 0.3 s, except the
+two of the roll branch (0.2 s) and Sprinting back to Moving when the weapon is not firing (0.05 s). Over all 419
+machines the 9,576 transitions are 0.3 s (7,633), 0.1 s (614), 0.2 s (354), 0.15 s (159), 0.6 s (152) and so on;
+375 are 0 (instant), 67 of them in the 45 machines of the Excalibur tree, none in the locomotion machine.
+Inside the states, `Select` nodes blend 0.3 s in 308 of 344 cases (0.1, 0.15, 0.5, 1 and 0 for the rest) and clip nodes
+0.3 s in 387 of 392 (five are 0).
+
+What plays in `Moving` for an Excalibur with a sword: `Select v95` (melee action) -> `v99` (parry) -> `v158` (stance:
+`MELEE_ONE_HAND` is 3) -> `v44` (crouch: 0 stands) -> `v100` (weapon class; 5, 6, 16, 24, 25 are the Sword) ->
+a `SpeedBlend` on `v126` with three points:
+
+| Clip | Speed (m/s) | Rate |
+|---|---|---|
+| `Sword/Idle` | 0 | 0.508 |
+| `Sword/WalkForward` | 1.81 | 0.909 |
+| `Sword/JogForward` | 4.22 | 1.2 |
+
+The speed is the clip's own root speed (3.52 m in 0.83 s is 4.22 m/s; `cargo test` checks it), so the blend is
+by speed, not by distance. Direction is a `SingleAxisBlend` on `v65` (the angle between movement and facing) with
+`BackLeft`, `Left`, `Forward`, `Right`, `BackRight` at -180, -90, 0, 90, 180 degrees; pitch is another on `v151`
+(`Down`, `Forward`, `Up`). Turning in place is a decorator with `SpinLeft`/`SpinRight` entries, each with two lists of conditions on `v65` (to
+start: 165..180 degrees and `v29 == 10`; to stay: -180..-135); procedural turning nodes limit the turn rate (`v143`
+between -360 and 360 degrees at 360 degrees per second; `v65` between -60 and 60 at 4,320 degrees per second). Upper and lower
+body are partial-body blends: each names a mask in Packages.bin (`TennoUpperBodyRequestMask`, `TennoRifleAimMask`...)
+with a weight per bone (`GAME_C1_HIP1` 0, `GAME_C1_SPINE1` 0.75, `GAME_C1_SPINE2` 0.9, the rest 1), a weight variable and
+fade times (0 s in 46 of the 47 plain mask blends, 0.15 s in one); additive blends take a variable weight. Idle variations: the idle
+sub-tree (`TennoIdleSubTree`; Excalibur's `ExcaliburNobleIdleSubTree` is the same graph with the Noble clips) runs
+`RandomIdleFsm` (states `Idle` and `Decoration`) and has 12 two-way `Random` nodes, e.g. between `Idle` and `IdleNoble`.
+
+All 1,163 assets the tree names exist (910 clips of type 132, 106 movement sets of type 14, 147 aim-pose sets of
+type 19), and all 910 clips decode.
+
+Read, but only in part:
+
+- Movement sets (type 14) and aim-pose sets (type 19), which `ParametricAnimationNode`s name: the `H.` part is
+  read (548 of the 561 paths the decoded trees name; the others are other types). A movement set lists the clips of a
+  directional locomotion (`SwordSprinting`: `JogForward`, `Sprint`, `Sprint90Left`, `Sprint90Right`; an aim-walk set:
+  idle, forward, back, left, right) and six numbers (`0 12 180 720 1 10` for sprints, `1 5 180 360 1 10` for aim-walks);
+  an aim-pose set names a clip and the bone it aims. Their `B.` tables are not read.
+
+Lives only in code, so not in the data (and not reproduced here):
+
+- Variable names and the number of values of an enum; what drives each variable (speed, direction, grounded...):
+  `v126` is called the speed because it is what the speed blends use.
+- The order in which conditions and transitions are tested, what the transition mode word and the state
+  conditions do (they read as guards on the state: `Idle` and `Moving` both carry `v62 != FBA_NONE`), and the
+  operator of the short condition layout (no operator is stored).
+- The shape of a blend (linear or not), what `Random` flags and weights mean, when idle variations are requested
+  (the `Decoration` request is set by game code), the request numbers of listener nodes (set by the controller's
+  actions), and foot, look and reach IK.
+- Which `NamedSubTreeNode` an animation set key (`PRN_IDLE_OVERRIDE`) fills.
+- The controller of a suit that names none: the player's avatars carry `AnimControllerType=TennoAnimController`; the
+  suit itself does not.
+
+Not decoded: 13 node types (above), the aim-offset pose grid inside `AimPosesAnimationNode`, and the sub-trees
+of the Excalibur tree that hold it (`WallRunningSubTree`, `GroundFireSubTree`, `TennoParryAimposes`).
 
 ### Levels
 

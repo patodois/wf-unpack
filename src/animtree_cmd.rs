@@ -1,13 +1,14 @@
 //! `animtree` and `check-animtrees`: what Excalibur's animation controller does.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use wf_unpack::animation::AnimationPackages;
 use wf_unpack::animtree::{
-    find_locomotion, suit_animation, variable_hints, Fsm, GraphPackages, Node, Tree, VarInfo,
+    bone_mask, find_locomotion, suit_animation, variable_hints, Fsm, GraphPackages, Node, Tree,
+    VarInfo,
 };
 use wf_unpack::header::CommonHeader;
 use wf_unpack::level::TypeResolver;
@@ -36,12 +37,18 @@ pub fn check_cmd(game: &Path) -> Result<()> {
     }
     let mut tree_ok = 0;
     let mut nodes = 0usize;
+    let mut set_paths: BTreeSet<String> = BTreeSet::new();
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in &trees {
         match pk.tree(p) {
             Ok(Some(t)) => {
                 tree_ok += 1;
                 nodes += t.nodes.len();
+                for n in &t.nodes {
+                    if let Node::Parametric { path } = n {
+                        set_paths.insert(path.clone());
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -66,6 +73,21 @@ pub fn check_cmd(game: &Path) -> Result<()> {
         "trees: {tree_ok} of {} decoded ({nodes} nodes)",
         trees.len()
     );
+    let (mut sets_ok, mut sets_other) = (0, Vec::new());
+    for p in &set_paths {
+        match pk.movement_set(p) {
+            Ok(Some(_)) => sets_ok += 1,
+            Ok(None) => sets_other.push(format!("{p}: not in H.Misc")),
+            Err(e) => sets_other.push(format!("{p}: {e:#}")),
+        }
+    }
+    println!(
+        "movement and aim-pose sets named by those trees: {sets_ok} of {} read",
+        set_paths.len()
+    );
+    for e in sets_other.iter().take(5) {
+        println!("  {e}");
+    }
     let mut rs: Vec<_> = reasons.into_iter().collect();
     rs.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     for (r, v) in rs.iter().take(15) {
@@ -91,6 +113,8 @@ struct Ctx<'a> {
     hints: &'a BTreeMap<u32, VarInfo>,
     stance: Option<&'a str>,
     max_depth: usize,
+    cards: BTreeMap<u32, usize>,
+    sets: HashMap<String, wf_unpack::animtree::MovementSet>,
     /// Per node: does it, or something under it, play a clip of the stance?
     keep: HashMap<usize, bool>,
 }
@@ -221,7 +245,24 @@ impl Ctx<'_> {
             Node::SubTreeListener { path, request } => {
                 format!("SubTreeListener request {request} -> {path}")
             }
-            Node::Parametric { path } => format!("Set {path}"),
+            Node::Parametric { path } => match self.sets.get(path) {
+                Some(set) if set.kind == wf_unpack::animtree::KIND_MOVEMENT_SET => format!(
+                    "MovementSet {} [{}]",
+                    path.rsplit('/').next().unwrap_or(path),
+                    set.names
+                        .iter()
+                        .map(|n| short(n.rsplit('/').next().unwrap_or(n)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(set) => format!(
+                    "AimPoseSet {} ({} on bone {})",
+                    path.rsplit('/').next().unwrap_or(path),
+                    set.names.first().map_or("?", |n| short(n)),
+                    set.bone.as_deref().unwrap_or("?")
+                ),
+                None => format!("Set {path}"),
+            },
             Node::ModifyVariable(a) => format!(
                 "ModifyVariable {}",
                 a.iter()
@@ -426,11 +467,6 @@ impl Ctx<'_> {
         else {
             return;
         };
-        let cols = match a.pick.vars.len() {
-            2 => a.pick.table.len() / a.pick.vars.len().max(1),
-            _ => 0,
-        };
-        let _ = cols;
         for (i, &c) in a.pick.table.iter().enumerate() {
             let Some(path) = t.clip(c) else { continue };
             if let Some(st) = self.stance {
@@ -438,17 +474,19 @@ impl Ctx<'_> {
                     continue;
                 }
             }
-            let label = match a.pick.vars.len() {
-                0 => String::new(),
-                1 => self.value_label(a.pick.vars[0], i as i64),
-                _ => {
-                    let rows = a.pick.table.len() / (a.pick.table.len() / 20).max(1);
-                    let _ = rows;
-                    format!(
-                        "{} x {} cell {i}",
-                        self.var(a.pick.vars[0]),
-                        self.var(a.pick.vars[1])
-                    )
+            let label = if a.pick.vars.is_empty() {
+                String::new()
+            } else {
+                match a.pick.values_of(i, &self.cards) {
+                    Some(vals) => a
+                        .pick
+                        .vars
+                        .iter()
+                        .zip(vals)
+                        .map(|(&v, x)| self.value_label(v, x as i64))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    None => format!("entry {i}"),
                 }
             };
             out.push(format!(
@@ -580,6 +618,16 @@ pub fn animtree_cmd(
         fsms.push(pk.fsm(&resolve_path(&tree_folder, p))?);
     }
     let hints = variable_hints(fsms.iter().flatten(), &sa.controller_variables);
+    let mut sets = HashMap::new();
+    for n in &tree.nodes {
+        if let Node::Parametric { path } = n {
+            if !sets.contains_key(path) {
+                if let Some(set) = pk.movement_set(path)? {
+                    sets.insert(path.clone(), set);
+                }
+            }
+        }
+    }
 
     let mut ctx = Ctx {
         tree: &tree,
@@ -587,6 +635,8 @@ pub fn animtree_cmd(
         hints: &hints,
         stance,
         max_depth: max_depth.unwrap_or(if stance.is_some() { 64 } else { 3 }),
+        cards: tree.cardinalities(),
+        sets,
         keep: HashMap::new(),
     };
 
@@ -672,6 +722,86 @@ pub fn animtree_cmd(
             } else {
                 println!("  (no clips of the {} folder)", stance.unwrap_or(""));
             }
+        }
+    }
+
+    // Upper/lower body layering: the masks the partial-body blends under the states use
+    {
+        let mut seen = vec![false; tree.nodes.len()];
+        let mut stack: Vec<usize> = edges
+            .iter()
+            .filter_map(|&c| usize::try_from(c).ok())
+            .collect();
+        let mut masks: BTreeMap<String, usize> = BTreeMap::new();
+        let mut bones: BTreeMap<String, usize> = BTreeMap::new();
+        while let Some(n) = stack.pop() {
+            if std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            let (by_mask, by_bone): (Vec<&String>, Vec<&String>) = match &tree.nodes[n] {
+                Node::PartialBody {
+                    by_mask: true,
+                    mask,
+                    ..
+                } => (vec![mask], vec![]),
+                Node::PartialBody { mask, .. } => (vec![], vec![mask]),
+                Node::PartialBodyMasks {
+                    masks: ms,
+                    single_mask,
+                    ..
+                } => (
+                    ms.iter().chain(std::iter::once(single_mask)).collect(),
+                    vec![],
+                ),
+                Node::MotionBlend { masks: ms, .. } => (ms.iter().collect(), vec![]),
+                _ => (vec![], vec![]),
+            };
+            let once: BTreeSet<&String> = by_mask.into_iter().filter(|m| !m.is_empty()).collect();
+            for m in once {
+                *masks.entry(m.clone()).or_default() += 1;
+            }
+            for b in by_bone {
+                *bones.entry(b.clone()).or_default() += 1;
+            }
+            stack.extend(
+                tree.graph.edges[n]
+                    .iter()
+                    .filter_map(|&c| usize::try_from(c).ok()),
+            );
+        }
+        println!("\nblend masks used by partial-body blends under these states (bone weights from Packages.bin)");
+        for (name, uses) in &masks {
+            let path = resolve_path(&tree_folder, name);
+            match bone_mask(&mut types, &path)? {
+                Some(w) => {
+                    let ones = w.iter().filter(|b| b.weight == 1.0).count();
+                    let zeros = w.iter().filter(|b| b.weight == 0.0).count();
+                    let partial: Vec<String> = w
+                        .iter()
+                        .filter(|b| b.weight != 0.0 && b.weight != 1.0)
+                        .map(|b| format!("{} {:.2}", b.bone.trim_start_matches("GAME_"), b.weight))
+                        .collect();
+                    let additive = w.iter().filter(|b| b.additive).count();
+                    println!(
+                        "  {name} ({uses} nodes): {} bones, weight 1: {ones}, weight 0: {zeros}{}{}",
+                        w.len(),
+                        if partial.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", between: {}", partial.join(", "))
+                        },
+                        if additive > 0 {
+                            format!(", additive: {additive}")
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                None => println!("  {name} ({uses} nodes): not in Packages.bin"),
+            }
+        }
+        for (bone, uses) in &bones {
+            println!("  from bone {bone} down ({uses} nodes)");
         }
     }
 
