@@ -405,3 +405,90 @@ fn static_level_of_a_hub() {
     }
     assert!(listed.iter().all(|&b| b));
 }
+
+#[test]
+fn the_tenno_movement_values_match_the_known_ones() {
+    use wf_unpack::player::Player;
+    let Some(dir) = game_dir() else { return };
+    let p = Player::load(&dir).unwrap();
+    assert_eq!(
+        p.mesh.value,
+        "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx"
+    );
+    assert_eq!(p.ground.max_speed.value, 7.5);
+    assert_eq!(
+        p.ground.max_speed.cite(),
+        "/Lotus/Types/Player/TennoWalkAttribs: MaxSpeed"
+    );
+    assert_eq!(
+        (p.ground.walk_fraction.value, p.ground.jog_fraction.value),
+        (0.4, 0.8)
+    );
+    assert_eq!(p.jump.height.value, 5.0);
+    assert_eq!(p.jump.num_jumps.value, 2.0);
+    assert_eq!(p.jump.air_jump_height_multiplier.value, 0.75);
+    assert_eq!(p.jump.num_jumps.entity, "/Lotus/Types/Player/TennoAvatar");
+    assert_eq!(p.gravity.world.value, [0.0, -15.0, 0.0]);
+    assert_eq!(p.gravity.additional.value, -9.0);
+    assert_eq!((p.rise_gravity(), p.fall_gravity()), (15.0, 24.0));
+    assert_eq!(
+        (p.capsule.height.value, p.capsule.radius.value),
+        (1.5, 0.45)
+    );
+    assert_eq!(p.capsule.slope_limit.value, 65.0);
+    assert_eq!(
+        p.capsule.slope_limit.entity,
+        "/Lotus/Types/Player/TennoWalkAttribs"
+    );
+    assert_eq!(
+        (
+            p.ground.acceleration.value,
+            p.ground.accel_drag.value,
+            p.ground.decel_drag.value
+        ),
+        (12.0, 8.5, 10.0)
+    );
+    assert_eq!(
+        (
+            p.air.acceleration.value,
+            p.air.accel_drag.value,
+            p.air.decel_drag.value
+        ),
+        (10.0, 0.05, 0.2)
+    );
+    assert_eq!((p.slide.accel.value, p.slide.drag.value), (6.0, 0.7));
+    assert_eq!(p.slide.end_threshold.value, 1.66);
+    assert_eq!(p.slide.jump_speed.entity, "/EE/Types/Game/SlideAction");
+    assert_eq!(p.bullet_jump.speed.value, 2.5);
+    assert_eq!(
+        p.bullet_jump.speed.entity,
+        "/Lotus/Types/Player/TennoClimbController"
+    );
+    assert_eq!(p.camera.view_offset.value, [0.5, -0.1, -1.5]);
+    assert_eq!(p.camera.base_fov.value, 65.0);
+    assert_eq!(p.camera.pitch_clamp.value, [-89.0, 89.0]);
+    assert_eq!(p.camera.collision_radius.value, 0.25);
+    // The crouch button: a tap rolls or slides, a hold crouches, jump and melee cancel the tap
+    assert_eq!(p.crouch.input_code, "PRE_CROUCH");
+    assert_eq!(p.crouch.tap_codes, ["ACTION"]);
+    assert_eq!(p.crouch.hold_codes, ["HOLD_CROUCH"]);
+    assert_eq!(p.crouch.bypass_tap_codes, ["JUMP", "MELEE"]);
+    assert!((p.crouch.required_hold_time.value - 0.15).abs() < 1e-6);
+    assert!(p.crouch.force_hold_when_directionless && !p.crouch.send_hold_immediately);
+    // The roll covers 8 m through the entity its clip derives from
+    assert_eq!(p.roll.clip.root_override, Some([0.0, 0.0, 8.0]));
+    assert_eq!(
+        p.roll.clip.root_conditioning.as_deref(),
+        Some("ROOTC_ADJUST_LINEAR")
+    );
+    assert_eq!(
+        p.roll.clip.end_events,
+        ["DodgeRollFinished", "EnableLookIK"]
+    );
+    assert!(p
+        .bullet_jump
+        .clip
+        .events
+        .iter()
+        .any(|e| e.name == "BulletJumpStart"));
+}

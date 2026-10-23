@@ -1,4 +1,5 @@
 mod anim_cmd;
+mod player_cmd;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -185,6 +186,14 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Print the Tenno's movement values (gravity, speeds, jump, camera, ...) with their sources
+    Player {
+        /// Also print the readings of units the data does not state, and what the data lacks
+        #[arg(long)]
+        notes: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -276,6 +285,7 @@ fn main() -> Result<()> {
             },
         ),
         Command::CheckLevels { deep, game } => level_cmd::check_levels(&expand_home(&game), deep),
+        Command::Player { notes, game } => player_cmd::player_cmd(&expand_home(&game), notes),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
 }
