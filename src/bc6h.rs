@@ -740,7 +740,7 @@ pub fn decode_bc6h_block(data: &[u8], outbuf: &mut [[f32; 3]; 16], signed: bool)
     let index_bits = if mi.partition_bits != 0 { 3 } else { 4 };
     let factors = BPTC_FACTORS[index_bits - 2];
 
-    for idx in 0..16_usize {
+    for (idx, out) in outbuf.iter_mut().enumerate() {
         let mut subset_index = 0;
         let mut index_anchor = 0;
 
@@ -765,7 +765,7 @@ pub fn decode_bc6h_block(data: &[u8], outbuf: &mut [[f32; 3]; 16], signed: bool)
                 signed,
             ))
         };
-        outbuf[idx] = [texel(0), texel(1), texel(2)];
+        *out = [texel(0), texel(1), texel(2)];
     }
 }
 

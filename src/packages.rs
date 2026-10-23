@@ -493,7 +493,7 @@ pub(crate) mod tests {
         frames.extend([b'x'; 10]);
         let raw = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, 3);
         let result = std::panic::catch_unwind(|| PackagesBin::parse(&raw).map(|b| b.len()));
-        let err = result.expect("parse panicked").err().expect("accepted");
+        let err = result.expect("parse panicked").expect_err("accepted");
         assert!(err.to_string().contains("runs past the frames"), "{err:#}");
     }
 
@@ -505,7 +505,7 @@ pub(crate) mod tests {
         let frames = b"dict0abc".to_vec();
         let raw = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, u32::MAX);
         let result = std::panic::catch_unwind(|| PackagesBin::parse(&raw).map(|b| b.len()));
-        let err = result.expect("parse panicked").err().expect("accepted");
+        let err = result.expect("parse panicked").expect_err("accepted");
         assert!(err.to_string().contains("do not fit"), "{err:#}");
         // The same file with the right count is fine
         let ok = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, 3);
