@@ -250,6 +250,10 @@ pub fn write_animated(
         let mut samplers = Vec::new();
         let mut channels = Vec::new();
         for ch in &clip.channels {
+            // A channel without keys would be an accessor of no elements, which glTF forbids
+            if ch.times.is_empty() {
+                continue;
+            }
             let key = ch.times.iter().map(|t| t.to_bits()).collect::<Vec<u32>>();
             let input = match inputs.iter().find(|(k, _)| *k == key) {
                 Some((_, a)) => *a,

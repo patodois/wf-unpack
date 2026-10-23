@@ -351,16 +351,16 @@ pub fn check_anims_cmd(game: &Path) -> Result<()> {
                             scale_min = scale_min.min(*v);
                             scale_max = scale_max.max(*v);
                         }
-                        if let Some(r) = &t.rotation {
+                        if let Some(first) = t.rotation.as_ref().and_then(|r| r.first()) {
                             frame0_checked += 1;
-                            let d = angle(&r[0], &t.initial_rotation);
+                            let d = angle(first, &t.initial_rotation);
                             worst_rot = worst_rot.max(d);
                             frame0_off += usize::from(d > 0.02);
                         }
-                        if let Some(p) = &t.translation {
+                        if let Some(first) = t.translation.as_ref().and_then(|p| p.first()) {
                             frame0_checked += 1;
                             let d = (0..3)
-                                .map(|k| (p[0][k] - t.initial_translation[k]).abs())
+                                .map(|k| (first[k] - t.initial_translation[k]).abs())
                                 .fold(0.0, f32::max);
                             worst_pos = worst_pos.max(d);
                             if d > 0.005 {
@@ -373,7 +373,7 @@ pub fn check_anims_cmd(game: &Path) -> Result<()> {
                                         a.bones[bone].name,
                                         t.flags,
                                         t.initial_translation,
-                                        p[0]
+                                        first
                                     ),
                                 ));
                             }

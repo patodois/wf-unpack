@@ -369,7 +369,7 @@ impl Animation {
         let mx = if mirror_x { -1.0 } else { 1.0 };
         let mut out = Vec::new();
         for (node, t) in self.tracks.iter().enumerate() {
-            match &t.translation {
+            match t.translation.as_ref().filter(|v| !v.is_empty()) {
                 Some(v) => out.push(Channel {
                     node,
                     target: Target::Translation,
@@ -390,7 +390,7 @@ impl Animation {
                 }),
             }
             let flip = |q: &[f32; 4]| [q[0], q[1] * mx, q[2] * mx, q[3]];
-            match &t.rotation {
+            match t.rotation.as_ref().filter(|v| !v.is_empty()) {
                 Some(v) => {
                     let mut values = Vec::with_capacity(v.len() * 4);
                     let mut prev: Option<[f32; 4]> = None;
@@ -421,7 +421,7 @@ impl Animation {
                     interpolation: Interpolation::Linear,
                 }),
             }
-            if let Some(v) = &t.scale {
+            if let Some(v) = t.scale.as_ref().filter(|v| !v.is_empty()) {
                 out.push(Channel {
                     node,
                     target: Target::Scale,
@@ -606,7 +606,9 @@ pub fn decode(path: &str, header: &[u8], body: &[u8]) -> Result<Vec<Animation>> 
                 frame_data.len()
             );
 
-            for t in &mut tracks {
+            // A clip without frames has nothing to animate whatever the flags say: its tracks stay
+            // at the initial pose (an empty key list would be an empty accessor and has no first key)
+            for t in tracks.iter_mut().filter(|_| frames > 0) {
                 if t.flags & (flag::TRANSLATION | flag::TRANSLATION_X) != 0 {
                     t.translation = Some(Vec::with_capacity(frames));
                 }
@@ -814,6 +816,11 @@ mod tests {
     /// A clip with three bones: the root moves in z, bone 1 rotates, bone 2 is
     /// constant. Three keys at 0, 0.5 and 1 over 2 seconds.
     fn synthetic() -> (Vec<u8>, Vec<u8>) {
+        synthetic_frames(3)
+    }
+
+    /// The same clip cut to its first `frames` frames (0 to 3), flags unchanged.
+    fn synthetic_frames(frames: usize) -> (Vec<u8>, Vec<u8>) {
         let attrs = "Attribs={\n    Rate=1.5\n}\n";
         let mut h = crate::header::tests::build(&["/a_anim.fbx"], attrs, 132);
         let s32 = |h: &mut Vec<u8>, s: &str| {
@@ -853,15 +860,18 @@ mod tests {
         h.extend(12u32.to_le_bytes()); // stride: root 6 + hip 6
         h.extend(0u32.to_le_bytes());
         h.extend([0u8; 26]);
-        h.extend(36u32.to_le_bytes());
+        h.extend((12 * frames as u32).to_le_bytes());
         h.extend([0u8; 12]);
-        h.extend(3u32.to_le_bytes());
+        h.extend((frames as u32).to_le_bytes());
         h.extend([0u8; 8]);
         h.extend(0u32.to_le_bytes());
 
         let mut b = Vec::new();
         // Frame data: root z = 0, 1000, 2000 (units of 0.001 from offset 1.0)
-        for (z, angle) in [(-1000i16, 0.0f32), (0, 0.5), (1000, 1.0)] {
+        for (z, angle) in [(-1000i16, 0.0f32), (0, 0.5), (1000, 1.0)]
+            .into_iter()
+            .take(frames)
+        {
             for v in [0i16, 0, z] {
                 b.extend(v.to_le_bytes());
             }
@@ -885,7 +895,7 @@ mod tests {
         for o in [0u16, 6, 12] {
             b.extend(o.to_le_bytes());
         }
-        for t in [0.0f32, 0.5, 1.0] {
+        for t in [0.0f32, 0.5, 1.0].into_iter().take(frames) {
             b.extend(t.to_le_bytes());
         }
         (h, b)
@@ -962,6 +972,38 @@ mod tests {
                 .sum();
             assert!(dot > 0.0);
         }
+    }
+
+    #[test]
+    fn a_clip_without_frames_stays_at_its_initial_pose() {
+        // Flags call for a moving root and a rotating hip, but there are no frames: the tracks
+        // must not hold empty key lists (check-anims indexed their first key, and the glTF
+        // export wrote an accessor of no keys)
+        let (h, b) = synthetic_frames(0);
+        let c = decode("p", &h, &b).unwrap().remove(0);
+        assert!(c.times.is_empty());
+        assert_eq!(c.tracks[0].flags, 1);
+        assert_eq!(c.tracks[1].flags, 2);
+        assert!(c
+            .tracks
+            .iter()
+            .all(|t| t.translation.is_none() && t.rotation.is_none() && t.scale.is_none()));
+        let ch = c.channels(false);
+        assert_eq!(ch.len(), 6);
+        assert!(ch.iter().all(|c| c.times == [0.0] && !c.values.is_empty()));
+        assert!(c.root_displacement().is_none());
+        // Hand-built tracks with empty key lists come out the same
+        let mut c = c;
+        c.tracks[0].translation = Some(Vec::new());
+        c.tracks[1].rotation = Some(Vec::new());
+        c.tracks[2].scale = Some(Vec::new());
+        let ch = c.channels(false);
+        assert_eq!(ch.len(), 6);
+        assert!(ch.iter().all(|c| c.times == [0.0]));
+        // One frame is a clip with keys
+        let (h, b) = synthetic_frames(1);
+        let one = decode("p", &h, &b).unwrap().remove(0);
+        assert_eq!(one.tracks[0].translation.as_ref().map(Vec::len), Some(1));
     }
 
     #[test]
