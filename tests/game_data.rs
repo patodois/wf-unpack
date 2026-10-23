@@ -1206,7 +1206,7 @@ fn dojo_lightmaps_decode() {
     assert_eq!((dir_atlas.width, dir_atlas.height), (1024, 512));
     // Alpha (luma) peaks at 1.0 in an object's rectangle; the colour channels peak at 1.0 too (chroma)
     let (mut amax, mut rgbmax) = (0u8, 0u8);
-    for px in page.clr.rgba.chunks_exact(4) {
+    for px in page.clr.rgba.as_chunks::<4>().0 {
         amax = amax.max(px[3]);
         rgbmax = rgbmax.max(px[0].max(px[1]).max(px[2]));
     }

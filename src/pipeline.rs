@@ -92,6 +92,8 @@ pub fn srgb_oetf(c: f32) -> f32 {
 
 /// The coordinate the final pass looks the exposed colour up at in the colour
 /// volume (before the half-texel scale `0.96875 u + 0.015625`).
+// The constants are the shader's, digit for digit, though f32 rounds them
+#[allow(clippy::excessive_precision)]
 pub fn lut_coordinate(c: f32) -> f32 {
     ((c + 0.002_667_719_27).max(f32::MIN_POSITIVE).log2() / 14.0 + 0.610_726_953).clamp(0.0, 1.0)
 }
@@ -124,6 +126,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
     fn lut_coordinate_matches_the_documented_grey() {
         // The offset colour 0.18 sits at 0.434018, the constant the colour volume builder inverts
         assert!((lut_coordinate(0.18 - 0.002_667_719_27) - 0.434_018).abs() < 1e-4);

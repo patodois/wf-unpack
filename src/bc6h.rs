@@ -290,15 +290,13 @@ fn unquantize(_value: u16, _signed: bool, _endpoint_bits: usize) -> u16 {
         let sign: bool = _value & 0x8000 != 0;
         let _value = _value & 0x7fff;
 
-        let unq: u16;
-
-        if 0 == _value {
-            unq = 0;
+        let unq: u16 = if 0 == _value {
+            0
         } else if _value >= max_value - 1 {
-            unq = 0x7fff;
+            0x7fff
         } else {
-            unq = ((((_value as u32) << 15) + 0x4000) >> (_endpoint_bits - 1)) as u16;
-        }
+            ((((_value as u32) << 15) + 0x4000) >> (_endpoint_bits - 1)) as u16
+        };
 
         return if sign { u16::MAX - unq + 1 } else { unq };
     }
@@ -930,9 +928,7 @@ mod tests {
         for i in 0..5 {
             bits.push([1, 1, 0, 0, 0][i]);
         }
-        for _ in 0..30 {
-            bits.push(1);
-        }
+        bits.extend(std::iter::repeat_n(1, 30));
         for (i, b) in bits.iter().enumerate() {
             block[i / 8] |= b << (i % 8);
         }

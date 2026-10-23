@@ -189,7 +189,7 @@ pub fn lightmaps_cmd(game: &Path, path: &str, out: Option<&Path>) -> Result<()> 
                 s.gain
             );
         }
-        for inst_idx in insts {
+        if let Some(inst_idx) = insts.first() {
             let lm = d.instances[*inst_idx].lightmap.as_ref().unwrap();
             for ix in &lm.indexed {
                 println!(
@@ -197,7 +197,6 @@ pub fn lightmaps_cmd(game: &Path, path: &str, out: Option<&Path>) -> Result<()> 
                     ix.texture, ix.lights, ix.light_indices
                 );
             }
-            break;
         }
         if let Some(out) = out {
             // The ambient term of every texel with each object's own constants, as sRGB

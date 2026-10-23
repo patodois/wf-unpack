@@ -4828,7 +4828,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "rewrite-bridge"
 version = "0.1.0"
-source = "git+https://github.com/patodois/rewrite-bridge?rev=1b5820180efbd585916ab206e6bcbbcf33096e1e#1b5820180efbd585916ab206e6bcbbcf33096e1e"
+source = "git+https://github.com/patodois/rewrite-bridge?rev=93acfa2d06466ed3ca3715ae900f0ef45b38b27b#93acfa2d06466ed3ca3715ae900f0ef45b38b27b"
 
 [[package]]
 name = "rodio"

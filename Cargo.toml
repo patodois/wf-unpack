@@ -16,7 +16,7 @@ texture2ddecoder = "0.1.2"
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
 # Shared model types for crossovers with other game rewrites
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "1b5820180efbd585916ab206e6bcbbcf33096e1e", optional = true }
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "93acfa2d06466ed3ca3715ae900f0ef45b38b27b", optional = true }
 
 # The F_NOCACHE hint in cache.rs and the peak memory report of check-levels
 [target.'cfg(unix)'.dependencies]

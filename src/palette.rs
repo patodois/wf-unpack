@@ -234,8 +234,10 @@ mod tests {
 
     #[test]
     fn material_colours_from_properties() {
-        let mut m = Material::default();
-        m.path = "/Lotus/X/M".into();
+        let mut m = Material {
+            path: "/Lotus/X/M".into(),
+            ..Default::default()
+        };
         for (k, v) in [
             ("PS:TintColor0", "{0.35,0.35,0.35,0.5}"),
             ("PS:TintColor3", "{0.26,0.0075,0.0037,0.5}"),

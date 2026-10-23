@@ -697,6 +697,7 @@ mod tests {
                 "LightingParams".into(),
                 "{skyLightColor={255,128,0,255}}".into(),
             )],
+            lighting: Default::default(),
         });
         let Some(Environment::Color(c)) = environment(&d) else {
             panic!("no colour")

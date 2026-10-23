@@ -330,8 +330,8 @@ mod tests {
         assert!((s.luma - q(128) * q(128) * 8.0).abs() < 1e-4);
         // d = (2*1-1, 2*0.502-1, 2*0.502-1), gain = 1 * 3
         let d = [1.0, 2.0 * q(128) - 1.0, 2.0 * q(128) - 1.0];
-        for k in 0..3 {
-            assert!((s.directional[k] - d[k]).abs() < 1e-3, "{k}");
+        for (k, (got, want)) in s.directional.iter().zip(d).enumerate() {
+            assert!((got - want).abs() < 1e-3, "{k}");
         }
         assert!((s.gain - 1.0).abs() < 1e-6);
         // Facing the light: the directional term adds; facing away it does not

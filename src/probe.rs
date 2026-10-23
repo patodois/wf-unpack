@@ -165,6 +165,8 @@ impl Probe {
 
 /// A Radiance RGBE (`.hdr`) file for linear RGB floats, run-length encoded as
 /// the format's "new" scanlines. Values are clamped to the half-float maximum.
+// Radiance stores each channel of a scanline as its own run-length stream
+#[allow(clippy::needless_range_loop)]
 pub fn radiance_hdr(width: usize, height: usize, pixels: &[[f32; 3]]) -> Result<Vec<u8>> {
     ensure!(
         pixels.len() == width * height,
@@ -228,6 +230,8 @@ fn rgbe(p: [f32; 3]) -> [u8; 4] {
 }
 
 /// Reads a Radiance file written by [`radiance_hdr`] (or any run-length one) back to floats; for tests.
+// Radiance stores each channel of a scanline as its own run-length stream
+#[allow(clippy::needless_range_loop)]
 pub fn read_radiance_hdr(data: &[u8]) -> Result<(usize, usize, Vec<[f32; 3]>)> {
     let end = data
         .windows(2)
@@ -327,7 +331,7 @@ mod tests {
         let mut body = Vec::new();
         for (lvl, size) in [(3u8, 16usize), (2, 16), (1, 16), (0, 64)] {
             for f in 0..6u8 {
-                body.extend(std::iter::repeat(lvl * 10 + f + 1).take(size));
+                body.extend(std::iter::repeat_n(lvl * 10 + f + 1, size));
             }
         }
         let t = CubeTexture::from_parts(header, &body, &[]).unwrap();
