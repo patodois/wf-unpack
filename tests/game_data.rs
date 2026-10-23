@@ -218,3 +218,93 @@ fn bridge_provider_loads_valid_models_in_metres() {
     );
     assert!(sword.materials[0].normal.is_some() && sword.materials[0].metallic_roughness.is_some());
 }
+
+#[test]
+fn excalibur_jog_animation() {
+    use wf_unpack::animation::{AnimationPackages, Target};
+    use wf_unpack::model::Model;
+    let Some(dir) = game_dir() else { return };
+    let path = "/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/JogForward_anim.fbx";
+    let clips = AnimationPackages::open(&dir).unwrap().load(path).unwrap();
+    assert_eq!(clips.len(), 1);
+    let a = &clips[0];
+    assert_eq!(
+        (a.skeleton.as_str(), a.name.as_str()),
+        ("ExcaliburBody1", "Take 001")
+    );
+    assert_eq!(a.bones.len(), 81);
+    assert_eq!(a.times.len(), 26);
+    // 25 intervals of 1/30 s
+    assert!((a.duration - 25.0 / 30.0).abs() < 1e-6);
+    assert!((a.times[1] - 1.0 / 30.0).abs() < 1e-6);
+    assert_eq!(a.times.last().copied(), Some(a.duration));
+
+    // The root travels 3.52 m forward; the header says so too
+    assert!((a.root_translation[2] - 3.519).abs() < 1e-3);
+    let moved = a.root_displacement().unwrap();
+    assert!((moved[2] - a.root_translation[2]).abs() < 1e-3);
+    assert!(moved[0].abs() < 1e-4 && moved[1].abs() < 1e-4);
+
+    // Footsteps: left then right, half a cycle apart
+    let steps: Vec<_> = a
+        .events
+        .iter()
+        .filter(|e| e.name.starts_with("Step"))
+        .collect();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(
+        (steps[0].name.as_str(), steps[1].name.as_str()),
+        ("StepL", "StepR")
+    );
+    assert!((steps[1].phase - steps[0].phase - 0.45).abs() < 1e-3);
+
+    // Every bone is in the Excalibur model with the same parent
+    let model = Model::load(&dir, "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx").unwrap();
+    let sk = model.skeleton.unwrap();
+    for b in &a.bones {
+        let m = sk
+            .bones
+            .iter()
+            .find(|m| m.name == b.name)
+            .unwrap_or_else(|| panic!("{} missing", b.name));
+        let parent_name = m.parent.map(|p| sk.bones[p].name.as_str());
+        assert_eq!(
+            parent_name,
+            b.parent.map(|p| a.bones[p].name.as_str()),
+            "{}",
+            b.name
+        );
+    }
+
+    // Decoded rotations are unit quaternions, and the first key is the stored initial transform
+    for t in &a.tracks {
+        for q in t.rotation.iter().flatten() {
+            let n: f32 = q.iter().map(|v| v * v).sum();
+            assert!((n - 1.0).abs() < 1e-3);
+        }
+        if let Some(r) = &t.rotation {
+            let d: f32 = (0..4)
+                .map(|i| r[0][i] * t.initial_rotation[i])
+                .sum::<f32>()
+                .abs();
+            assert!(d > 0.9999, "first key differs from the initial rotation");
+        }
+    }
+
+    // glTF-style channels: translation and rotation for every bone, mirrored to right-handed
+    let ch = a.channels(true);
+    assert_eq!(ch.len(), 162);
+    let root = ch
+        .iter()
+        .find(|c| c.node == 0 && c.target == Target::Translation)
+        .unwrap();
+    assert_eq!(root.times.len(), 26);
+    assert!((root.values[3 * 25 + 2] - 3.519).abs() < 1e-3);
+    let hip = ch
+        .iter()
+        .find(|c| c.node == 1 && c.target == Target::Translation)
+        .unwrap();
+    // The hip bone's x is negated by the mirror
+    let game_x = a.tracks[1].translation.as_ref().unwrap()[0][0];
+    assert_eq!(hip.values[0], -game_x);
+}
