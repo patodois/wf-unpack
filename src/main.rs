@@ -1050,6 +1050,11 @@ fn model_cmd(
     } else {
         manual_materials(game, textures, &h.materials(), h.meshes.len(), out)?
     };
+    let used_lod = model.usable_lod(lod)?;
+    if used_lod != lod {
+        eprintln!("note: this model has no triangles at LOD {lod}; writing LOD {used_lod}");
+    }
+    let lod = used_lod;
     let scene = wf_unpack::scene::prepare(&model, lod, true)?;
     let clips = match animations {
         Some(filter) => {

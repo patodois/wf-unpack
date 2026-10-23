@@ -427,7 +427,9 @@ pub fn export_level(
         }
         let loaded =
             Model::load_from(&mut head, body.as_mut(), full.as_mut(), path).and_then(|model| {
-                let prepared = scene::prepare(&model, opts.lod, true)?;
+                // A model with fewer LODs than asked for is drawn at its coarsest, not dropped
+                let lod = model.usable_lod(opts.lod).unwrap_or(opts.lod);
+                let prepared = scene::prepare(&model, lod, true)?;
                 Ok((model, prepared))
             });
         match loaded {

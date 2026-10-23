@@ -1157,6 +1157,20 @@ impl Model {
         (lo, hi)
     }
 
+    /// The LOD to draw when `lod` is asked for: `lod` itself if any mesh has triangles at it,
+    /// otherwise the nearest finer one that has some (models store fewer LODs than the five
+    /// slots, and a glTF with no primitives draws nothing). Fails for a slot past the last one,
+    /// or when no LOD up to `lod` has a triangle.
+    pub fn usable_lod(&self, lod: usize) -> Result<usize> {
+        if lod >= LOD_COUNT {
+            bail!("LOD {lod} out of range (0 to {})", LOD_COUNT - 1);
+        }
+        (0..=lod)
+            .rev()
+            .find(|&l| self.header.meshes.iter().any(|m| m.lod_counts[l] > 0))
+            .with_context(|| format!("the model has no triangles at LOD {lod} or finer"))
+    }
+
     /// The triangles of one mesh at one LOD, as indices into `vertices`.
     pub fn lod_indices(&self, mesh: usize, lod: usize) -> Result<&[u32]> {
         let m = self.header.meshes.get(mesh).context("no such mesh")?;
@@ -1669,5 +1683,27 @@ mod tests {
                 .contains("index 5 out of range for 3 vertices"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_missing_lod_falls_back_to_the_coarsest_stored_one() {
+        // The test model stores LOD 0 only; asking for LOD 3 used to give an empty scene
+        let header = ModelHeader::parse(&skinned_header_bytes()).unwrap();
+        let model = Model::from_parts(header, &skinned_body([0, 1, 2]), &[]).unwrap();
+        for lod in 0..LOD_COUNT {
+            assert_eq!(model.usable_lod(lod).unwrap(), 0, "LOD {lod}");
+        }
+        assert!(model.usable_lod(LOD_COUNT).is_err());
+        assert_eq!(model.lod_indices(0, 3).unwrap().len(), 0);
+        // With a finer LOD stored (here LOD 2 made to hold triangles too) the asked one wins
+        let mut model = model;
+        model.header.meshes[0].lod_offsets[2] = 0;
+        model.header.meshes[0].lod_counts[2] = 3;
+        assert_eq!(model.usable_lod(1).unwrap(), 0);
+        assert_eq!(model.usable_lod(2).unwrap(), 2);
+        assert_eq!(model.usable_lod(4).unwrap(), 2);
+        // No triangles anywhere: an error, not an empty scene
+        model.header.meshes[0].lod_counts = [0; LOD_COUNT];
+        assert!(model.usable_lod(0).is_err());
     }
 }

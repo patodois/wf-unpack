@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
 use crate::animation::{Channel, Interpolation, Target};
@@ -68,6 +68,10 @@ pub fn write_animated(
     clips: &[Clip],
     out_dir: &Path,
 ) -> Result<()> {
+    ensure!(
+        !scene.primitives.is_empty(),
+        "{name} has no triangles to write (an empty \"primitives\" list draws nothing)"
+    );
     fs::create_dir_all(out_dir)?;
 
     let mut bin: Vec<u8> = Vec::new();
@@ -199,7 +203,7 @@ pub fn write_animated(
 
     // Skeleton: bones become nodes 1..
     let mut nodes = vec![json!({"name": name, "mesh": 0})];
-    let mut scene_nodes = vec![0];
+    let scene_nodes = [0];
     let mut skins = Vec::new();
     if let Some(sk) = &scene.skin {
         nodes[0]["skin"] = json!(0);
@@ -220,9 +224,19 @@ pub fn write_animated(
                 node["children"] = json!(children);
             }
             nodes.push(node);
-            if b.parent.is_none() {
-                scene_nodes.push(i + 1);
-            }
+        }
+        // Bones without a parent hang from the model's node, as in the bridge's model, so that
+        // every joint has the one common root glTF requires of a skin, however many roots the
+        // skeleton has (attachments that ride another skeleton get root bones of their own)
+        let roots: Vec<usize> = sk
+            .bones
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.parent.is_none())
+            .map(|(i, _)| i + 1)
+            .collect();
+        if !roots.is_empty() {
+            nodes[0]["children"] = json!(roots);
         }
         // Column-major, as glTF stores matrices
         let ibm: Vec<u8> = sk
@@ -237,9 +251,7 @@ pub fn write_animated(
             "joints": sk.joints.iter().map(|j| j + 1).collect::<Vec<_>>(),
             "inverseBindMatrices": accessors.len() - 1,
         });
-        if let Some(root) = sk.bones.iter().position(|b| b.parent.is_none()) {
-            skin["skeleton"] = json!(root + 1);
-        }
+        skin["skeleton"] = json!(0);
         skins.push(skin);
     }
 
@@ -604,5 +616,83 @@ impl LevelWriter {
             serde_json::to_vec_pretty(&doc)?,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{Primitive, SceneBone, SceneSkin};
+
+    fn bone(name: &str, parent: Option<usize>) -> SceneBone {
+        SceneBone {
+            name: name.into(),
+            parent,
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        }
+    }
+
+    /// One triangle skinned to three bones: A (root) with child B, and a second root C.
+    fn scene(with_triangle: bool) -> Scene {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        Scene {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
+            uv0: vec![[0.0; 2]; 3],
+            uv1: vec![[0.0; 2]; 3],
+            joints: vec![[0, 1, 2, 0]; 3],
+            weights: vec![[0.5, 0.25, 0.25, 0.0]; 3],
+            primitives: if with_triangle {
+                vec![Primitive {
+                    mesh: 0,
+                    indices: vec![0, 1, 2],
+                }]
+            } else {
+                Vec::new()
+            },
+            skin: Some(SceneSkin {
+                bones: vec![bone("A", None), bone("B", Some(0)), bone("C", None)],
+                joints: vec![0, 1, 2],
+                inverse_binds: vec![identity; 3],
+            }),
+            bounds: ([0.0; 3], [1.0, 1.0, 0.0]),
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wf-unpack-gltf-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_skeleton_with_two_roots_has_one_common_root() {
+        let dir = temp_dir("roots");
+        write_animated(&scene(true), "m", &[], &[], &dir).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(dir.join("m.gltf")).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        // Bones are nodes 1..=3; both roots (A = 1, C = 3) hang from the model's node 0
+        assert_eq!(doc["nodes"][0]["children"], json!([1, 3]));
+        assert_eq!(doc["nodes"][1]["children"], json!([2]));
+        assert_eq!(doc["scenes"][0]["nodes"], json!([0]));
+        assert_eq!(doc["skins"][0]["skeleton"], json!(0));
+        assert_eq!(doc["meshes"][0]["primitives"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_scene_without_triangles_is_not_written() {
+        let dir = temp_dir("empty");
+        let err = write_animated(&scene(false), "m", &[], &[], &dir).unwrap_err();
+        assert!(err.to_string().contains("no triangles"), "{err:#}");
+        assert!(!dir.join("m.gltf").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
