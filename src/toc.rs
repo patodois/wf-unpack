@@ -145,6 +145,28 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     go(pattern.as_bytes(), path.as_bytes())
 }
 
+/// Whether `path` matches an animation filter: `|` separates alternatives; each one is a
+/// substring of the path, or, when it has `*` or `?`, a glob over the end of the path (the start is
+/// free, so `Tenno/Movement/**` and `/Tenno/Movement/**` both match
+/// `/Lotus/Animations/Tenno/Movement/...`). For a plain substring, `Tenno/Movement/` and
+/// `/Tenno/Movement/` select the same clips of the game, since every folder name starts after a `/`.
+pub fn clip_filter_matches(filter: &str, path: &str) -> bool {
+    filter.split('|').any(|f| {
+        if f.contains(['*', '?']) {
+            let anchored = if f.starts_with('*') {
+                f.to_string()
+            } else if f.starts_with('/') {
+                format!("**{f}")
+            } else {
+                format!("**/{f}")
+            };
+            glob_match(&anchored, path)
+        } else {
+            path.contains(f)
+        }
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -215,6 +237,15 @@ pub(crate) mod tests {
         assert!(glob_match("/a?c", "/abc"));
         assert!(!glob_match("/a?c", "/a/c"));
         assert!(glob_match("/exact", "/exact"));
+        // the start of an animation filter is free; `|` separates alternatives
+        let clip = "/Lotus/Animations/Tenno/Movement/Sword/JogForward_anim.fbx";
+        assert!(clip_filter_matches("Tenno/Movement/Sword/", clip));
+        assert!(clip_filter_matches("/Tenno/Movement/Sword/", clip));
+        assert!(clip_filter_matches("Tenno/Movement/*/Jog*_anim.fbx", clip));
+        assert!(clip_filter_matches("/Tenno/Movement/**_anim.fbx", clip));
+        assert!(clip_filter_matches("/Bow/|/Sword/", clip));
+        assert!(!clip_filter_matches("Tenno/Movement/Bow/", clip));
+        assert!(!clip_filter_matches("/Tenno/Movement/*_anim.fbx", clip));
         assert!(!glob_match("/exact", "/exactly"));
     }
 }

@@ -8,12 +8,11 @@ use anyhow::{bail, Context, Result};
 
 use wf_unpack::animation::{Animation, AnimationPackages, KIND_ANIMATION, SOURCE_FPS};
 use wf_unpack::gltf::Clip;
+use wf_unpack::groupkey::GroupKey;
 use wf_unpack::header::CommonHeader;
 use wf_unpack::model::Model;
 use wf_unpack::scene::SceneSkin;
-use wf_unpack::toc::Entry;
-
-use crate::matches;
+use wf_unpack::toc::{clip_filter_matches, Entry};
 
 /// Animations live under these folders; a few have no `.fbx` extension.
 fn may_be_animation(e: &Entry) -> bool {
@@ -57,7 +56,7 @@ pub fn anim_cmd(game: &Path, target: &str, filter: Option<&str>) -> Result<()> {
     let mut count = 0;
     for i in 0..pk.entries().len() {
         let e = pk.entries()[i].clone();
-        if !may_be_animation(&e) || filter.is_some_and(|f| !matches(f, &e.path)) {
+        if !may_be_animation(&e) || filter.is_some_and(|f| !clip_filter_matches(f, &e.path)) {
             continue;
         }
         let Some((_, h)) = pk.header(&e)? else {
@@ -88,15 +87,25 @@ pub fn anim_cmd(game: &Path, target: &str, filter: Option<&str>) -> Result<()> {
             }
         }
     }
+    if count == 0 {
+        bail!("no clip found for {target} (a skeleton name, a model or a clip path)");
+    }
+    // The total first, so a long list below can be skimmed or cut off
+    match (&skeleton, filter) {
+        (None, Some(f)) => println!(
+            "fits this model: {count} clips ({} skeletons) matching {f:?}",
+            found.len()
+        ),
+        (None, None) => println!("fits this model: {count} clips ({} skeletons)", found.len()),
+        (Some(name), Some(f)) => println!("skeleton {name}: {count} clips matching {f:?}"),
+        (Some(name), None) => println!("skeleton {name}: {count} clips"),
+    }
     for (name, mut lines) in found {
         lines.sort();
         println!("skeleton {name}: {} clips", lines.len());
         for (_, l) in lines {
             println!("  {l}");
         }
-    }
-    if count == 0 {
-        bail!("no clip found for {target} (a skeleton name, a model or a clip path)");
     }
     Ok(())
 }
@@ -164,7 +173,7 @@ pub fn clips_for_skin(game: &Path, skin: &SceneSkin, filter: &str) -> Result<Vec
     let (mut wrong_skeleton, mut seen) = (0usize, 0usize);
     for i in 0..pk.entries().len() {
         let e = pk.entries()[i].clone();
-        if !may_be_animation(&e) || !matches(filter, &e.path) {
+        if !may_be_animation(&e) || !clip_filter_matches(filter, &e.path) {
             continue;
         }
         let Some((raw, h)) = pk.header(&e)? else {
@@ -424,6 +433,9 @@ pub fn check_anims_cmd(game: &Path) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if !errors.is_empty() {
+        println!("files the reader does not handle, counted per message (N is a number):");
+    }
     for (msg, (n, example)) in &errors {
         println!("  {n:>5}  {msg}\n         e.g. {example}");
     }
@@ -440,7 +452,5 @@ pub fn check_anims_cmd(game: &Path) -> Result<()> {
 
 /// Messages grouped without their numbers.
 fn squash(msg: &str) -> String {
-    msg.chars()
-        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-        .collect()
+    msg.group_key()
 }

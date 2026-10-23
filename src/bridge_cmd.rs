@@ -10,6 +10,7 @@ use rewrite_bridge::SceneModel;
 use wf_unpack::bridge::{animated_id, Warframe};
 use wf_unpack::bridge_scene::SceneOptions;
 use wf_unpack::cache::Package;
+use wf_unpack::groupkey::GroupKey;
 use wf_unpack::level::{LevelDescription, RawLevel, StaticLevel, TypeResolver, KIND_LEVEL};
 use wf_unpack::packages::PackagesBin;
 
@@ -216,19 +217,14 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
                     *left_out.entry(why).or_default() += c;
                 }
                 for (_, why) in r.model_failures.iter().chain(&r.collision_failures) {
-                    let key: String = why
-                        .chars()
-                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                        .collect();
+                    let key: String = why.group_key();
                     *model_errors.entry(key).or_default() += 1;
                 }
             }
             Err(e) => {
                 let key: String = format!("{e:#}")
                     .replace(path.as_str(), "<level>")
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
+                    .group_key();
                 errors.entry(key).or_default().push(path.clone());
             }
         }
@@ -257,4 +253,91 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
         peak_rss_text()
     );
     Ok(())
+}
+
+/// Texture size `check-conformance` bakes at unless told otherwise: a level at full size peaked at
+/// 7 GB of resident memory, and the checks look at the geometry and the material slots, not at
+/// the pixels.
+pub const CONFORMANCE_MAX_TEXTURE: u32 = 256;
+
+/// What `check-conformance` takes besides the checker's own options.
+#[derive(Debug, PartialEq)]
+pub struct ConformanceOptions {
+    pub max_texture: u32,
+    pub no_textures: bool,
+    /// The rest, for `rewrite_bridge::conformance::cli::run`.
+    pub checker_args: Vec<String>,
+}
+
+/// Takes `--max-texture N` and `--no-textures` out of the arguments (they work before and after
+/// the checker's options) and returns them with the arguments the checker keeps.
+pub fn conformance_options(
+    max_texture: Option<u32>,
+    no_textures: bool,
+    args: Vec<String>,
+) -> Result<ConformanceOptions> {
+    let (mut max_texture, mut no_textures) = (max_texture, no_textures);
+    let mut checker_args = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--no-textures" => no_textures = true,
+            "--max-texture" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-texture needs a number of pixels"))?;
+                max_texture = Some(v.parse().map_err(|_| {
+                    anyhow::anyhow!("--max-texture {v:?} is not a number of pixels")
+                })?);
+            }
+            _ => checker_args.push(a),
+        }
+    }
+    Ok(ConformanceOptions {
+        max_texture: max_texture.unwrap_or(CONFORMANCE_MAX_TEXTURE),
+        no_textures,
+        checker_args,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn conformance_texture_options() {
+        let o = conformance_options(None, false, v(&["--kind", "level", "--limit", "5"])).unwrap();
+        assert_eq!(o.max_texture, CONFORMANCE_MAX_TEXTURE);
+        assert!(!o.no_textures);
+        assert_eq!(o.checker_args, v(&["--kind", "level", "--limit", "5"]));
+
+        // after the checker's options too, and the checker never sees them
+        let o = conformance_options(
+            None,
+            false,
+            v(&[
+                "--kind",
+                "level",
+                "--max-texture",
+                "128",
+                "--no-textures",
+                "-v",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(o.max_texture, 128);
+        assert!(o.no_textures);
+        assert_eq!(o.checker_args, v(&["--kind", "level", "-v"]));
+
+        // the ones clap parsed before the first checker option
+        let o = conformance_options(Some(2048), true, vec![]).unwrap();
+        assert_eq!((o.max_texture, o.no_textures), (2048, true));
+
+        assert!(conformance_options(None, false, v(&["--max-texture"])).is_err());
+        assert!(conformance_options(None, false, v(&["--max-texture", "big"])).is_err());
+    }
 }

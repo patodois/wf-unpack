@@ -109,7 +109,7 @@ use crate::model::{self, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use crate::packages::PackagesBin;
 use crate::pbr::{self, Baked, MaterialBaker};
 use crate::scene::{self, Scene};
-use crate::toc::{glob_match, Entry};
+use crate::toc::{clip_filter_matches, Entry};
 
 /// The suffix that asks for animation clips: `<model path>?animations=<filter>`.
 pub const ANIMATIONS_SUFFIX: &str = "?animations=";
@@ -142,13 +142,9 @@ pub fn is_level(path: &str) -> bool {
     path.ends_with(".level")
 }
 
-/// `filter` is a substring, or a glob when it has `*` or `?`.
+/// `filter` is a substring, or a glob when it has `*` or `?` (see [`clip_filter_matches`]).
 fn matches(filter: &str, path: &str) -> bool {
-    if filter.contains(['*', '?']) {
-        glob_match(filter, path)
-    } else {
-        path.contains(filter)
-    }
+    clip_filter_matches(filter, path)
 }
 
 /// The Warframe provider: models, animated models and level scenes of one `Cache.Windows`

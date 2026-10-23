@@ -15,6 +15,7 @@ pub mod clipspec;
 pub mod collision;
 pub mod ee;
 pub mod gltf;
+pub mod groupkey;
 pub mod header;
 pub mod level;
 pub mod level_export;

@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use wf_unpack::cache::Package;
+use wf_unpack::groupkey::GroupKey;
 use wf_unpack::header::CommonHeader;
 use wf_unpack::level::{
     InstanceRole, LevelDescription, RawLevel, StaticLevel, TypeResolver, KIND_LEVEL,
@@ -54,14 +55,14 @@ fn open(game: &Path, name: &str) -> Result<Package> {
 
 /// Groups error texts with their numbers masked, keeping a few examples.
 fn note(errors: &mut BTreeMap<String, Vec<String>>, err: &anyhow::Error, example: &str) {
-    let key: String = format!("{err:#}")
-        .chars()
-        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-        .collect();
+    let key: String = format!("{err:#}").group_key();
     errors.entry(key).or_default().push(example.to_string());
 }
 
 fn print_errors(errors: &BTreeMap<String, Vec<String>>) {
+    if !errors.is_empty() {
+        println!("  files that the reader does not handle, counted per message (N is a number):");
+    }
     for (msg, list) in errors {
         println!(
             "  {:>6}  {msg}\n          e.g. {}",

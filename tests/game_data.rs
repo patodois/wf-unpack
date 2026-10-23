@@ -1432,3 +1432,88 @@ fn warframe_default_colours() {
     assert_eq!(t[3], [1.0, 1.0, 1.0, 0.5]);
     assert!(SuitPalette::resolve(&dir, "/Lotus/Powersuits/Nobody/Nobody").is_err());
 }
+
+/// Runs the command-line tool and returns its standard output.
+fn run_cli(args: &[&str]) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wf-unpack"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn list_has_a_header_row_and_a_limit() {
+    let Some(dir) = game_dir() else { return };
+    let toc = dir.join("H.Misc.toc");
+    let text = run_cli(&["list", toc.to_str().unwrap(), "--limit", "3"]);
+    let lines: Vec<_> = text.lines().collect();
+    // the summary, the column names, then three files
+    assert_eq!(lines.len(), 5, "{text}");
+    assert!(lines[0].contains("files in"));
+    assert!(
+        lines[1].contains("bytes") && lines[1].contains("stored") && lines[1].ends_with("path")
+    );
+}
+
+#[test]
+fn anim_filter_says_how_many_clips_fit_first() {
+    let Some(dir) = game_dir() else { return };
+    let model = "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx";
+    // both spellings of the filter select the same clips
+    let game = dir.to_str().unwrap();
+    let anim = |filter: &str| run_cli(&["anim", model, "--filter", filter, "--game", game]);
+    let a = anim("/Tenno/Movement/MeleeWeapon/Sword/");
+    let b = anim("Tenno/Movement/MeleeWeapon/Sword/");
+    // (the first line quotes the filter as typed)
+    assert_eq!(
+        a.lines().skip(1).collect::<Vec<_>>(),
+        b.lines().skip(1).collect::<Vec<_>>()
+    );
+    let first = a.lines().next().unwrap();
+    assert!(first.starts_with("fits this model: "), "{first}");
+    let n: usize = first["fits this model: ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(n > 10, "{first}");
+}
+
+#[cfg(feature = "bridge")]
+#[test]
+fn check_conformance_takes_texture_options_among_the_checkers() {
+    let Some(dir) = game_dir() else { return };
+    let game = dir.to_str().unwrap();
+    // `--max-texture` and `--no-textures` work before and after the checker's own options; a level at the
+    // default size is checked with 256-pixel textures, which keeps a run of levels under about 1 GB
+    let a = run_cli(&[
+        "check-conformance",
+        "--game",
+        game,
+        "--no-textures",
+        "--kind",
+        "level",
+        "--limit",
+        "2",
+    ]);
+    let b = run_cli(&[
+        "check-conformance",
+        "--game",
+        game,
+        "--kind",
+        "level",
+        "--limit",
+        "1",
+        "--max-texture",
+        "64",
+    ]);
+    assert!(a.contains("2 asset(s) checked"), "{a}");
+    assert!(b.contains("1 asset(s) checked"), "{b}");
+}

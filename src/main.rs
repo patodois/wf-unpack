@@ -17,6 +17,7 @@ mod lighting_cmd;
 
 use wf_unpack::cache::Package;
 use wf_unpack::gltf;
+use wf_unpack::groupkey::GroupKey;
 use wf_unpack::header::CommonHeader;
 use wf_unpack::material::{self, MaskLayout, Material, Plan, Source};
 use wf_unpack::model::{Model, ModelHeader, KIND_SKINNED, KIND_STATIC};
@@ -41,6 +42,9 @@ enum Command {
         /// Only list paths containing this text, or matching it when it has * or ?
         #[arg(long)]
         filter: Option<String>,
+        /// Stop after this many files
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Extract files whose path matches (`*` within a folder, `**` across folders)
     Extract {
@@ -86,8 +90,9 @@ enum Command {
         /// (materials are not resolved automatically yet)
         #[arg(long = "texture")]
         textures: Vec<String>,
-        /// Also write the animations whose path matches (substring, or a glob with * / ** / ?)
-        /// and that fit the model's skeleton, as glTF animations
+        /// Also write the animations whose path matches and that fit the model's skeleton, as glTF
+        /// animations. A filter is a substring (`/Tenno/Movement/MeleeWeapon/Sword/`), or a glob
+        /// with * / ** / ?; `|` separates several. Same form as `bridge-anim --animations`.
         #[arg(long)]
         animations: Option<String>,
         /// A Warframe (e.g. /Lotus/Powersuits/Excalibur/Excalibur): bake with its default
@@ -155,7 +160,8 @@ enum Command {
     BridgeAnim {
         /// A skinned model path, e.g. /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx
         model: String,
-        /// Clips whose path matches (substring, or glob with * / ** / ?; `|` separates several)
+        /// Clips whose path matches: a substring (`/Tenno/Movement/MeleeWeapon/Sword/`), or a glob
+        /// with * / ** / ?; `|` separates several. Same form as `model --animations`.
         #[arg(long)]
         animations: String,
         /// Fail when more clips than this match
@@ -195,6 +201,13 @@ enum Command {
         /// The Warframe game folder (put it before the checker's options)
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
+        /// Shrink baked textures to at most this many pixels on a side (default 256: a level
+        /// baked at full size needs several GB). Can also come after the checker's options.
+        #[arg(long)]
+        max_texture: Option<u32>,
+        /// Skip texture baking: flat material colours only (fast, small)
+        #[arg(long)]
+        no_textures: bool,
         /// Options of the checker, passed through (`--id`, `--filter`, `--kind`, `--limit`,
         /// `--strict`, `-v`, `--help`). Ids are model paths, or `path?animations=FILTER` to
         /// check a skinned model with its clips.
@@ -218,7 +231,8 @@ enum Command {
     Anim {
         /// A skeleton name, a model path or a clip path
         target: String,
-        /// Only clips whose path contains this text, or matches it when it has * or ?
+        /// Only clips whose path matches: a substring (`/Tenno/Movement/MeleeWeapon/Sword/`), or a
+        /// glob with * / ** / ?; `|` separates several
         #[arg(long)]
         filter: Option<String>,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -356,7 +370,7 @@ fn expand_home(p: &Path) -> PathBuf {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::List { toc, filter } => list(&toc, filter.as_deref()),
+        Command::List { toc, filter, limit } => list(&toc, filter.as_deref(), limit),
         Command::Extract { toc, pattern, out } => extract(&toc, &pattern, &out),
         Command::Check { dir, only } => check(&dir, only.as_deref()),
         Command::Texture {
@@ -404,10 +418,21 @@ fn main() -> Result<()> {
             include_hidden,
         ),
         #[cfg(feature = "bridge")]
-        Command::CheckConformance { game, args } => {
-            let provider = wf_unpack::bridge::Warframe::open(&expand_home(&game))?;
+        Command::CheckConformance {
+            game,
+            max_texture,
+            no_textures,
+            args,
+        } => {
+            let opts = bridge_cmd::conformance_options(max_texture, no_textures, args)?;
+            let provider = wf_unpack::bridge::Warframe::open(&expand_home(&game))?
+                .with_textures(!opts.no_textures)
+                .with_max_texture(Some(opts.max_texture));
             // exits with the checker's status: 0, 1 (an asset failed) or 2 (usage)
-            std::process::exit(rewrite_bridge::conformance::cli::run(&provider, args))
+            std::process::exit(rewrite_bridge::conformance::cli::run(
+                &provider,
+                opts.checker_args,
+            ))
         }
         #[cfg(feature = "bridge")]
         Command::CheckBridgeScenes {
@@ -504,7 +529,7 @@ fn matches(filter: &str, path: &str) -> bool {
     }
 }
 
-fn list(path: &Path, filter: Option<&str>) -> Result<()> {
+fn list(path: &Path, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
     use std::io::Write;
     let pkg = Package::open(path)?;
     let mut out = std::io::stdout().lock();
@@ -516,10 +541,14 @@ fn list(path: &Path, filter: Option<&str>) -> Result<()> {
             pkg.toc.entries.len(),
             pkg.toc.dir_count
         )?;
-        for e in &pkg.toc.entries {
-            if filter.is_some_and(|f| !matches(f, &e.path)) {
-                continue;
-            }
+        writeln!(out, "{:>10} {:>10}  path", "bytes", "stored")?;
+        let shown = pkg
+            .toc
+            .entries
+            .iter()
+            .filter(|e| filter.is_none_or(|f| matches(f, &e.path)))
+            .take(limit.unwrap_or(usize::MAX));
+        for e in shown {
             writeln!(out, "{:>10} {:>10}  {}", e.len, e.comp_len, e.path)?;
         }
         Ok(())
@@ -616,10 +645,7 @@ fn check(dir: &Path, only: Option<&str>) -> Result<()> {
                 }
                 Err(err) => {
                     // Group by message without numbers so similar failures land together
-                    let key: String = format!("{err:#}")
-                        .chars()
-                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                        .collect();
+                    let key: String = format!("{err:#}").group_key();
                     errors.entry(key).or_default().push(e.path.clone());
                 }
             }
@@ -703,10 +729,7 @@ fn textures_cmd(game: &Path) -> Result<()> {
                 }
             ),
             Err(err) => {
-                let msg: String = format!("{err:#}")
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
+                let msg: String = format!("{err:#}").group_key();
                 format!("FAIL {}", msg.chars().take(100).collect::<String>())
             }
         };
@@ -1121,10 +1144,7 @@ fn check_models_cmd(game: &Path) -> Result<()> {
                 }
             }
             Err(err) => {
-                let key: String = format!("{err:#}")
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
+                let key: String = format!("{err:#}").group_key();
                 st.errors.entry(key).or_default().push(e.path.clone());
             }
         }
@@ -1149,6 +1169,9 @@ fn check_models_cmd(game: &Path) -> Result<()> {
             );
         }
         println!(")");
+        if !st.errors.is_empty() {
+            println!("  models the reader does not handle, counted per message (N is a number):");
+        }
         for (msg, list) in &st.errors {
             println!(
                 "  {:>6}  {msg}\n          e.g. {}",
@@ -1210,10 +1233,7 @@ fn check_packages_cmd(game: &Path) -> Result<()> {
             }
             Ok(None) => unreachable!(),
             Err(err) => {
-                let key: String = format!("{err:#}")
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
+                let key: String = format!("{err:#}").group_key();
                 errors.entry(key).or_default().push(path.to_string());
             }
         }
@@ -1488,10 +1508,7 @@ fn check_bridge_cmd(game: &Path, textures: bool, filter: &str, limit: Option<usi
                     .filter(|m| m != path)
                     .collect::<Vec<_>>()
                     .join(": ");
-                let key: String = msg
-                    .chars()
-                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
-                    .collect();
+                let key: String = msg.group_key();
                 st.errors.entry(key).or_default().push(path.clone());
             }
         }
@@ -1512,6 +1529,9 @@ fn check_bridge_cmd(game: &Path, textures: bool, filter: &str, limit: Option<usi
             st.joints,
             if textures { format!(", {} with a base colour texture", st.textured) } else { String::new() }
         );
+        if !st.errors.is_empty() {
+            println!("  models the reader does not handle, counted per message (N is a number):");
+        }
         for (msg, list) in &st.errors {
             println!(
                 "  {:>6}  {msg}\n          e.g. {}",
