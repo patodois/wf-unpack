@@ -291,7 +291,9 @@ Not reproduced (counted per slot by `check-materials`):
 Not affiliated with or endorsed by Digital Extremes. Warframe is a trademark
 of Digital Extremes Ltd. Use this tool for reading and studying game data
 from your own install only; do not use it for cheating or to redistribute
-game assets.
+game assets. Nothing extracted from the game belongs in this repository, its
+issues or its pull requests. The game's own terms may restrict reading its
+files; check them before using this tool.
 
 ## License
 
