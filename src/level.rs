@@ -564,8 +564,8 @@ pub struct Instance {
     /// Index into [`LevelDescription::models`].
     pub model: usize,
     pub transform: Transform,
-    /// `OverrideMaterial`: replaces the model's materials, in mesh order;
-    /// an empty entry keeps the model's own.
+    /// `OverrideMaterial` (or a lone `Material`): replaces the model's
+    /// materials, in mesh order; an empty entry keeps the model's own.
     pub materials: Vec<String>,
     /// Index of the object in the level.
     pub object: usize,
@@ -727,6 +727,7 @@ pub struct LevelDescription {
 const CLASS_LIGHT: &str = "/EE/Types/Engine/Light";
 const CLASS_ZONE: &str = "/EE/Types/Engine/CsgZone";
 const CLASS_SHEET: &str = "/EE/Types/Alias/CsgSheet";
+const CLASS_HLOD: &str = "/EE/Types/Engine/HLODAggregateEntity";
 const CLASS_PORTAL: &str = "/EE/Types/Framework/LevelPortal";
 const CLASS_LEVEL_INFO: &str = "/EE/Types/Engine/LevelInfo";
 const CLASS_ZONE_ATTRIBS: &str = "/EE/Types/Engine/ZoneAttribs";
@@ -934,6 +935,10 @@ impl LevelDescription {
                     height: r.float("Height"),
                     radius: r.float("Radius"),
                 }),
+                CLASS_HLOD => skip(
+                    "HLOD aggregate (a low-detail stand-in; type 108 models are not read)"
+                        .to_string(),
+                ),
                 _ => {
                     let Some(mesh) = r.path("Mesh") else {
                         skip(format!("no mesh: {}", o.type_path));
@@ -973,7 +978,14 @@ impl LevelDescription {
                     d.instances.push(Instance {
                         model,
                         transform,
-                        materials: r.paths("OverrideMaterial"),
+                        materials: {
+                            let list = r.paths("OverrideMaterial");
+                            // A lone `Material` replaces the first slot, as an override list of one would
+                            match (list.is_empty(), r.path("Material")) {
+                                (true, Some(m)) => vec![m],
+                                _ => list,
+                            }
+                        },
                         object: i,
                         type_path: o.type_path.clone(),
                         scope: o.scope.clone(),
@@ -1202,6 +1214,13 @@ pub(crate) mod tests {
                 "Mesh=/Lotus/Objects/A.fbx\nStartHidden=1\n",
             ),
             ("/Lotus/Deco/Chair", [0.0; 3], id, "/", ""),
+            (
+                "/EE/Types/Engine/Decoration",
+                [0.0; 3],
+                id,
+                "/",
+                "Mesh=/Lotus/Objects/A.fbx\nMaterial=/M/Solo\n",
+            ),
             ("/Lotus/Deco/RedChair", [0.0; 3], id, "/", "MeshScale={1,2,3}\n"),
             (
                 "DojoLight",
@@ -1259,7 +1278,7 @@ pub(crate) mod tests {
                 "/Lotus/Other/Red.fbx"
             ]
         );
-        assert_eq!(d.instances.len(), 5);
+        assert_eq!(d.instances.len(), 6);
         let zone = &d.instances[0];
         assert_eq!(zone.role, InstanceRole::Zone);
         let lm = zone.lightmap.as_ref().unwrap();
@@ -1272,9 +1291,11 @@ pub(crate) mod tests {
         assert!(!a.hidden && d.instances[2].hidden);
         assert_eq!(d.instances[3].transform.scale, [0.5; 3]);
         assert_eq!(d.instances[3].model, 2);
+        // A lone Material replaces the first slot
+        assert_eq!(d.instances[4].materials, ["/M/Solo"]);
         // The child type overrides Mesh and keeps the scale; the object overrides the scale
-        assert_eq!(d.instances[4].model, 3);
-        assert_eq!(d.instances[4].transform.scale, [1.0, 2.0, 3.0]);
+        assert_eq!(d.instances[5].model, 3);
+        assert_eq!(d.instances[5].transform.scale, [1.0, 2.0, 3.0]);
 
         // The relative type name resolves against the level's folder
         assert_eq!(d.lights.len(), 1);
@@ -1360,9 +1381,9 @@ pub(crate) mod tests {
         };
         let mut d = d;
         d.add_static_level("/Lotus/Levels/X/0.static", &s);
-        assert_eq!(d.instances.len(), 6);
-        assert_eq!(d.instances[5].transform.scale, [3.0; 3]);
-        assert_eq!(d.instances[5].model, 1);
+        assert_eq!(d.instances.len(), 7);
+        assert_eq!(d.instances[6].transform.scale, [3.0; 3]);
+        assert_eq!(d.instances[6].model, 1);
         assert_eq!(d.skipped["editor helper mesh"], 2);
         assert_eq!(d.models.len(), 4);
     }

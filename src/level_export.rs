@@ -244,7 +244,11 @@ pub fn export_level(
                 stored.push(None);
             }
             Err(e) => {
-                report.model_failures.push((path.clone(), format!("{e:#}")));
+                // The error chain starts with the path; the report has it already
+                let text = format!("{e:#}");
+                let text = text.strip_prefix(&format!("{path}: ")).unwrap_or(&text);
+                let text = text.strip_prefix(&format!("{path}: ")).unwrap_or(text);
+                report.model_failures.push((path.clone(), text.to_string()));
                 stored.push(None);
             }
         }
