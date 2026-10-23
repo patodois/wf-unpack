@@ -71,7 +71,10 @@ struct Orbit {
 }
 
 fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+    match (
+        p.strip_prefix("~/"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    ) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(p),
     }

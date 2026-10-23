@@ -133,7 +133,10 @@ const DEFAULT_GAME_DIR: &str = "~/Games/Warframe/Cache.Windows";
 
 /// Expands a leading `~/` (clap does not go through a shell for defaults).
 fn expand_home(p: &Path) -> PathBuf {
-    match (p.strip_prefix("~"), std::env::var_os("HOME")) {
+    match (
+        p.strip_prefix("~"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    ) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => p.to_path_buf(),
     }
@@ -1091,7 +1094,14 @@ fn check_bridge_cmd(game: &Path, textures: bool, filter: &str, limit: Option<usi
         errors: BTreeMap<String, Vec<String>>,
     }
     let mut stats: BTreeMap<u16, Stats> = BTreeMap::new();
-    for (path, kind) in &models {
+    for (n, (path, kind)) in models.iter().enumerate() {
+        if n > 0 && n % 2000 == 0 {
+            eprintln!(
+                "{n}/{} models, {:.0}s",
+                models.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
         let st = stats.entry(*kind).or_default();
         match provider.load(path) {
             Ok(m) => {

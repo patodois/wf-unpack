@@ -9,7 +9,6 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-libc = "0.2"
 oozextract = "0.5.5"
 png = "0.18.1"
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -17,7 +16,11 @@ texture2ddecoder = "0.1.2"
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
 # Shared model types for crossovers with other game rewrites
-rewrite-bridge = { path = "../rewrite-bridge", optional = true }
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "263b74c550c49873e9a8b0298ca8434803037fd8", optional = true }
+
+# Only for the F_NOCACHE hint in cache.rs
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [features]
 bridge = ["dep:rewrite-bridge"]

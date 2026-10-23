@@ -71,7 +71,7 @@ WF_GAME_DIR=~/Games/Warframe/Cache.Windows cargo test --release
 ## rewrite-bridge
 
 With the `bridge` feature, `src/bridge.rs` implements
-[rewrite-bridge](../rewrite-bridge)'s `Provider` for Warframe. Other game
+[rewrite-bridge](https://github.com/patodois/rewrite-bridge)'s `Provider` for Warframe. Other game
 rewrites can then load Warframe models into the same scene as their own.
 
 ```sh
