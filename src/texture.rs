@@ -34,6 +34,9 @@ use crate::header::CommonHeader;
 
 pub const KIND_ARRAY: u16 = 166;
 pub const KIND_CUBEMAP: u16 = 177;
+/// Reflection probes of levels (`<N>_cross.hdr` in `H.LightMap`): a BC6H cube
+/// map, six faces per mip level (see [`CubeTexture`]).
+pub const KIND_PROBE: u16 = 183;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -197,7 +200,13 @@ pub struct Layout {
 impl TextureHeader {
     /// Matches the header against the sizes of the `B.` and `F.` parts.
     pub fn layout(&self, body_len: usize, full_len: usize) -> Result<Layout> {
-        let sizes = self.level_sizes()?;
+        self.layout_layers(1, body_len, full_len)
+    }
+
+    /// Like [`TextureHeader::layout`] for a texture whose every mip level holds
+    /// `layers` images (6 for a cube map).
+    pub fn layout_layers(&self, layers: usize, body_len: usize, full_len: usize) -> Result<Layout> {
+        let sizes: Vec<usize> = self.level_sizes()?.iter().map(|s| s * layers).collect();
         let (body, full) = (usize::from(self.body_mips), usize::from(self.full_mips));
         ensure!(body + full > 0, "texture has no mip levels");
         let first = (0..sizes.len())
@@ -230,6 +239,57 @@ fn split_levels(sizes: &[usize], layout: &Layout, body: &[u8], full: &[u8]) -> V
     mips
 }
 
+/// A cube map: for every mip level, six square faces in the order +X, -X, +Y,
+/// -Y, +Z, -Z (Direct3D's order; see [`crate::probe`] for the orientation).
+pub struct CubeTexture {
+    pub header: TextureHeader,
+    pub format: Format,
+    /// Size of `mips[0]` faces; smaller than the header's when top levels are missing.
+    pub size: u32,
+    /// Mip levels, largest first, each with its six faces.
+    pub mips: Vec<[Vec<u8>; 6]>,
+}
+
+impl CubeTexture {
+    /// Splits the `B.` and `F.` parts of a type 183 texture. Each part stores
+    /// its levels smallest first, and a level is its six faces one after the other.
+    pub fn from_parts(header: TextureHeader, body: &[u8], full: &[u8]) -> Result<Self> {
+        ensure!(
+            header.common.kind == KIND_PROBE,
+            "texture type {} is not a reflection probe ({KIND_PROBE})",
+            header.common.kind
+        );
+        ensure!(
+            header.width == header.height,
+            "cube map faces must be square"
+        );
+        let layout = header.layout_layers(6, body.len(), full.len())?;
+        let sizes = header.level_sizes()?;
+        let format = header.format.context("unknown texture format")?;
+        let mut mips = Vec::with_capacity(layout.full + layout.body);
+        for (part, levels) in [
+            (full, &sizes[layout.first..layout.first + layout.full]),
+            (body, &sizes[layout.first + layout.full..][..layout.body]),
+        ] {
+            let mut end = part.len();
+            for &size in levels {
+                let level = &part[end - 6 * size..end];
+                mips.push(std::array::from_fn(|f| {
+                    level[f * size..(f + 1) * size].to_vec()
+                }));
+                end -= 6 * size;
+            }
+        }
+        let size = (u32::from(header.width) >> layout.first).max(1);
+        Ok(CubeTexture {
+            header,
+            format,
+            size,
+            mips,
+        })
+    }
+}
+
 /// The three texture packages, opened once for loading many textures.
 pub struct TexturePackages {
     head: Package,
@@ -258,11 +318,11 @@ impl TexturePackages {
         self.head.toc.get(path).is_some()
     }
 
-    pub fn load(&mut self, path: &str) -> Result<Texture> {
+    fn parts(&mut self, path: &str) -> Result<(TextureHeader, Vec<u8>, Vec<u8>)> {
         let h = self
             .head
             .read_path(path)?
-            .with_context(|| format!("{path} is not in H.Texture"))?;
+            .with_context(|| format!("{path} is not in {}", self.head.name))?;
         let header = TextureHeader::parse(&h)?;
         let part = |pkg: &mut Option<Package>| -> Result<Vec<u8>> {
             Ok(match pkg {
@@ -272,12 +332,26 @@ impl TexturePackages {
         };
         let body = part(&mut self.body)?;
         let full = part(&mut self.full)?;
+        Ok((header, body, full))
+    }
+
+    pub fn load(&mut self, path: &str) -> Result<Texture> {
+        let (header, body, full) = self.parts(path)?;
         Texture::from_parts(header, &body, &full).with_context(|| path.to_string())
+    }
+
+    /// Loads a reflection probe (type 183).
+    pub fn load_cube(&mut self, path: &str) -> Result<CubeTexture> {
+        let (header, body, full) = self.parts(path)?;
+        CubeTexture::from_parts(header, &body, &full).with_context(|| path.to_string())
     }
 }
 
 impl Texture {
     pub fn from_parts(header: TextureHeader, body: &[u8], full: &[u8]) -> Result<Self> {
+        if header.common.kind == KIND_PROBE {
+            bail!("a reflection probe (type {KIND_PROBE}) is a cube map: use CubeTexture");
+        }
         if header.common.kind == KIND_ARRAY || header.common.kind == KIND_CUBEMAP {
             bail!(
                 "texture arrays and cubemaps (type {}) are not supported yet",

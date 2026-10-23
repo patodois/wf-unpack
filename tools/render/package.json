@@ -1,0 +1,10 @@
+{
+  "name": "wf-unpack-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless three.js renderer for the glTF files wf-unpack writes (levels and models)",
+  "dependencies": {
+    "playwright-core": "^1.61.1",
+    "three": "^0.160.0"
+  }
+}

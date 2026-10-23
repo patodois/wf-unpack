@@ -29,6 +29,8 @@ pub struct Material {
     pub metallic_factor: f32,
     pub roughness_factor: f32,
     pub emissive_factor: [f32; 3],
+    /// `KHR_materials_emissive_strength`, written when it is not 1.
+    pub emissive_strength: f32,
 }
 
 impl Material {
@@ -40,6 +42,7 @@ impl Material {
             metallic_factor: 0.0,
             roughness_factor: 0.6,
             emissive_factor: [1.0; 3],
+            emissive_strength: 1.0,
         }
     }
 }
@@ -163,6 +166,7 @@ pub fn write_animated(
         images.len() - 1
     };
     let mut gl_materials = Vec::new();
+    let mut uses_emissive_strength = false;
     for m in materials {
         let mut pbr = json!({
             "baseColorFactor": m.base_color_factor,
@@ -183,6 +187,10 @@ pub fn write_animated(
             }
         }
         mat["pbrMetallicRoughness"] = pbr;
+        if m.emissive_strength != 1.0 && mat.get("emissiveTexture").is_some() {
+            mat["extensions"] = json!({"KHR_materials_emissive_strength": {"emissiveStrength": m.emissive_strength}});
+            uses_emissive_strength = true;
+        }
         gl_materials.push(mat);
     }
     let textures: Vec<Value> = (0..images.len())
@@ -294,6 +302,9 @@ pub fn write_animated(
     });
     if !gl_materials.is_empty() {
         doc["materials"] = json!(gl_materials);
+        if uses_emissive_strength {
+            doc["extensionsUsed"] = json!(["KHR_materials_emissive_strength"]);
+        }
     }
     if !skins.is_empty() {
         doc["skins"] = json!(skins);
@@ -335,6 +346,7 @@ pub struct LevelWriter {
     scene_nodes: Vec<usize>,
     lights: Vec<Value>,
     scene_extras: Option<Value>,
+    uses_emissive_strength: bool,
 }
 
 impl LevelWriter {
@@ -397,6 +409,10 @@ impl LevelWriter {
             }
         }
         mat["pbrMetallicRoughness"] = pbr;
+        if m.emissive_strength != 1.0 && mat.get("emissiveTexture").is_some() {
+            mat["extensions"] = json!({"KHR_materials_emissive_strength": {"emissiveStrength": m.emissive_strength}});
+            self.uses_emissive_strength = true;
+        }
         self.materials.push(mat);
         self.materials.len() - 1
     }
@@ -567,9 +583,16 @@ impl LevelWriter {
             doc["textures"] = json!(textures);
             doc["samplers"] = json!([{"wrapS": 10497, "wrapT": 10497}]);
         }
+        let mut used: Vec<&str> = Vec::new();
         if !self.lights.is_empty() {
-            doc["extensionsUsed"] = json!(["KHR_lights_punctual"]);
+            used.push("KHR_lights_punctual");
             doc["extensions"] = json!({"KHR_lights_punctual": {"lights": self.lights}});
+        }
+        if self.uses_emissive_strength {
+            used.push("KHR_materials_emissive_strength");
+        }
+        if !used.is_empty() {
+            doc["extensionsUsed"] = json!(used);
         }
         fs::write(out_dir.join(&bin_name), &self.bin)?;
         fs::write(

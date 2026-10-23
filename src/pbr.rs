@@ -1,15 +1,21 @@
 //! Bakes a material [`Plan`] into glTF metallic-roughness images.
 //!
 //! - base colour = albedo x layered tint. The albedo is the diffuse map, the
-//!   grey albedo channel of a pack map, or `PS:DiffuseColor`. The tint starts
-//!   at white and each mask channel (R, then G, B, A) blends towards its tint
-//!   colour, as Warframe's texturing guide describes the layering. Colours are
-//!   multiplied in linear space; textures and tint colours are taken as sRGB.
+//!   grey albedo channel of a pack map, or `PS:DiffuseColor`. The tint is what
+//!   the game's fill shaders compute (decoded from the DXBC): a neutral 0.5
+//!   that each mask channel (R, then G, B, A) lerps towards its
+//!   `PS:TintColor0..3`, then doubled, so a tint colour of 0.5 means x1. Tint,
+//!   diffuse and emissive colour constants are linear values used as they are;
+//!   textures are sRGB.
 //! - metallic-roughness: glTF wants roughness in G and metalness in B.
 //! - normal: the game's maps point green down (DirectX); glTF wants green up,
 //!   so green is inverted and blue rebuilt from red and green.
-//! - emissive: the map (its red channel for single-channel maps) times the
-//!   material's emissive colour.
+//! - emissive: as the game computes it, the map (its red channel for
+//!   single-channel maps) is squared, then multiplied by the emissive colour
+//!   (`PS:EmissiveTintColor`, or a lerp from `Lo` to `Hi` by the squared map
+//!   for multi-tint materials) and by `PS:EmissiveMapAtten`; the first two
+//!   are baked into the texture (sRGB encoded) and the last is
+//!   `KHR_materials_emissive_strength`.
 
 use anyhow::{ensure, Result};
 
@@ -153,16 +159,21 @@ fn to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Layers the four tint colours over white by the mask channels (all in linear space).
+/// The tint multiplier the game's fill shaders build from the four mask
+/// weights and `PS:TintColor0..3` (linear): start at 0.5, lerp towards each
+/// colour by its mask in turn (0, 1, 2, 3), double, and keep the vector's
+/// length at 0.04 or more. A tint colour of 0.5 therefore means "unchanged".
 pub fn layered_tint(mask: [u8; 4], tints: &[[f32; 3]; 4]) -> [f32; 3] {
-    let mut t = [1.0f32; 3];
+    let mut t = [0.5f32; 3];
     for (i, tint) in tints.iter().enumerate() {
         let w = f32::from(mask[i]) / 255.0;
         for k in 0..3 {
             t[k] += (tint[k] - t[k]) * w;
         }
     }
-    t
+    let v = t.map(|c| 2.0 * c + 1e-4);
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    v.map(|c| c / len * len.max(0.04))
 }
 
 /// The four tint layer weights at pixel (x, y) of a `w` x `h` output.
@@ -183,6 +194,12 @@ pub fn mask_at(mask: &Image, layout: MaskLayout, x: u32, y: u32, w: u32, h: u32)
             })
         }
     }
+}
+
+/// The game's emission fade: `smoothstep(sat(10 * (1.1 * cutoff - v)))`; 1 for every map value when `cutoff` is 1.
+pub fn emissive_fade(v: f32, cutoff: f32) -> f32 {
+    let t = (10.0 * (1.1 * cutoff - v)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Metalness from a specular level (sRGB 0..1): dielectrics sit near 4 % reflectance.
@@ -209,6 +226,8 @@ pub struct Baked {
     pub normal: Option<Image>,
     pub emissive: Option<Image>,
     pub emissive_factor: [f32; 3],
+    /// `KHR_materials_emissive_strength`: `PS:EmissiveMapAtten`.
+    pub emissive_strength: f32,
 }
 
 /// Loads each texture once.
@@ -264,7 +283,7 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
         Some(t) => Some((
             loader.get(&t.mask)?,
             t.layout,
-            t.colors.map(|c| [0, 1, 2].map(|k| srgb_to_linear(c[k]))),
+            t.colors.map(|c| [c[0], c[1], c[2]]),
         )),
         None => None,
     };
@@ -278,7 +297,11 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
             v
         }
     };
-    let diffuse_lin = [0, 1, 2].map(|k| srgb_to_linear(plan.diffuse_color[k]));
+    let diffuse_lin = [
+        plan.diffuse_color[0],
+        plan.diffuse_color[1],
+        plan.diffuse_color[2],
+    ];
     // In the specular workflow metals take their colour from the specular map
     let spec_tints_base = plan.specular_workflow && metal_img.is_some();
     let base_inputs = [
@@ -291,7 +314,7 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
         },
     ];
     let (base_color, base_color_factor) = match largest(base_inputs) {
-        // The colour constants are taken as sRGB like the textures; glTF's factor is linear
+        // The colour constants are linear, like glTF's factor
         None => (None, [diffuse_lin[0], diffuse_lin[1], diffuse_lin[2], 1.0]),
         Some((w, h)) => {
             let mut out = Image::new(w, h);
@@ -359,17 +382,35 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
     };
 
     // Emissive
-    let (emissive, emissive_factor) = match &plan.emissive {
-        Some((p, single, color)) => {
+    let (emissive, emissive_factor, emissive_strength) = match &plan.emissive {
+        Some((p, single, hi)) => {
             let mut img = loader.get(p)?;
-            if *single {
-                for px in img.rgba.as_chunks_mut::<4>().0 {
-                    *px = [px[0], px[0], px[0], 255];
-                }
+            let (lo, cutoff) = (plan.emissive_lo, plan.emissive_cutoff);
+            for px in img.rgba.as_chunks_mut::<4>().0 {
+                let e = f32::from(px[0]) / 255.0;
+                let out = if *single {
+                    let s = e * e;
+                    if plan.multi_tint_emission {
+                        // lerp(Lo, Hi, s) times s
+                        [0, 1, 2].map(|k| s * (lo[k] + (hi[k] - lo[k]) * s))
+                    } else {
+                        let g = emissive_fade(s, cutoff);
+                        [0, 1, 2].map(|k| s * hi[k] * g)
+                    }
+                } else {
+                    let g = emissive_fade(f32::from(px[1]) / 255.0, cutoff);
+                    [0, 1, 2].map(|k| f32::from(px[k]) / 255.0 * hi[k] * g)
+                };
+                *px = [
+                    to_u8(linear_to_srgb(out[0].clamp(0.0, 1.0))),
+                    to_u8(linear_to_srgb(out[1].clamp(0.0, 1.0))),
+                    to_u8(linear_to_srgb(out[2].clamp(0.0, 1.0))),
+                    255,
+                ];
             }
-            (Some(img), color.map(|c| c.clamp(0.0, 1.0)))
+            (Some(img), [1.0; 3], plan.emissive_atten)
         }
-        None => (None, [0.0; 3]),
+        None => (None, [0.0; 3], 1.0),
     };
 
     Ok(Baked {
@@ -381,6 +422,7 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
         normal,
         emissive,
         emissive_factor,
+        emissive_strength,
     })
 }
 
@@ -403,13 +445,34 @@ mod tests {
             [0.0, 0.0, 1.0],
             [0.5, 0.5, 0.5],
         ];
-        assert_eq!(layered_tint([0, 0, 0, 0], &tints), [1.0, 1.0, 1.0]);
-        assert_eq!(layered_tint([255, 0, 0, 0], &tints), [1.0, 0.0, 0.0]);
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3);
+        // No mask: 0.5 doubled is 1, the material's own colour
+        assert!(near(layered_tint([0, 0, 0, 0], &tints), [1.0, 1.0, 1.0]));
+        // A tint of 0.5 means "unchanged", 1.0 doubles
+        assert!(near(layered_tint([255, 0, 0, 0], &tints), [2.0, 0.0, 0.0]));
         // Green over red, alpha over everything
-        assert_eq!(layered_tint([255, 255, 0, 0], &tints), [0.0, 1.0, 0.0]);
-        assert_eq!(layered_tint([255, 255, 255, 255], &tints), [0.5, 0.5, 0.5]);
+        assert!(near(
+            layered_tint([255, 255, 0, 0], &tints),
+            [0.0, 2.0, 0.0]
+        ));
+        assert!(near(
+            layered_tint([255, 255, 255, 255], &tints),
+            [1.0, 1.0, 1.0]
+        ));
         let half = layered_tint([255, 128, 0, 0], &tints);
-        assert!((half[0] - 0.498).abs() < 0.01 && (half[1] - 0.502).abs() < 0.01);
+        assert!((half[0] - 0.996).abs() < 0.01 && (half[1] - 1.004).abs() < 0.01);
+        // Near black keeps at least a length of 0.04
+        let dark = layered_tint([255, 0, 0, 0], &[[0.0; 3]; 4]);
+        assert!((dark.iter().map(|c| c * c).sum::<f32>().sqrt() - 0.04).abs() < 1e-3);
+    }
+
+    #[test]
+    fn emission_fade() {
+        assert_eq!(emissive_fade(1.0, 1.0), 1.0);
+        assert_eq!(emissive_fade(0.0, 0.5), 1.0);
+        assert_eq!(emissive_fade(1.0, 0.5), 0.0);
+        let mid = emissive_fade(0.5, 0.5);
+        assert!(mid > 0.0 && mid < 1.0);
     }
 
     #[test]

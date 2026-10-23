@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod level_cmd;
+mod lighting_cmd;
 
 use wf_unpack::cache::Package;
 use wf_unpack::gltf;
@@ -85,6 +86,17 @@ enum Command {
         /// and that fit the model's skeleton, as glTF animations
         #[arg(long)]
         animations: Option<String>,
+        /// A Warframe (e.g. /Lotus/Powersuits/Excalibur/Excalibur): bake with its default
+        /// colours, i.e. its energy colours on the emissive parts
+        #[arg(long)]
+        suit: Option<String>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Print a Warframe's default colours: the tint colours of its materials and its energy colours
+    Palette {
+        /// A suit, e.g. /Lotus/Powersuits/Excalibur/Excalibur
+        suit: String,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -174,6 +186,42 @@ enum Command {
         /// Shrink baked textures to at most this many pixels on a side
         #[arg(long)]
         max_texture: Option<u32>,
+        /// Do not write the lightmap pages
+        #[arg(long)]
+        no_lightmaps: bool,
+        /// Do not decode the reflection probes
+        #[arg(long)]
+        no_probes: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Decode a reflection probe (type 183, `<N>_cross.hdr`) to an equirectangular .hdr and six face .hdr files
+    Probe {
+        /// Path inside the packages, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr
+        path: String,
+        /// Output directory
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Print a level's post-processing, exposure and zone lighting settings
+    Postprocess {
+        /// Path inside the packages, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level
+        path: String,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// List the lightmaps a level uses and decode a few texels of each page
+    Lightmaps {
+        /// Path inside the packages, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level
+        path: String,
+        /// Write each page's decoded ambient light (luma * chroma, tone-mapped) as lm<N>_ambient.png here
+        #[arg(short, long)]
+        out: Option<PathBuf>,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -237,6 +285,7 @@ fn main() -> Result<()> {
             lod,
             textures,
             animations,
+            suit,
             game,
         } => model_cmd(
             &expand_home(&game),
@@ -245,7 +294,9 @@ fn main() -> Result<()> {
             lod,
             &textures,
             animations.as_deref(),
+            suit.as_deref(),
         ),
+        Command::Palette { suit, game } => lighting_cmd::palette_cmd(&expand_home(&game), &suit),
         Command::Anim {
             target,
             filter,
@@ -261,6 +312,8 @@ fn main() -> Result<()> {
             no_textures,
             collision,
             max_texture,
+            no_lightmaps,
+            no_probes,
             game,
         } => level_cmd::level_cmd(
             &expand_home(&game),
@@ -273,8 +326,19 @@ fn main() -> Result<()> {
                 include_hidden,
                 textures: !no_textures,
                 max_texture,
+                lightmaps: !no_lightmaps,
+                probes: !no_probes,
             },
         ),
+        Command::Probe { path, out, game } => {
+            lighting_cmd::probe_cmd(&expand_home(&game), &path, out.as_deref())
+        }
+        Command::Postprocess { path, json, game } => {
+            lighting_cmd::postprocess_cmd(&expand_home(&game), &path, json)
+        }
+        Command::Lightmaps { path, out, game } => {
+            lighting_cmd::lightmaps_cmd(&expand_home(&game), &path, out.as_deref())
+        }
         Command::CheckLevels { deep, game } => level_cmd::check_levels(&expand_home(&game), deep),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
@@ -580,6 +644,7 @@ fn auto_materials(
     names: &[String],
     meshes: usize,
     out: &Path,
+    palette: Option<&wf_unpack::palette::PaletteOverride>,
 ) -> Result<Vec<gltf::Material>> {
     let mut baker = pbr::MaterialBaker::open(game)?;
     let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
@@ -591,7 +656,12 @@ fn auto_materials(
             continue;
         };
         let mut mat = gltf::Material::named(short(name));
-        let plan = match baker.plan(model_path, name) {
+        let plan = match baker.plan(model_path, name).map(|mut p| {
+            if let Some(o) = palette {
+                p.apply_palette(o);
+            }
+            p
+        }) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("material {name}: {e:#}; exported without textures");
@@ -621,6 +691,7 @@ fn auto_materials(
         mat.metallic_factor = baked.metallic_factor;
         mat.roughness_factor = baked.roughness_factor;
         mat.emissive_factor = baked.emissive_factor;
+        mat.emissive_strength = baked.emissive_strength;
         result.push(mat);
     }
     Ok(result)
@@ -694,6 +765,7 @@ fn model_cmd(
     lod: usize,
     textures: &[String],
     animations: Option<&str>,
+    suit: Option<&str>,
 ) -> Result<()> {
     let read = |name: &str| -> Result<Vec<u8>> {
         Ok(match Package::open_in(game, name)? {
@@ -779,8 +851,27 @@ fn model_cmd(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    let palette = match suit {
+        Some(s) => {
+            let p = wf_unpack::palette::SuitPalette::resolve(game, s)?;
+            eprintln!(
+                "palette of {s}: energy {:?}, {} parts",
+                p.energy,
+                p.parts.len()
+            );
+            Some(p.energy_override())
+        }
+        None => None,
+    };
     let materials = if textures.is_empty() {
-        auto_materials(game, path, &h.materials(), h.meshes.len(), out)?
+        auto_materials(
+            game,
+            path,
+            &h.materials(),
+            h.meshes.len(),
+            out,
+            palette.as_ref(),
+        )?
     } else {
         manual_materials(game, textures, &h.materials(), h.meshes.len(), out)?
     };

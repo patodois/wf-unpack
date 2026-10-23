@@ -406,6 +406,18 @@ pub fn level_cmd(
             r.materials,
             r.buffer_bytes as f64 / 1e6
         );
+        if r.lightmap_pages > 0 || !r.lightmap_failures.is_empty() {
+            println!("lightmaps: {} pages written", r.lightmap_pages);
+        }
+        for (p, e) in &r.lightmap_failures {
+            println!("lightmap failed: {p}: {e}");
+        }
+        if r.probes_written > 0 || !r.probe_failures.is_empty() {
+            println!("reflection probes: {} written", r.probes_written);
+        }
+        for (p, e) in &r.probe_failures {
+            println!("probe failed: {p}: {e}");
+        }
         if r.hidden_skipped > 0 {
             println!(
                 "{} instances start hidden and were left out (--include-hidden)",
