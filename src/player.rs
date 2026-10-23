@@ -467,6 +467,15 @@ fn text(ty: &TypeInfo, key: &str) -> Result<Sourced<String>> {
     })
 }
 
+/// The path an entity name in `ty`'s text points at. Names in an entity's text are relative to
+/// that entity's folder, and for an inherited key the entity is the ancestor that sets it, not
+/// the type being read: `PhysicsBehavior=TennoWalk` set on `/Lotus/Types/Player/TennoAvatar` means
+/// `/Lotus/Types/Player/TennoWalk` for every avatar that derives from it, wherever it lives.
+fn named_path(ty: &TypeInfo, key: &str) -> Result<String> {
+    let s = text(ty, key)?;
+    Ok(resolve_path(folder(&s.entity), &s.value))
+}
+
 fn flag_of(ty: &TypeInfo, key: &str) -> Result<Sourced<bool>> {
     let t = text(ty, key)?;
     Ok(Sourced {
@@ -596,11 +605,7 @@ impl Player {
                 .ok_or_else(|| anyhow!("{path} is not in Packages.bin"))
         };
         let avatar = resolve(AVATAR)?;
-        // Names in an entity's text are relative to its folder
-        let named = |ty: &TypeInfo, key: &str| -> Result<String> {
-            let s = text(ty, key)?;
-            Ok(resolve_path(folder(&ty.path), &s.value))
-        };
+        let named = named_path;
         // PhysicsBehavior=TennoWalk -> ControllerAttributes=TennoWalkAttribs
         let behavior = resolve(&named(&avatar, "PhysicsBehavior")?)?;
         let walk = resolve(&named(&behavior, "ControllerAttributes")?)?;
@@ -1016,6 +1021,64 @@ mod tests {
                     .iter()
                     .all(|r| r.source.contains(':') || r.source.starts_with('/'))
         );
+    }
+
+    #[test]
+    fn names_inherited_from_a_parent_resolve_in_the_parents_folder() {
+        // The keys that name the controllers are set on AvatarBase2, which lives elsewhere than
+        // the avatar; the controllers are next to it, and not in the avatar's folder
+        const S: &str = "/Lotus/Types/Shared/";
+        let mut e: Vec<Entity> = Vec::new();
+        for (folder, name, parent, text) in entities("") {
+            match name {
+                "AvatarBase" => e.push((folder, name, "/Lotus/Types/Shared/AvatarBase2", text)),
+                "AvatarBase2" | "CameraController" | "Cam2" | "TennoMotion" | "InputController" => {
+                    e.push((S, name, parent, text))
+                }
+                _ => e.push((folder, name, parent, text)),
+            }
+        }
+        let bin = PackagesBin::parse(&crate::packages::tests::build(&e)).unwrap();
+        let mut types = TypeResolver::new(&bin).unwrap();
+        let p = Player::read(&mut types).unwrap();
+        assert_eq!(
+            p.ground.run_turn_rate.entity,
+            "/Lotus/Types/Shared/TennoMotion"
+        );
+        assert_eq!(p.camera.view_offset.value, [0.5, -0.1, -1.5]);
+        assert_eq!(p.crouch.tap_codes, ["ACTION"]);
+        // The climb controller is named by AvatarBase, in the avatar's folder, as before
+        assert_eq!(
+            p.bullet_jump.speed.entity,
+            "/Lotus/Types/Player/TennoClimbController"
+        );
+    }
+
+    /// In the game's data: an avatar that derives from TennoAvatar from another folder.
+    #[test]
+    fn the_games_inherited_names_point_at_entities_that_exist() {
+        let Some(dir) = std::env::var_os("WF_GAME_DIR") else {
+            return;
+        };
+        let bin = PackagesBin::load(std::path::Path::new(&dir)).unwrap();
+        let mut types = TypeResolver::new(&bin).unwrap();
+        let ghost = types
+            .resolve("/Lotus/Types/GameRules/LotusGhostAvatar")
+            .unwrap()
+            .unwrap();
+        assert!(ghost.chain.iter().any(|c| c == AVATAR), "{:?}", ghost.chain);
+        for (key, want) in [
+            ("PhysicsBehavior", "/Lotus/Types/Player/TennoWalk"),
+            ("MotionControllerType", "/Lotus/Types/Player/TennoMotion"),
+            (
+                "CameraControllerType",
+                "/Lotus/Types/Player/CameraController",
+            ),
+        ] {
+            let path = named_path(&ghost, key).unwrap();
+            assert_eq!(path, want, "{key}");
+            assert!(bin.contains(&path), "{path}");
+        }
     }
 
     #[test]
