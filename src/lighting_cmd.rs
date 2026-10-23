@@ -12,12 +12,20 @@ use wf_unpack::pbr::linear_to_srgb;
 use wf_unpack::probe::{radiance_hdr, Probe, FACE_NAMES};
 use wf_unpack::texture::TexturePackages;
 
+/// The last component of `path` without its extension, as a name for files in an output folder.
+/// It never holds a separator, so `folder.join(format!("{name}_x.hdr"))` stays in the folder; an
+/// entry without a `.` used to come back whole, with its folders (and an absolute one replaced
+/// the output folder in `join`).
 fn stem(path: &str) -> &str {
-    path.rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .rsplit_once('.')
-        .map_or(path, |(s, _)| s)
+    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    // A name made of dots only (".", "..") is not a file name
+    if !last.is_empty() && last.bytes().all(|b| b == b'.') {
+        return "probe";
+    }
+    match last.rsplit_once('.') {
+        Some((s, _)) if !s.is_empty() => s,
+        _ => last,
+    }
 }
 
 pub fn probe_cmd(game: &Path, path: &str, out: Option<&Path>) -> Result<()> {
@@ -457,4 +465,40 @@ pub fn check_lighting_cmd(game: &Path) -> Result<()> {
         crate::level_cmd::peak_rss_text()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stem_is_a_file_name_inside_the_output_folder() {
+        assert_eq!(stem("/Lotus/Levels/ClanDojo/A/0_cross.hdr"), "0_cross");
+        // No extension: the last component, not the whole path
+        assert_eq!(stem("/Lotus/Levels/A/0_cross"), "0_cross");
+        assert_eq!(stem("plain"), "plain");
+        assert_eq!(stem("/etc/passwd"), "passwd");
+        assert_eq!(stem("a/b/.hidden"), ".hidden");
+        for evil in [
+            "/etc/cron.d/../../tmp/x",
+            "../../up/there",
+            "/abs/olute",
+            "a\\b\\..\\..\\c",
+            "/Lotus/..",
+            "..",
+            ".",
+            "",
+            "trailing/",
+        ] {
+            let out = Path::new("out");
+            let name = stem(evil);
+            for file in [
+                out.join(format!("{name}_equirect.hdr")),
+                out.join(format!("{name}_{}.hdr", FACE_NAMES[0])),
+            ] {
+                assert_eq!(file.parent(), Some(out), "{evil:?} gave {file:?}");
+                assert!(!file.to_string_lossy().contains(".."), "{evil:?}");
+            }
+        }
+    }
 }
