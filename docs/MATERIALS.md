@@ -29,7 +29,7 @@ the result into glTF metallic-roughness textures:
 | `TX:RoughnessMap`, `TX:SpecularMap` | roughness, metalness or specular level | used when enabled |
 | `TX:TintMask` RGBA (or the pack map's alpha quadrants) with `PS:TintColor0..3` | multiplies the base colour | decoded from the fill shaders: start at 0.5, lerp towards each tint by its mask (0, 1, 2, 3 in turn), double, keep the length at 0.04 or more; no gamma anywhere |
 | `TX:NormalMap` | normal | measured: green points down (DirectX), inverted for glTF; blue rebuilt |
-| `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | decoded from the fill shaders: map squared, times `EmissiveTintColor` (or `lerp(Lo, Hi, map^2)` for multi-tint), baked into the texture; `PS:EmissiveMapAtten` is `KHR_materials_emissive_strength` |
+| `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | decoded from the fill shaders: the single-channel map squared, times `EmissiveTintColor` (or `lerp(Lo, Hi, map^2)` for multi-tint), baked into the texture. An RGB map (`EC_RGB`) is used as stored, unsquared: the decoded shaders do not say whether the game squares it, and its `EmissiveMap` texture type has no `ColorSpace` entry to settle it; `PS:EmissiveMapAtten` is `KHR_materials_emissive_strength` |
 
 Each pack map's own `H.Texture` attribute text names the source images it
 was built from (`Diffuse=`, `Roughness=`, `Specular=`, and for

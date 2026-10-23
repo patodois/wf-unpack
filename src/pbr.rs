@@ -10,12 +10,14 @@
 //! - metallic-roughness: glTF wants roughness in G and metalness in B.
 //! - normal: the game's maps point green down (DirectX); glTF wants green up,
 //!   so green is inverted and blue rebuilt from red and green.
-//! - emissive: as the game computes it, the map (its red channel for
-//!   single-channel maps) is squared, then multiplied by the emissive colour
+//! - emissive: as the game computes it, a single-channel map (its red channel,
+//!   `EC_COMPONENT`) is squared, then multiplied by the emissive colour
 //!   (`PS:EmissiveTintColor`, or a lerp from `Lo` to `Hi` by the squared map
 //!   for multi-tint materials) and by `PS:EmissiveMapAtten`; the first two
 //!   are baked into the texture (sRGB encoded) and the last is
-//!   `KHR_materials_emissive_strength`.
+//!   `KHR_materials_emissive_strength`. An RGB map (`EC_RGB`) is used as stored:
+//!   the decoded shaders do not say whether the game squares it too (see
+//!   [`emissive_texel`]).
 
 use anyhow::{ensure, Result};
 
@@ -200,6 +202,38 @@ pub fn mask_at(mask: &Image, layout: MaskLayout, x: u32, y: u32, w: u32, h: u32)
 pub fn emissive_fade(v: f32, cutoff: f32) -> f32 {
     let t = (10.0 * (1.1 * cutoff - v)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// The linear emission of one texel of an emissive map, before it is sRGB encoded.
+///
+/// A single-channel map (`EMISSIVE_COMPRESSION=EC_COMPONENT`, red channel) is squared, as the fill
+/// shaders do, and then scaled by the tint (a lerp from `lo` to `hi` by the squared value for
+/// multi-tint materials) and the fade. An RGB map (`EC_RGB`) is used as stored: the notes on the
+/// decoded shaders cover only the squared single-channel form, and whether the game squares, or
+/// sRGB-decodes (its `EmissiveMap` texture type has no `ColorSpace`, unlike the linear
+/// `RoughnessMap`), an RGB map is not in the data, so nothing is assumed for it.
+pub fn emissive_texel(
+    px: [u8; 4],
+    single: bool,
+    multi_tint: bool,
+    lo: [f32; 3],
+    hi: [f32; 3],
+    cutoff: f32,
+) -> [f32; 3] {
+    let e = f32::from(px[0]) / 255.0;
+    if single {
+        let s = e * e;
+        if multi_tint {
+            // lerp(Lo, Hi, s) times s
+            [0, 1, 2].map(|k| s * (lo[k] + (hi[k] - lo[k]) * s))
+        } else {
+            let g = emissive_fade(s, cutoff);
+            [0, 1, 2].map(|k| s * hi[k] * g)
+        }
+    } else {
+        let g = emissive_fade(f32::from(px[1]) / 255.0, cutoff);
+        [0, 1, 2].map(|k| f32::from(px[k]) / 255.0 * hi[k] * g)
+    }
 }
 
 /// Metalness from a specular level (sRGB 0..1): dielectrics sit near 4 % reflectance.
@@ -387,20 +421,7 @@ pub fn bake(plan: &Plan, packages: &mut TexturePackages) -> Result<Baked> {
             let mut img = loader.get(p)?;
             let (lo, cutoff) = (plan.emissive_lo, plan.emissive_cutoff);
             for px in img.rgba.as_chunks_mut::<4>().0 {
-                let e = f32::from(px[0]) / 255.0;
-                let out = if *single {
-                    let s = e * e;
-                    if plan.multi_tint_emission {
-                        // lerp(Lo, Hi, s) times s
-                        [0, 1, 2].map(|k| s * (lo[k] + (hi[k] - lo[k]) * s))
-                    } else {
-                        let g = emissive_fade(s, cutoff);
-                        [0, 1, 2].map(|k| s * hi[k] * g)
-                    }
-                } else {
-                    let g = emissive_fade(f32::from(px[1]) / 255.0, cutoff);
-                    [0, 1, 2].map(|k| f32::from(px[k]) / 255.0 * hi[k] * g)
-                };
+                let out = emissive_texel(*px, *single, plan.multi_tint_emission, lo, *hi, cutoff);
                 *px = [
                     to_u8(linear_to_srgb(out[0].clamp(0.0, 1.0))),
                     to_u8(linear_to_srgb(out[1].clamp(0.0, 1.0))),
@@ -473,6 +494,21 @@ mod tests {
         assert_eq!(emissive_fade(1.0, 0.5), 0.0);
         let mid = emissive_fade(0.5, 0.5);
         assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn emissive_maps() {
+        let one = [1.0; 3];
+        // Single channel: the red channel squared (128/255 squared is about 0.252)
+        let single = emissive_texel([128, 0, 0, 255], true, false, [0.0; 3], one, 1.0);
+        assert!((single[0] - 0.2519).abs() < 1e-3 && single[0] == single[2]);
+        // Multi-tint: lerp(lo, hi, s) times s
+        let lo = [0.0, 0.5, 1.0];
+        let multi = emissive_texel([255, 0, 0, 255], true, true, lo, [1.0, 1.0, 0.0], 1.0);
+        assert_eq!(multi, [1.0, 1.0, 0.0]);
+        // RGB maps are used as stored: not squared (the data does not say that the game does)
+        let rgb = emissive_texel([128, 255, 0, 255], false, false, [0.0; 3], one, 1.0);
+        assert!((rgb[0] - 128.0 / 255.0).abs() < 1e-6 && rgb[2] == 0.0);
     }
 
     #[test]
