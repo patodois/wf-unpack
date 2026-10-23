@@ -1,3 +1,5 @@
+mod anim_cmd;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -74,6 +76,10 @@ enum Command {
         /// (materials are not resolved automatically yet)
         #[arg(long = "texture")]
         textures: Vec<String>,
+        /// Also write the animations whose path matches (substring, or a glob with * / ** / ?)
+        /// and that fit the model's skeleton, as glTF animations
+        #[arg(long)]
+        animations: Option<String>,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -122,6 +128,22 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// List the animation clips of a skeleton ("Tenno" is the Warframe rig), of a skinned
+    /// model (those that fit its bones), or describe one clip by its path
+    Anim {
+        /// A skeleton name, a model path or a clip path
+        target: String,
+        /// Only clips whose path contains this text, or matches it when it has * or ?
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Decode every animation (type 132) in H.Misc/B.Misc and summarise failures
+    CheckAnims {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Parse every texture header and check its mip chain against the B./F. sizes (reads only H.Texture)
     Textures {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -168,8 +190,22 @@ fn main() -> Result<()> {
             out,
             lod,
             textures,
+            animations,
             game,
-        } => model_cmd(&expand_home(&game), &path, out.as_deref(), lod, &textures),
+        } => model_cmd(
+            &expand_home(&game),
+            &path,
+            out.as_deref(),
+            lod,
+            &textures,
+            animations.as_deref(),
+        ),
+        Command::Anim {
+            target,
+            filter,
+            game,
+        } => anim_cmd::anim_cmd(&expand_home(&game), &target, filter.as_deref()),
+        Command::CheckAnims { game } => anim_cmd::check_anims_cmd(&expand_home(&game)),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
 }
@@ -587,6 +623,7 @@ fn model_cmd(
     out: Option<&Path>,
     lod: usize,
     textures: &[String],
+    animations: Option<&str>,
 ) -> Result<()> {
     let read = |name: &str| -> Result<Vec<u8>> {
         Ok(match Package::open_in(game, name)? {
@@ -678,7 +715,17 @@ fn model_cmd(
         manual_materials(game, textures, &h.materials(), h.meshes.len(), out)?
     };
     let scene = wf_unpack::scene::prepare(&model, lod, true)?;
-    gltf::write(&scene, &name, &materials, out)?;
+    let clips = match animations {
+        Some(filter) => {
+            let skin = scene
+                .skin
+                .as_ref()
+                .context("--animations needs a skinned model (type 281)")?;
+            anim_cmd::clips_for_skin(game, skin, filter)?
+        }
+        None => Vec::new(),
+    };
+    gltf::write_animated(&scene, &name, &materials, &clips, out)?;
     let tris: usize = (0..h.meshes.len())
         .map(|m| model.lod_indices(m, lod).map_or(0, |t| t.len() / 3))
         .sum();

@@ -11,6 +11,8 @@ Evolution Engine) from your own install:
   (type 281: Warframe bodies, helmets, rigged weapons), exported to glTF 2.0
   with normals, tangents, both UV sets, materials and, for skinned models, the
   skeleton, inverse bind matrices, joints and weights
+- skeletal animations (type 132): idle, walk, run, sprint, jump, slide and the other ~25,000 clips, as
+  glTF animations on a model's skeleton
 
 This project contains no game code or game data. It only reads files from a
 copy of the game you already have installed.
@@ -45,6 +47,13 @@ wf-unpack texture /Lotus/Interface/Icons/Miscellaneous/Kuva.png -o kuva.png --ga
 wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx
 wf-unpack model /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx -o out/
 wf-unpack check-models --game $C
+
+# Animations: the clips that fit a model's skeleton, or a skeleton name, or one clip in detail.
+# --animations adds every matching, compatible clip to the glTF as an animation.
+wf-unpack anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --filter /Tenno/Movement/MeleeWeapon/Sword/
+wf-unpack anim /Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/JogForward_anim.fbx
+wf-unpack model /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx -o out/ --animations Tenno/Movement/MeleeWeapon/Sword/
+wf-unpack check-anims --game $C
 
 # Packages.bin: properties of an asset (and its parents), text search, full decode
 wf-unpack props /Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatinePBR
@@ -119,8 +128,9 @@ The module docs in `src/toc.rs`, `src/cache.rs`, `src/header.rs` and
 `src/texture.rs` describe the layouts. Starting points were the
 documentation and source of [LotusLib](https://github.com/Puxtril/LotusLib)
 and [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by
-Puxtril (including its model readers for the static model layout and the
-`dev` branch's Packages.bin reader); no code was copied. Warframe's public
+Puxtril (including its model readers for the static model layout, the
+`dev` branch's Packages.bin reader and the `animation2` branch's outline of the
+animation header, body and quaternion packing); no code was copied. Warframe's public
 [texturing guide](https://www.warframe.com/steamworkshop/texturing-guide)
 describes the tint mask layering. Oodle streams are decoded with the pure-Rust
 [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
@@ -196,13 +206,108 @@ out:
 
 Not handled yet:
 
-- Other model types: 132/134 (animations stored under `.fbx`), 105/109
-  (level geometry), 108 (HLOD), the morph data above, and the newer packed
-  rigged types (289-317). Warframe-Exporter's readers describe most of them.
-- Animations.
+- Other model types: 105/109 (level geometry), 108 (HLOD), the morph data
+  above, and the newer packed rigged types (289-317). Warframe-Exporter's
+  readers describe most of them. (Type 132, animations, is read; see below.)
 - Vertex colours (stored in separate `.vc` entries), the byte after the normal
   (0 or 255), and what exactly the fourth vertex byte after the tangent holds
   (probably ambient occlusion).
+
+### Animations
+
+`src/animation.rs` reads type 132 (`*_anim.fbx`: 24,676 files, 24,987 clips,
+about 17 hours of animation). The module docs have the byte layout; the facts
+that matter:
+
+- **Where.** Header in `H.Misc`, body in `B.Misc`, no `F.` part, almost all
+  under `/Lotus/Animations/` (a few hundred have no extension). The header
+  holds the skeleton (bone names and parents) and, per clip, the frame count,
+  rate and quantisation ranges; the body holds the quantised frames.
+- **Time.** Keys are fractions of the duration, ascending, with irregular
+  spacing (redundant keys were dropped). The duration is `1 / rate`; it is a
+  whole number of 1/30 s in all 24,987 clips, so the source was sampled at 30
+  frames per second. The `Rate=` attribute in the common header is a play-speed
+  multiplier the game applies at run time; it is not applied here.
+- **Tracks.** Per bone, flags say what is animated: translation (3 x i16,
+  `offset + v * scale` with ranges from the header), rotation (48-bit packed
+  quaternion, smallest three), x translation as an f32 (2,081 tracks, e.g. the
+  `NW0A` wire bones), scale (3 x i16 like translation). A bone with flags 0 or
+  32 keeps the initial transform stored in the body; so does every component
+  that is not animated. Decoded first keys equal the stored initial transforms
+  for 1,216,708 of 1,216,793 animated components (the rest are clips whose
+  initial transforms hold garbage such as 4.9e11 m, or ranges of tens of metres).
+  A rotation and its negative are the same rotation; `Animation::channels`
+  flips signs so interpolation takes the short way.
+- **Root motion.** The skeleton header stores the clip's total root rotation and
+  translation (a Sword `JogForward` moves 3.52 m in z in 0.83 s, a
+  `Sprint90Left` turns 90 degrees); the same displacement is in the root bone's
+  translation track, so exported clips move the character. The glTF
+  `extras` of each animation repeat it, with the events and the attribute text.
+- **Events.** The attribute text lists events (`StepL`, `StepR`, sound
+  cues); their `Time` is a fraction of the clip (the two steps of a jog are half a cycle apart).
+- **Handedness.** Same as the models: x negated, rotations (x, -y, -z, w). A
+  sprint-left clip turns the character toward its left in the exported glTF.
+
+How a clip links to a character: the model carries its own skeleton and the
+animation names its bones, so the link is the bone names. All Warframe clips use
+the same 81 bones (`GAME_C1_ROOT` ... `GAME_R1_TRICORDERATTACH`), each with the
+same parent in every Warframe's model; `Excalibur_skel.fbx` has these plus
+`Body1` and `Helmet1`. The skeleton name in the animation header is only the
+rig the clip was authored on (`Tenno` 3,654 clips, `KirkDropSuit` 1,998,
+`ExcaliburBody1` 235, `WispBody1`, `MagBody1`, ...; Titania's `FaerieBody1` has
+141 bones), so `anim <model>` lists clips by bone names, which is what the game
+retargets by. In Packages.bin, Excalibur's suit (`/Lotus/Powersuits/Excalibur/ExcaliburBaseSuit`)
+names `Mesh=/Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx` and an
+`AnimationSet` (`ExcaliburNobleAnims`, whose `ExcaliburNobleIdleSubTree.animtree`
+names `Excalibur_skel.fbx`); the controller is the default
+`/Lotus/Types/Player/TennoAnimController` (`AnimTree=Animation/SimpleTennoAnimTree.animtree`),
+and some suits override it with `DefaultAnimControllerOverride`. The `.animtree`
+files (in `H.AnimRetarget`), the `.animfsm` state machines (type 383) and the
+movement sets (types 14 and 19, e.g. `/Lotus/Animations/Tenno/Movement/Unarmed/UnarmedMovement`)
+list clip paths as plain text; they are not decoded, so which clip the game
+picks when is not derived.
+
+Movement clips for an Excalibur with his sword out
+(`/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/`; the same names exist
+under the other stances, e.g. `Unarmed/`, `Rifle/`, `Bow/`):
+
+| Motion | Clip | Length | Root motion |
+|---|---|---|---|
+| idle | `Idle_anim.fbx` (also `IdleNoble`, `IdleAgile`) | 1.97 s | none |
+| walk | `WalkForward_anim.fbx` | 1.10 s | 1.99 m |
+| run | `JogForward_anim.fbx` | 0.83 s | 3.52 m |
+| sprint | `Sprint_anim.fbx` (`Sprint90Left/Right`) | 0.57 s | 3.69 m |
+| jump | `JumpStart_anim.fbx`, `Jump_anim.fbx`, `JumpEnd_anim.fbx` | 0.17 / 1.13 / 0.27 s | |
+| slide | `KneeSlide_anim.fbx` | 1.97 s | none |
+
+`check-anims` decodes every type-132 file, one entry at a time (peak RSS 274 MB,
+about 15 s): 24,640 files ok, 36 not decoded; 24,987 clips, 2,166,135 bone
+tracks, 1,217,467 keys; all key times ascend and all durations are multiples of
+1/30 s. Checked by rendering: Excalibur with the Sword `JogForward`, `Sprint`,
+`Jump`, `Idle`, `KneeSlide` and `WalkForward` clips in headless three.js
+reads as a run, a sprint, a jump and a slide.
+
+Not read, and why:
+
+- Type 134 (`*_cin.fbx`, 1,469 cinematic clips): another header, an `F.` part;
+  not looked at beyond its first bytes.
+- 36 type-132 files fail: 19 with `Compressed=AC_DISABLED` (8; raw frames, not
+  understood) or `AC_ENABLED_POSITION_ENHANCE` (11; four more header bytes and
+  another frame layout), 11 with a `CinematicCamera` skeleton (extra channel
+  flags 64/66 and key times that do not fit), and a few others (a root channel
+  flag 64, two headers whose skeleton count is nonsense, short frame data in a
+  few portal effects). `check-anims` lists them.
+- Three floats after each bone's initial translation: the same in nearly every
+  bone (0, 0.0078, 2.0037) and garbage in others; they are not a scale and are
+  ignored. Scale channels (flag 8, 5,497 tracks) follow the translation
+  scheme and are decoded, but nothing in the data checks them.
+- Interpolation: the data has no interpolation field; keys are exported as
+  linear (spherical for rotations).
+- The `Rate` play-speed attribute, additive and partial-body blending
+  (`BlendMaskSmooth`, masks in the trees), foot IK, and everything in the
+  animation trees and state machines.
+- Clips of other skeletons (creatures, weapon rigs, cameras) decode, but
+  `--animations` only adds clips whose every bone is in the model.
 
 ### Packages.bin and materials
 

@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::animation::{Channel, Interpolation, Target};
 use crate::scene::Scene;
 
 /// Texture slots a material can fill.
@@ -43,7 +44,27 @@ impl Material {
     }
 }
 
+/// An animation to write: channels whose `node` is a bone index of the
+/// scene's skin (already converted to the scene's handedness).
+pub struct Clip {
+    pub name: String,
+    pub channels: Vec<Channel>,
+    /// Written as the animation's `extras` (events, root motion, ...).
+    pub extras: Option<Value>,
+}
+
 pub fn write(scene: &Scene, name: &str, materials: &[Material], out_dir: &Path) -> Result<()> {
+    write_animated(scene, name, materials, &[], out_dir)
+}
+
+/// Like [`write`], plus glTF animations driving the skeleton's bones.
+pub fn write_animated(
+    scene: &Scene,
+    name: &str,
+    materials: &[Material],
+    clips: &[Clip],
+    out_dir: &Path,
+) -> Result<()> {
     fs::create_dir_all(out_dir)?;
 
     let mut bin: Vec<u8> = Vec::new();
@@ -214,6 +235,52 @@ pub fn write(scene: &Scene, name: &str, materials: &[Material], out_dir: &Path) 
         skins.push(skin);
     }
 
+    // Animations: bone i is node i + 1. Channels that share key times share one input accessor.
+    let mut animations = Vec::new();
+    for clip in clips {
+        let mut inputs: Vec<(Vec<u32>, usize)> = Vec::new();
+        let mut samplers = Vec::new();
+        let mut channels = Vec::new();
+        for ch in &clip.channels {
+            let key = ch.times.iter().map(|t| t.to_bits()).collect::<Vec<u32>>();
+            let input = match inputs.iter().find(|(k, _)| *k == key) {
+                Some((_, a)) => *a,
+                None => {
+                    let view = push_view(&mut bin, &floats(&mut ch.times.iter().copied()), None);
+                    let lo = ch.times.iter().copied().fold(f32::MAX, f32::min);
+                    let hi = ch.times.iter().copied().fold(f32::MIN, f32::max);
+                    accessors.push(json!({"bufferView": view, "componentType": 5126, "count": ch.times.len(), "type": "SCALAR", "min": [lo], "max": [hi]}));
+                    inputs.push((key, accessors.len() - 1));
+                    accessors.len() - 1
+                }
+            };
+            let (path, kind) = match ch.target {
+                Target::Translation => ("translation", "VEC3"),
+                Target::Rotation => ("rotation", "VEC4"),
+                Target::Scale => ("scale", "VEC3"),
+            };
+            let view = push_view(&mut bin, &floats(&mut ch.values.iter().copied()), None);
+            accessors.push(json!({"bufferView": view, "componentType": 5126, "count": ch.times.len(), "type": kind}));
+            samplers.push(json!({
+                "input": input,
+                "output": accessors.len() - 1,
+                "interpolation": match ch.interpolation {
+                    Interpolation::Linear => "LINEAR",
+                    Interpolation::Step => "STEP",
+                },
+            }));
+            channels.push(json!({
+                "sampler": samplers.len() - 1,
+                "target": {"node": ch.node + 1, "path": path},
+            }));
+        }
+        let mut animation = json!({"name": clip.name, "samplers": samplers, "channels": channels});
+        if let Some(extras) = &clip.extras {
+            animation["extras"] = extras.clone();
+        }
+        animations.push(animation);
+    }
+
     let bin_name = format!("{name}.bin");
     let mut doc = json!({
         "asset": {"version": "2.0", "generator": "wf-unpack"},
@@ -230,6 +297,9 @@ pub fn write(scene: &Scene, name: &str, materials: &[Material], out_dir: &Path) 
     }
     if !skins.is_empty() {
         doc["skins"] = json!(skins);
+    }
+    if !animations.is_empty() {
+        doc["animations"] = json!(animations);
     }
     if !images.is_empty() {
         doc["images"] = json!(images);
