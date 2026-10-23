@@ -798,6 +798,13 @@ pub fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     std::array::from_fn(|i| std::array::from_fn(|j| (0..4).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
+/// The bytes of a model's H., B. and F. parts, as stored.
+pub struct RawModel {
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
+    pub full: Vec<u8>,
+}
+
 pub struct Model {
     pub header: ModelHeader,
     pub vertices: Vec<Vertex>,
@@ -883,8 +890,11 @@ fn read_skeleton(
             let start = mesh.lod_offsets[lod] as usize;
             let end = (start + mesh.lod_counts[lod] as usize).min(indices.len());
             for &i in &indices[start.min(end)..end] {
-                if owner[i as usize] == usize::MAX {
-                    owner[i as usize] = m;
+                let slot = owner.get_mut(i as usize).with_context(|| {
+                    format!("index {i} out of range for {} vertices", vertices.len())
+                })?;
+                if *slot == usize::MAX {
+                    *slot = m;
                 }
             }
         }
@@ -1017,17 +1027,7 @@ impl Model {
             .chain(full_idx.as_chunks::<2>().0)
             .map(|&c| u32::from(u16::from_le_bytes(c)))
             .collect();
-        let skeleton = match &header.skeleton {
-            Some(sh) => Some(read_skeleton(
-                sh,
-                skel_data,
-                &header.meshes,
-                &indices,
-                &mut vertices,
-            )?),
-            None => None,
-        };
-
+        // Checked before the skeleton is read: that indexes per-vertex tables by these indices
         if let Some(&max) = indices.iter().max() {
             ensure!(
                 (max as usize) < vertices.len(),
@@ -1050,6 +1050,16 @@ impl Model {
                 );
             }
         }
+        let skeleton = match &header.skeleton {
+            Some(sh) => Some(read_skeleton(
+                sh,
+                skel_data,
+                &header.meshes,
+                &indices,
+                &mut vertices,
+            )?),
+            None => None,
+        };
         Ok(Model {
             header,
             vertices,
@@ -1065,10 +1075,21 @@ impl Model {
         full: Option<&mut Package>,
         path: &str,
     ) -> Result<Self> {
-        let h = head
+        let raw = Self::read_raw(head, body, full, path)?;
+        Self::parse_raw(raw, path)
+    }
+
+    /// Reads the bytes of a model's three parts and nothing else, so that a caller that shares
+    /// the packages can release them before parsing.
+    pub fn read_raw(
+        head: &mut Package,
+        body: Option<&mut Package>,
+        full: Option<&mut Package>,
+        path: &str,
+    ) -> Result<RawModel> {
+        let header = head
             .read_path(path)?
             .with_context(|| format!("{path} is not in H.Misc"))?;
-        let header = ModelHeader::parse(&h).with_context(|| path.to_string())?;
         let body = match body {
             Some(p) => p.read_path(path)?.unwrap_or_default(),
             None => Vec::new(),
@@ -1077,7 +1098,13 @@ impl Model {
             Some(p) => p.read_path(path)?.unwrap_or_default(),
             None => Vec::new(),
         };
-        Model::from_parts(header, &body, &full).with_context(|| path.to_string())
+        Ok(RawModel { header, body, full })
+    }
+
+    /// Parses what [`Model::read_raw`] read.
+    pub fn parse_raw(raw: RawModel, path: &str) -> Result<Self> {
+        let header = ModelHeader::parse(&raw.header).with_context(|| path.to_string())?;
+        Model::from_parts(header, &raw.body, &raw.full).with_context(|| path.to_string())
     }
 
     /// Loads a model by path from a `Cache.Windows` folder.
@@ -1581,14 +1608,8 @@ mod tests {
         h
     }
 
-    #[test]
-    fn parses_skinned_model() {
-        let header = ModelHeader::parse(&skinned_header_bytes()).unwrap();
-        let sh = header.skeleton.clone().unwrap();
-        assert_eq!(sh.weighted, ["root", "arm"]);
-        assert_eq!(sh.tree[1].name, "arm");
-        assert_eq!(sh.bone_maps, [vec![1, 0]]);
-
+    /// The B. part of the skinned test model: the skeleton, three vertices and `indices`.
+    fn skinned_body(indices: [u16; 3]) -> Vec<u8> {
         let sk = two_bone_skeleton();
         let mut body = vec![0, 0];
         for ib in &sk.inverse_binds {
@@ -1608,9 +1629,21 @@ mod tests {
             v.extend(1023u32.to_le_bytes());
             body.extend(v);
         }
-        for i in [0u16, 1, 2] {
+        for i in indices {
             body.extend(i.to_le_bytes());
         }
+        body
+    }
+
+    #[test]
+    fn parses_skinned_model() {
+        let header = ModelHeader::parse(&skinned_header_bytes()).unwrap();
+        let sh = header.skeleton.clone().unwrap();
+        assert_eq!(sh.weighted, ["root", "arm"]);
+        assert_eq!(sh.tree[1].name, "arm");
+        assert_eq!(sh.bone_maps, [vec![1, 0]]);
+
+        let body = skinned_body([0, 1, 2]);
         let model = Model::from_parts(header, &body, &[]).unwrap();
         let sk2 = model.skeleton.unwrap();
         assert_eq!(sk2.joints, [0, 1]);
@@ -1620,5 +1653,21 @@ mod tests {
         let joints: Vec<u16> = model.vertices.iter().map(|v| v.joints[0]).collect();
         assert_eq!(joints, [1, 0, 1]);
         assert_eq!(model.vertices[0].weights, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn skinned_model_with_an_index_past_the_vertices_is_an_error() {
+        // Index 5 of 3 vertices indexed a per-vertex table in read_skeleton and panicked
+        let header = ModelHeader::parse(&skinned_header_bytes()).unwrap();
+        let body = skinned_body([0, 1, 5]);
+        let err = match Model::from_parts(header, &body, &[]) {
+            Ok(_) => panic!("a bad index was accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("index 5 out of range for 3 vertices"),
+            "{err:#}"
+        );
     }
 }

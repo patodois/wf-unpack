@@ -91,7 +91,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{bail, ensure, Context, Result};
 use rewrite_bridge::{
@@ -303,6 +303,17 @@ impl Warframe {
         self
     }
 
+    /// Locks the packages. A load that panicked while holding the lock leaves it poisoned; what
+    /// it guards (opened packages and caches that are filled in whole) is still good, so later
+    /// calls go on instead of every one of them panicking.
+    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_clips(&self) -> MutexGuard<'_, BTreeMap<String, ClipInfo>> {
+        self.clips.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The Warframe game folder.
     pub fn game_dir(&self) -> &Path {
         &self.game
@@ -313,7 +324,7 @@ impl Warframe {
     /// clip loaded through this provider; [`Warframe::load_animated_clips`] returns the same data
     /// for one call without touching it.
     pub fn clip_info(&self, name: &str) -> Option<ClipInfo> {
-        self.clips.lock().unwrap().get(name).cloned()
+        self.lock_clips().get(name).cloned()
     }
 
     /// With `false`, materials keep their names but get no textures, which
@@ -325,7 +336,7 @@ impl Warframe {
 
     /// Paths and types of every static and skinned model, reading each header once.
     pub fn models(&self) -> Result<Vec<(String, u16)>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         if inner.index.is_none() {
             let mut entries: Vec<_> = inner.head.toc.entries.clone();
             entries.sort_by_key(|e| e.offset);
@@ -378,16 +389,19 @@ impl Warframe {
         overrides: &[String],
         mut cache: Option<&mut HashMap<String, Material>>,
     ) -> Result<Model> {
-        let mut inner = self.inner.lock().unwrap();
-        let Inner {
-            head,
-            body,
-            full,
-            baker,
-            ..
-        } = &mut *inner;
-        let model = model::Model::load_from(head, body.as_mut(), full.as_mut(), id)?;
+        // The packages are locked to read the bytes only. Parsing is fallible, and a malformed
+        // model must not hold up (or, by panicking, poison) every other load
+        let raw = {
+            let mut inner = self.lock_inner();
+            let Inner {
+                head, body, full, ..
+            } = &mut *inner;
+            model::Model::read_raw(head, body.as_mut(), full.as_mut(), id)?
+        };
+        let model = model::Model::parse_raw(raw, id)?;
         let scene = scene::prepare(&model, 0, true)?;
+        let mut inner = self.lock_inner();
+        let Inner { baker, .. } = &mut *inner;
         let names = model.header.materials();
         let mut materials = Vec::with_capacity(model.header.meshes.len());
         for i in 0..model.header.meshes.len() {
@@ -485,7 +499,7 @@ impl Warframe {
         let node_count = out.model.model.nodes.len();
         let filters: Vec<&str> = filter.split('|').collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let Inner {
             head,
             body,
@@ -775,7 +789,7 @@ impl Provider for Warframe {
                 .to_string()
         };
         let models = self.models()?;
-        let characters = self.inner.lock().unwrap().characters.clone();
+        let characters = self.lock_inner().characters.clone();
         let mut out: Vec<AssetInfo> = models
             .into_iter()
             .filter(|(path, _)| path.contains(filter))
@@ -810,7 +824,7 @@ impl Provider for Warframe {
     /// events, root motion and play rate are in [`Warframe::clip_info`].
     fn load_animated(&self, id: &str) -> Result<AnimatedModel, BoxError> {
         let loaded = self.load_animated_clips(id)?;
-        self.clips.lock().unwrap().extend(loaded.info);
+        self.lock_clips().extend(loaded.info);
         Ok(loaded.model)
     }
 
@@ -823,6 +837,33 @@ impl Provider for Warframe {
 mod tests {
     use super::*;
     use crate::scene::{Primitive, SceneBone, SceneSkin};
+
+    /// A load that panics (a malformed model) used to poison the packages' lock, and every later
+    /// call then panicked on `lock().unwrap()`.
+    #[test]
+    fn a_panic_during_a_load_does_not_break_later_calls() {
+        let Some(dir) = std::env::var_os("WF_GAME_DIR") else {
+            return;
+        };
+        let wf = Warframe::open(std::path::Path::new(&dir))
+            .unwrap()
+            .with_textures(false);
+        let died = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _packages = wf.inner.lock().unwrap();
+                let _clips = wf.clips.lock().unwrap();
+                panic!("a model the reader cannot take");
+            })
+            .join()
+        });
+        assert!(died.is_err());
+        assert!(wf.inner.is_poisoned() && wf.clips.is_poisoned());
+        let model = wf
+            .load_model("/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx")
+            .unwrap();
+        assert!(!model.meshes.is_empty());
+        assert!(wf.clip_info("nothing").is_none());
+    }
 
     #[test]
     fn kinds_from_paths() {
