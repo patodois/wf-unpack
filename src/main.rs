@@ -1198,14 +1198,16 @@ fn props_cmd(game: &Path, path: &str) -> Result<()> {
             println!("== {path} (H.Misc attribute text)\n{attrs}");
         }
     }
-    let mut cur = Some(path.to_string());
-    while let Some(p) = cur {
+    let (chain, again) = bin.lineage(path);
+    for p in &chain {
         println!("== {p}");
-        match texts.text(&p)? {
+        match texts.text(p)? {
             Some(text) => println!("{text}"),
             None => println!("(not in Packages.bin)"),
         }
-        cur = bin.parent(&p).map(str::to_string);
+    }
+    if let Some(again) = again {
+        println!("== {again}\n(already shown above: the parent chain loops)");
     }
     Ok(())
 }

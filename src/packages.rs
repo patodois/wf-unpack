@@ -264,6 +264,22 @@ impl PackagesBin {
             .filter(|p| !p.is_empty())
     }
 
+    /// `path` and the entities it derives from, nearest first. A chain that comes back to an
+    /// entity it already listed (the game's data has none, a corrupt file might) stops there:
+    /// the second value is that entity.
+    pub fn lineage(&self, path: &str) -> (Vec<String>, Option<String>) {
+        let mut chain = vec![path.to_string()];
+        let mut cur = path;
+        while let Some(parent) = self.parent(cur) {
+            if chain.iter().any(|c| c == parent) {
+                return (chain, Some(parent.to_string()));
+            }
+            chain.push(parent.to_string());
+            cur = parent;
+        }
+        (chain, None)
+    }
+
     /// A reader for property texts, reusing one zstd context.
     pub fn texts(&self) -> Result<TextReader<'_>> {
         let mut dctx = zstd::bulk::Decompressor::with_prepared_dictionary(&self.dict)?;
@@ -494,5 +510,29 @@ pub(crate) mod tests {
         // The same file with the right count is fine
         let ok = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, 3);
         assert_eq!(PackagesBin::parse(&ok).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_parent_cycle_ends_the_lineage() {
+        let raw = build(&[
+            ("/F/", "A", "/F/B", Some("a=1\n")),
+            ("/F/", "B", "/F/C", None),
+            ("/F/", "C", "/F/A", None),
+            ("/F/", "Self", "/F/Self", None),
+            ("/F/", "Leaf", "/F/C", None),
+            ("/F/", "Root", "", None),
+        ]);
+        let bin = PackagesBin::parse(&raw).unwrap();
+        let (chain, again) = bin.lineage("/F/A");
+        assert_eq!(chain, ["/F/A", "/F/B", "/F/C"]);
+        assert_eq!(again.as_deref(), Some("/F/A"));
+        let (chain, again) = bin.lineage("/F/Self");
+        assert_eq!((chain.len(), again.as_deref()), (1, Some("/F/Self")));
+        // A tail that leads into the cycle stops at the first repeat
+        let (chain, again) = bin.lineage("/F/Leaf");
+        assert_eq!(chain, ["/F/Leaf", "/F/C", "/F/A", "/F/B"]);
+        assert_eq!(again.as_deref(), Some("/F/C"));
+        // No cycle: the whole chain, nothing repeated
+        assert_eq!(bin.lineage("/F/Root"), (vec!["/F/Root".to_string()], None));
     }
 }
