@@ -187,6 +187,20 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Check what the provider returns against the rewrite-bridge conventions (scale, facing,
+    /// winding, skins, materials ...); try `check-conformance --help`
+    #[cfg(feature = "bridge")]
+    #[command(disable_help_flag = true)]
+    CheckConformance {
+        /// The Warframe game folder (put it before the checker's options)
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+        /// Options of the checker, passed through (`--id`, `--filter`, `--kind`, `--limit`,
+        /// `--strict`, `-v`, `--help`). Ids are model paths, or `path?animations=FILTER` to
+        /// check a skinned model with its clips.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Build and validate the scenes of every level through the provider (no textures)
     #[cfg(feature = "bridge")]
     CheckBridgeScenes {
@@ -389,6 +403,12 @@ fn main() -> Result<()> {
             max_texture,
             include_hidden,
         ),
+        #[cfg(feature = "bridge")]
+        Command::CheckConformance { game, args } => {
+            let provider = wf_unpack::bridge::Warframe::open(&expand_home(&game))?;
+            // exits with the checker's status: 0, 1 (an asset failed) or 2 (usage)
+            std::process::exit(rewrite_bridge::conformance::cli::run(&provider, args))
+        }
         #[cfg(feature = "bridge")]
         Command::CheckBridgeScenes {
             filter,
