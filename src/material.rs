@@ -202,6 +202,14 @@ pub struct Plan {
     pub normal: Option<String>,
     /// Emissive texture, whether only its red channel is used, and its colour.
     pub emissive: Option<(String, bool, [f32; 3])>,
+    /// `EMISSIVE_FX=EMISSIVE_MULTI_TINT`: the emission takes the player's energy colours.
+    pub multi_tint_emission: bool,
+    /// `PS:EmissiveTintColorLo`, the colour of dim emission when the material tints it with two colours.
+    pub emissive_lo: [f32; 3],
+    /// `PS:EmissiveTintColor.w`: the map values above this are faded out (1.0 keeps everything).
+    pub emissive_cutoff: f32,
+    /// `PS:EmissiveMapAtten`: the emission is multiplied by this (8 on Excalibur).
+    pub emissive_atten: f32,
     /// Features seen but not reproduced, for reports.
     pub unsupported: Vec<String>,
 }
@@ -307,7 +315,29 @@ impl Plan {
             specular_workflow,
             normal,
             emissive,
+            multi_tint_emission: m.get("EMISSIVE_FX") == Some("EMISSIVE_MULTI_TINT"),
+            emissive_lo: m
+                .color("PS:EmissiveTintColorLo")
+                .map_or([1.0; 3], |c| [c[0], c[1], c[2]]),
+            emissive_cutoff: m.color("PS:EmissiveTintColor").map_or(1.0, |c| c[3]),
+            emissive_atten: m.float("PS:EmissiveMapAtten").unwrap_or(1.0),
             unsupported,
+        }
+    }
+
+    /// Puts a suit's palette over the material's own colours (see [`crate::palette`]).
+    pub fn apply_palette(&mut self, p: &crate::palette::PaletteOverride) {
+        if let (Some(colors), Some(tint)) = (p.tint, self.tint.as_mut()) {
+            tint.colors = colors;
+            tint.default_colors = false;
+        }
+        if let (true, Some(em)) = (self.multi_tint_emission, self.emissive.as_mut()) {
+            if let Some(e) = p.energy[0] {
+                em.2 = e.map(crate::pbr::srgb_to_linear);
+            }
+            if let Some(e) = p.energy[1] {
+                self.emissive_lo = e.map(crate::pbr::srgb_to_linear);
+            }
         }
     }
 }

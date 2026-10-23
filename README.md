@@ -84,6 +84,14 @@ wf-unpack level /Lotus/Levels/Hub/PlayerShipInteriorOrbiter.level -o out/ --max-
 wf-unpack check-levels --game $C          # every level and static level parses (streaming)
 wf-unpack check-levels --deep --game $C   # + descriptions, level geometry and PhysX of every model they place
 
+# Lighting: reflection probe (type 183) to HDR files, post-process settings, lightmap pages, Warframe default colours
+wf-unpack probe /Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr -o out/
+wf-unpack postprocess /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--json]
+wf-unpack lightmaps /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level -o out/
+wf-unpack palette /Lotus/Powersuits/Excalibur/Excalibur
+wf-unpack check-lighting --game $C        # every level: pages, probes, post-process fields
+wf-unpack model /Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx -o out/ --suit /Lotus/Powersuits/Excalibur/Excalibur
+
 # Surveys: asset types in an H. package, texture headers vs. B./F. sizes
 wf-unpack kinds $C/H.Misc.toc
 wf-unpack textures --game $C
@@ -697,16 +705,16 @@ Where things are:
 The dojo's obstacle course (`/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level`) is
 rebuilt in full: 1 zone (9,005 vertices, 8 materials, 5,766 collision
 triangles), 498 placed models of 38 kinds, 8 lights, 4 blocking volumes, a
-portal and two environment settings; `level ... -o` writes it in 6 s at a peak of
-770 MB (texture baking is most of that; `--no-textures` peaks at 305 MB).
+portal and two environment settings; `level ... -o` writes it, with the lightmap pages and
+the probe, in 11 to 20 s at a peak of about 650 MB (texture baking is most of
+that; `--no-textures` is lower).
 
 Not read, or not applied (the glTF and the description leave these out):
 
-- Baked lighting. The light maps decode as ordinary textures (`texture
-  --package LightMap`), but how a lightmap atlas, `LightMapCoords`,
-  `LightMapNormalize` and the per-light indexed maps combine is not worked out,
-  so surfaces are not lit like in the game. Reflection probes (`_cross.hdr`,
-  type 183, a cube map) do not decode with the texture reader.
+- Baked lighting is decoded and written (see "Lighting" below) but only its
+  non-directional part is exact: the directional gain scale, the indexed
+  light maps (`_I_l1`), light probes and the lights' own contribution are
+  not decoded.
 - Per-instance `MaterialParams` (tint and other overrides), attachments
   (`AttachParent`, `LocalPosition`), movers and their keys (instances are at rest),
   animations, particle effects, sounds, scripts and triggers. Skinned models
@@ -743,9 +751,9 @@ the result into glTF metallic-roughness textures:
 | `TX:PackMap` B | roughness | guessed: lower on metal, ~0.9 on painted wood |
 | `TX:PackMap` A with `DETAILING=TINT_MASK_PACK_MAP` | tint mask | measured: a 2x2 grid of half-size masks, R top-left, G top-right, B bottom-left, A bottom-right |
 | `TX:RoughnessMap`, `TX:SpecularMap` | roughness, metalness or specular level | used when enabled |
-| `TX:TintMask` RGBA with `PS:TintColor0..3` | multiplies the base colour | layering from Warframe's texturing guide (R bottom, then G, B, A on top); blending in linear space is a guess |
+| `TX:TintMask` RGBA (or the pack map's alpha quadrants) with `PS:TintColor0..3` | multiplies the base colour | decoded from the fill shaders: start at 0.5, lerp towards each tint by its mask (0, 1, 2, 3 in turn), double, keep the length at 0.04 or more; no gamma anywhere |
 | `TX:NormalMap` | normal | measured: green points down (DirectX), inverted for glTF; blue rebuilt |
-| `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | colour is `PS:EmissiveTintColorHi`; brightness (`EmissiveMapAtten`) ignored |
+| `TX:EmissiveMap` (red channel when `EMISSIVE_COMPRESSION=EC_COMPONENT`) | emissive | decoded from the fill shaders: map squared, times `EmissiveTintColor` (or `lerp(Lo, Hi, map^2)` for multi-tint), baked into the texture; `PS:EmissiveMapAtten` is `KHR_materials_emissive_strength` |
 
 Each pack map's own `H.Texture` attribute text names the source images it
 was built from (`Diffuse=`, `Roughness=`, `Specular=`, and for
@@ -764,8 +772,16 @@ specular colour on metal (the materials set `TINT_MASK_AFFECTS_SPECULAR=1`).
 This conversion is an approximation.
 
 Tint colours are the material's own `PS:TintColor0..3` (its default player
-colours). Every tinted material slot in the game sets them, so the neutral
-grey/gold fallback palette is never used for these. The green-down normal
+colours; every tinted slot sets them). **They are linear values used as they
+are**: the fill shaders' bytecode applies no gamma to the tint constants, to
+`PS:DiffuseColor` or to the emissive colours. Earlier versions read them as
+sRGB, which made Excalibur near-black (his primary, 0.35, came out as 0.10).
+His store icon (`/Lotus/Interface/Icons/StoreIcons/Warframes/Excalibur.png`,
+a render of the default look) shows a light grey primary, a dark secondary and
+red accents; Mag's shows steel blue, bright aqua and copper, which are his
+`TintColor0`, `1` and `2` read as linear. The tint is `2 * lerp-chain`, so a tint
+colour of 0.5 means "unchanged". The tint alpha (0.5) is never read by the
+fill shaders. The green-down normal
 convention comes from a curl test: the normal maps are integrable only with
 green pointing down. The tangent's w is set so glTF's bitangent points to the
 top of the texture. It is checked against the UV derivatives of every
@@ -795,8 +811,129 @@ Not reproduced (counted per slot by `check-materials`):
 - The newer character-detail materials (`/EE/Materials/Defaults/CharacterPBRDetail`,
   e.g. the 2025 Skana and Lato): they use `TX:MacroPackMap`, `TX:DetailMask`
   and per-layer normal maps, and come out as constants for now.
-- Opacity maps, detail maps, ambient-occlusion maps and vertex AO.
+- Opacity maps, detail maps, ambient-occlusion maps and vertex AO; the wet
+  albedo squaring, the hue fix-up of multi-tint emission and the `CLOAK` effect.
 - Weapon skins and other material overrides outside the model's own list.
+
+## Lighting and post-processing
+
+The shaders are in the game files too: `B.ShaderPermutationDx11` (and
+`B.ShaderDx11`) hold, per shader family, many permutations. Each entry is a
+header, a 512-entry `u16` table (a runtime option key to a frame index; 65,536
+entries for `FinalScenePass`), and then frames: a LEB128 decompressed size and a
+magic-less zstd frame with one compressed block (first byte `00`, a window
+descriptor, a 3-byte block header). Put `28 B5 2F FD` in front and decompress
+with a dictionary from `B.ShaderDictionaryDx11` (three zstd dictionaries one
+after the other: vertex 512 KiB, pixel 4 MiB, compute 128 KiB). The result is
+a DXBC container without its leading `DXBC` (only `ISGN`, `OSGN` and `SHEX`),
+whose checksum is D3D's modified MD5 over bytes 20 on (it matches on all 6,085
+frames tried). The formulas below were read from that bytecode, and the
+lightmap one was also run in an emulator on random inputs (agreement to 1e-7).
+A constant record in `H.ShaderDx11` is the data block followed by the name it
+belongs to; its slot byte is the `cb0` register, which is how constants were
+named. This reader does not decode shaders itself; `src/pipeline.rs` has the
+resulting formulas.
+
+**Lightmaps** (`src/lightmap.rs`). Per object: `LightMap={X_clr.png,X_dir.png}`,
+`LightMapCoords={ox,oy,sx,sy}` (rectangle of the page for mesh UV set 1),
+`LightMapNormalize={r,g,b,w}`, `LightMapNormalize1`, `IndexedLightMaps`. `_clr`
+is BC3: RGB chroma (largest channel about 1.0), A a luma stored squared, per
+object normalised to 1.0. `_dir` is BC5 holding two pages side by side (half
+the resolution of `_clr`; its top mip is not shipped). The decode:
+
+```
+a = uv1 * coords.zw + coords.xy            (cubic B-spline filtering, clamped, no v flip)
+chroma = clr.rgb * normalize.rgb           luma = clr.a^2 * normalize.w
+d = (2 dL.x - 1, 2 dL.y - 1, 2 dR.x - 1)   gain = dR.y^2 * S         (L, R: the two dir pages)
+light = (luma + max(dot(n, gain * M d), 0)) * chroma
+```
+
+Exact and applied: everything but the directional term (`luma * chroma`, the
+ambient part, is what a texture can hold). Not identified: `S`, the scale of the
+directional term (it is not `LightMapNormalize1.w`: the shader constant table
+puts that elsewhere), and `M`, which sits in a block named `ProcRotation` (the
+procedural-tile rotation, the identity in a fixed level). The raw `d` and
+`dR.y^2` are exposed, the pages are exported unchanged as `lm<N>_clr.png` /
+`lm<N>_dir.png`, and the node extras carry `coords`, `normalize`, `normalize1`,
+the page number and the indexed light maps. `lm_idx<N>.png` are the indexed
+light map pages: RGBA, one light per channel, per entry of `IndexedLightMaps`
+(the lights are named `Layer3/DojoLight29`: scope, type, instance; the
+description resolves them to the level's lights). The fill shaders use those
+channels as masks: `mask * colour * max(1 - (w d^2)^2, 0)^2 * (1 + k (1/(1+d^2) -
+1)) * N.L`, with `w = 1 / radius^2` (an inference). How `Brightness`, `Lumens`,
+`Color`, `Temperature` and `PhysicalFalloff` become the colour and `k` is
+CPU-side code and is not in the data, so the renders label that mapping as an
+assumption (colour = linear `Color` times `Brightness`, `k` = 1).
+
+**Reflection probes** (`src/probe.rs`, `src/bc6h.rs`). `ZoneAttribs.ReflectionMap`
+names a type 183 texture in `H.LightMap`: BC6H, six faces per mip level
+(smallest level first; a level is its six faces), Direct3D face order
+(+X, -X, +Y, -Y, +Z, -Z) and orientation, which was confirmed by comparing the
+texels on both sides of all 12 cube edges. `texture2ddecoder` clamps BC6H to
+8 bits, so `src/bc6h.rs` is its decoder with float output. `wfu probe` writes
+an equirectangular `.hdr` (RLE Radiance) and six face files; `level -o` writes
+`probe<N>_equirect.hdr`. The dojo's probe holds values up to 32,192 (the
+emissive strips).
+
+**Post-processing and zone settings** (`src/postprocess.rs`). `LevelInfo.PostProcessInfo`
+(about 100 fields: exposure, tone map, colour grading, bloom, fog, `lightMapTint`,
+`lightMapBoost`, ...), `PostProcessInfoAlt`, `LightingParams` and
+`ZoneAttribs` become typed structs; a type chain and the object's own text are
+overlaid field by field. Anything unknown stays as text. Field names come from
+the executable's property table; every `PostProcessInfo` in Packages.bin and
+in the levels reads. Fields neither the type nor the level sets have defaults
+inside the executable, not in the data. `wfu postprocess <level>` prints them
+and the level export puts them in the scene extras. The dojo: fog and
+`postFXMaterial=/Lotus/Types/ACESPost` from the level, `targetExposure=0.07` and
+`adaptationRateUp=3` from `LevelInfo`; the zone sets `UseLightMap=1`,
+`ZoneUsesAmbient=0` and the probe.
+
+What the shaders do with those settings (`src/pipeline.rs`): exposure is
+`clamp(target / L, min, max)` with `L` the centre-weighted geometric mean of the
+unexposed scene's luma (or a piecewise curve in log2 luma when the curve
+points are set); the final pass multiplies by it and by a vignette and looks the
+result up in a 32^3 colour volume that `ColorLUT_cs` builds from the 3-zone
+grade, the tone curve chosen by `toneMapType` (`LINEAR`, `UNCHARTED`,
+`ACES_REF`, `ACES_OPT`, `FILMIC`, `CUSTOM`, `ACES_1000`) and the sRGB encoding.
+`ACES_OPT` is implemented; the others are described in the notes but not
+ported. The tone map a level gets when it sets none is a default in the
+executable.
+
+**Default colours** (`src/palette.rs`, `wfu palette`, `model --suit`). A suit
+names its body `Mesh`, `DefaultEnergyColor` / `DefaultEnergyColor1` (0..255) and a
+`DefaultCustomization` (helmet, ...). Nothing is picked on a new account, so the
+default look is each material's own `PS:TintColor0..3` and
+`PS:EmissiveTintColorHi/Lo`; the energy colours are what the energy slots start
+as. Excalibur: tints 0.35, 0.085, 0.065 grey and (0.26, 0.0075, 0.0037) red,
+energy `#4db0e0` / `#3692be`; body and helmet agree. `--suit` puts the energy
+colours on the emissive parts of multi-tint materials (that this is what the
+engine does is inferred).
+
+`check-lighting` over the build of 2026-10-22 (36 s, peak 526 MB): 1,952 of 4,601
+levels have lightmaps (1,376,939 lightmapped instances) naming 28,488 page
+textures, whose headers all fit their `B.`/`F.` sizes (BC1, BC3, BC5; 4 are
+not in `H.LightMap`); 8,688 reflection probes decode (128 or 256 pixel faces) and 22 are
+type 177 cube textures, not read; 4,830 `PostProcessInfo` tables read with
+50,452 typed fields (`toneMapType` is `TM_ACES_REF` in 754, `TM_UNCHARTED` in 15,
+`TM_CUSTOM` in 2, `TM_ACES_OPT` in 1; the rest set none). Of 248,724
+`IndexedLightMaps` entries only 8,341 have all their lights among the level's
+own lights (the others name lights of prefabs or sub-levels, which a level
+description does not contain).
+
+**Not done:** the directional term's scale `S`, light probes (`.lpd`),
+`FillLightingBuffer` (global illumination volumes, sky and directional light,
+`AmbientLight*`), the lights' CPU-side colour mapping, `TM_ACES_REF` and the
+other tone maps, bloom, the lightmap `LightMapTint` / `lightMapBoost` scaling
+(applied outside the pixel shaders), and the clustered (non-indexed) lights.
+Because of the first four, a level cannot be lit as in the game from the
+files alone: rendered with everything that is decoded (`tools/render`), the
+dojo's lightmaps and indexed lights leave most surfaces dark.
+
+`tools/render` is a headless three.js/Playwright renderer for the glTF files
+(`npm install` there, then `node shot.cjs out.png level.gltf "pos=..&tgt=..&game=1"`);
+`game=1` lights level meshes with the lightmaps by the formula above, `lights=assumed`
+adds the indexed lights, `post=game` exposes and tone maps as the game's final
+pass does. Parameters are documented at the top of `view.html`.
 
 ## Disclaimer
 

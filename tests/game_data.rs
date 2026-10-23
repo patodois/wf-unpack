@@ -1087,3 +1087,260 @@ fn movement_and_aim_pose_sets() {
         .movement_set("/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/Idle_anim.fbx")
         .is_err());
 }
+
+const DOJO: &str = "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level";
+
+#[test]
+fn dojo_reflection_probe() {
+    use wf_unpack::probe::{direction_to_face, face_direction, Probe};
+    let Some(dir) = game_dir() else { return };
+    let p = Probe::load(
+        &dir,
+        "/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr",
+    )
+    .unwrap();
+    // BC6H, 128 x 128 faces, 8 mip levels
+    assert_eq!((p.size, p.mip_levels), (128, 8));
+    assert!(p.faces.iter().all(|f| f.len() == 128 * 128));
+    // The probe holds light above 1.0 (the cyan emissive strips)
+    assert!(p.max_finite() > 10.0);
+    // Faces in Direct3D's order and orientation: the colours on both sides of every
+    // cube edge agree. Step just outside each face edge, find the neighbouring texel
+    // by direction, and compare log luminance.
+    let lum = |t: [f32; 3]| (1.0 + 50.0 * (t[0] + t[1] + t[2]).min(60000.0) / 3.0).ln();
+    let n = p.size;
+    let (mut total, mut count) = (0.0f32, 0usize);
+    for face in 0..6 {
+        for side in 0..4 {
+            for i in 0..n {
+                let t = (i as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+                let out = 1.0 + 1.0 / n as f32;
+                let ((u, v), (px, py)) = match side {
+                    0 => ((-out, t), (0, i)),
+                    1 => ((out, t), (n - 1, i)),
+                    2 => ((t, -out), (i, 0)),
+                    _ => ((t, out), (i, n - 1)),
+                };
+                let (f2, u2, v2) = direction_to_face(face_direction(face, u, v));
+                let qx = (((u2 + 1.0) / 2.0 * n as f32) as usize).min(n - 1);
+                let qy = (((v2 + 1.0) / 2.0 * n as f32) as usize).min(n - 1);
+                total += (lum(p.faces[face][py * n + px]) - lum(p.faces[f2][qy * n + qx])).abs();
+                count += 1;
+            }
+        }
+    }
+    let mean = total / count as f32;
+    assert!(mean < 0.15, "mean edge difference {mean}");
+    // Swapping two faces breaks it
+    let mut swapped = p.clone();
+    swapped.faces.swap(0, 1);
+    let mut total2 = 0.0f32;
+    for i in 0..n {
+        let t = (i as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+        let (f2, u2, v2) = direction_to_face(face_direction(4, 1.0 + 1.0 / n as f32, t));
+        let qx = (((u2 + 1.0) / 2.0 * n as f32) as usize).min(n - 1);
+        let qy = (((v2 + 1.0) / 2.0 * n as f32) as usize).min(n - 1);
+        total2 +=
+            (lum(swapped.faces[4][i * n + n - 1]) - lum(swapped.faces[f2][qy * n + qx])).abs();
+    }
+    assert!(total2 / n as f32 > 0.0);
+    // The equirect has the requested size and finite texels
+    let eq = p.to_equirect(64, 32);
+    assert_eq!(eq.len(), 64 * 32);
+    assert!(eq
+        .iter()
+        .all(|t| t.iter().all(|c| c.is_finite() && *c >= 0.0)));
+}
+
+#[test]
+fn dojo_lightmaps_decode() {
+    use wf_unpack::level::{load_description, InstanceRole};
+    use wf_unpack::lightmap::{LightmapPage, LightmapParams};
+    use wf_unpack::texture::TexturePackages;
+    let Some(dir) = game_dir() else { return };
+    let d = load_description(&dir, DOJO).unwrap();
+    let with: Vec<_> = d
+        .instances
+        .iter()
+        .filter(|i| i.lightmap.is_some())
+        .collect();
+    assert_eq!(with.len(), 316);
+    // The zone sits in the top left quarter of page 0, half a texel margin of 1/512 around
+    let zone = d
+        .instances
+        .iter()
+        .find(|i| i.role == InstanceRole::Zone)
+        .unwrap();
+    let lm = zone.lightmap.as_ref().unwrap();
+    assert_eq!(
+        lm.coords,
+        [0.001953125, 0.001953125, 0.49609375, 0.49609375]
+    );
+    assert_eq!(
+        lm.pages(),
+        (
+            Some("/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_clr.png"),
+            Some("/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_dir.png"),
+        )
+    );
+    // Two indexed light maps of four lights each; all eight names match the level's lights
+    assert_eq!(lm.indexed.len(), 2);
+    let mut matched: Vec<usize> = lm
+        .indexed
+        .iter()
+        .flat_map(|ix| ix.light_indices.iter().flatten().copied())
+        .collect();
+    matched.sort();
+    assert_eq!(matched, (0..8).collect::<Vec<_>>());
+    assert_eq!(
+        lm.indexed[0].texture,
+        "/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_I_l1.png"
+    );
+
+    let mut pk = TexturePackages::open_family(&dir, "LightMap").unwrap();
+    let (clr, dir_tex) = lm.pages();
+    let page = LightmapPage::load(&mut pk, clr.unwrap(), dir_tex).unwrap();
+    // clr 1024 x 1024; dir is two 512 x 512 pages at half resolution (its 2048 x 1024 top level is not shipped)
+    assert_eq!((page.clr.width, page.clr.height), (1024, 1024));
+    let dir_atlas = page.dir.as_ref().unwrap();
+    assert_eq!((dir_atlas.width, dir_atlas.height), (1024, 512));
+    // Alpha (luma) peaks at 1.0 in an object's rectangle; the colour channels peak at 1.0 too (chroma)
+    let (mut amax, mut rgbmax) = (0u8, 0u8);
+    for px in page.clr.rgba.chunks_exact(4) {
+        amax = amax.max(px[3]);
+        rgbmax = rgbmax.max(px[0].max(px[1]).max(px[2]));
+    }
+    assert_eq!((amax, rgbmax), (255, 255));
+    // The right page's G (the directional gain) reaches 1.0 and the directions are unit length where lit
+    let mut gmax = 0u8;
+    let mut lens = Vec::new();
+    for y in 0..512usize {
+        for x in 0..512usize {
+            let l = &dir_atlas.rgba[(y * 1024 + x) * 4..][..2];
+            let r = &dir_atlas.rgba[(y * 1024 + 512 + x) * 4..][..2];
+            gmax = gmax.max(r[1]);
+            if r[1] > 128 {
+                let v = [
+                    2.0 * f32::from(l[0]) / 255.0 - 1.0,
+                    2.0 * f32::from(l[1]) / 255.0 - 1.0,
+                    2.0 * f32::from(r[0]) / 255.0 - 1.0,
+                ];
+                lens.push((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+            }
+        }
+    }
+    assert!(gmax >= 250);
+    lens.sort_by(|a, b| a.total_cmp(b));
+    let median = lens[lens.len() / 2];
+    assert!(
+        (0.9..1.1).contains(&median),
+        "median direction length {median}"
+    );
+
+    // Decoding: chroma follows LightMapNormalize.rgb, luma is alpha squared times its w
+    let p = LightmapParams {
+        coords: lm.coords,
+        normalize: lm.normalize,
+        normalize1: lm.normalize1,
+    };
+    let s = page.sample(&p, [0.5, 0.5]);
+    assert!(s.chroma.iter().all(|c| (0.0..=1.0).contains(c)));
+    assert!(s.luma >= 0.0 && s.luma <= lm.normalize[3]);
+    assert!(s.ambient().iter().all(|c| *c <= 1.0));
+}
+
+#[test]
+fn dojo_post_process_and_zone() {
+    use wf_unpack::level::{load_description, EnvironmentKind};
+    use wf_unpack::postprocess::ToneMapType;
+    let Some(dir) = game_dir() else { return };
+    let d = load_description(&dir, DOJO).unwrap();
+    let level = d
+        .environments
+        .iter()
+        .find(|e| e.kind == EnvironmentKind::Level)
+        .unwrap();
+    let pp = level.lighting.post_process.as_ref().unwrap();
+    // The level sets fog and the final-pass material; the type gives the exposure
+    assert_eq!(pp.fog_color, Some([102.0, 110.0, 126.0, 255.0]));
+    assert_eq!(pp.distance_fog_density, Some(0.17));
+    assert_eq!(
+        pp.post_fx_material.as_deref(),
+        Some("/Lotus/Types/ACESPost")
+    );
+    assert!((pp.target_exposure.unwrap() - 0.07).abs() < 1e-6);
+    assert_eq!(pp.adaptation_rate_up, Some(3.0));
+    assert_eq!(pp.tone_map_type, None::<ToneMapType>);
+    let fx = level.lighting.post_fx.as_ref().unwrap();
+    assert_eq!(
+        fx.shader.as_deref(),
+        Some("/EE/Shaders/PostFX/FinalScenePass.hlsl")
+    );
+    assert_eq!(
+        fx.switches.get("SIMPLE_VIGNETTE").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        fx.switches.get("BLOOM_ENABLED").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        level
+            .lighting
+            .lighting_params
+            .as_ref()
+            .unwrap()
+            .sky_light_color,
+        Some([0.0, 0.0, 0.0, 255.0])
+    );
+
+    let zone = d
+        .environments
+        .iter()
+        .find(|e| e.kind == EnvironmentKind::Zone)
+        .unwrap();
+    let z = zone.lighting.zone.as_ref().unwrap();
+    assert_eq!(z.zone_uses_ambient, Some(false));
+    assert_eq!(z.use_light_map, Some(true));
+    assert_eq!(z.ambient_light, Some([50.0, 50.0, 50.0, 0.0]));
+    assert_eq!(
+        z.reflection_map.as_deref(),
+        Some("/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr")
+    );
+    assert!((z.reflection_sh1.unwrap()[0] - 0.030593872).abs() < 1e-6);
+    assert_eq!(z.light_map_size.as_deref(), Some("LM_1024x1024"));
+}
+
+#[test]
+fn warframe_default_colours() {
+    use wf_unpack::palette::SuitPalette;
+    let Some(dir) = game_dir() else { return };
+    let exc = SuitPalette::resolve(&dir, "/Lotus/Powersuits/Excalibur/Excalibur").unwrap();
+    assert_eq!(
+        exc.energy,
+        [
+            Some([77.0, 176.0, 224.0, 255.0]),
+            Some([54.0, 146.0, 190.0, 255.0])
+        ]
+    );
+    let tint = exc.body_tint().unwrap();
+    assert_eq!(tint[0], [0.35, 0.35, 0.35, 0.5]);
+    assert_eq!(tint[1], [0.085, 0.085, 0.085, 0.5]);
+    assert_eq!(tint[3], [0.26, 0.0075, 0.0037, 0.5]);
+    // The helmet is a second part with the same defaults
+    let parts: Vec<_> = exc.parts.iter().map(|p| p.part.as_str()).collect();
+    assert_eq!(parts, ["body", "Helmet"]);
+    assert_eq!(
+        exc.parts[1].materials[0].tint,
+        exc.parts[0].materials[0].tint
+    );
+    assert!(exc.parts[0].materials[0].multi_tint_emission);
+
+    // Mag has other defaults: a steel blue, a bright blue, copper and white
+    let mag = SuitPalette::resolve(&dir, "/Lotus/Powersuits/Mag/Mag").unwrap();
+    assert_eq!(mag.energy[0], Some([77.0, 195.0, 126.0, 255.0]));
+    let t = mag.body_tint().unwrap();
+    assert_eq!(t[1], [0.2, 0.52, 0.69, 0.5]);
+    assert_eq!(t[3], [1.0, 1.0, 1.0, 0.5]);
+    assert!(SuitPalette::resolve(&dir, "/Lotus/Powersuits/Nobody/Nobody").is_err());
+}

@@ -47,9 +47,12 @@ use crate::bytes::Reader;
 use crate::cache::Package;
 use crate::ee::{self, Attributes, Value};
 use crate::header::CommonHeader;
-use crate::material::{folder, parse_properties, resolve_path};
+use crate::material::{folder, parse_properties, resolve_path, Material};
 use crate::packages::{PackagesBin, TextReader};
 use crate::physx::Shape;
+use crate::postprocess::{
+    overlay_tables, EnvironmentLighting, LightingParams, PostFxMaterial, ZoneLighting,
+};
 
 pub const KIND_LEVEL: u16 = 212;
 
@@ -330,7 +333,13 @@ pub struct TypeInfo {
     pub chain: Vec<String>,
     /// Key to (value, path of the type that set it); children override parents.
     pub props: BTreeMap<String, (Value, String)>,
+    /// For the struct-valued keys in [`LAYERED_KEYS`], every value the chain
+    /// sets, root first: structs are overlaid field by field, not replaced.
+    pub layers: BTreeMap<String, Vec<Value>>,
 }
+
+/// Keys whose tables are kept layer by layer in [`TypeInfo::layers`].
+pub const LAYERED_KEYS: [&str; 3] = ["PostProcessInfo", "PostProcessInfoAlt", "LightingParams"];
 
 impl TypeInfo {
     /// The root of the chain: the engine class everything derives from.
@@ -377,12 +386,16 @@ impl<'a> TypeResolver<'a> {
             chain.push(parent.to_string());
         }
         let mut props = BTreeMap::new();
+        let mut layers: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for entity in chain.iter().rev() {
             let Some(text) = self.texts.text(entity)? else {
                 continue;
             };
             for (k, raw) in parse_properties(&text) {
                 let value = ee::parse_value(&raw).unwrap_or(Value::Text(raw));
+                if LAYERED_KEYS.contains(&k.as_str()) {
+                    layers.entry(k.clone()).or_default().push(value.clone());
+                }
                 props.insert(k, (value, entity.clone()));
             }
         }
@@ -390,7 +403,16 @@ impl<'a> TypeResolver<'a> {
             path: path.to_string(),
             chain,
             props,
+            layers,
         }))
+    }
+
+    /// A material with its inherited properties; `None` when it is not in Packages.bin.
+    pub fn material(&mut self, path: &str) -> Result<Option<Material>> {
+        if !self.bin.contains(path) {
+            return Ok(None);
+        }
+        Material::resolve(self.bin, &mut self.texts, path, "").map(Some)
     }
 }
 
@@ -549,6 +571,30 @@ pub struct Lightmap {
     pub coords: [f32; 4],
     pub normalize: [f32; 4],
     pub normalize1: [f32; 4],
+    /// `IndexedLightMaps`: the textures that hold per-light baked data for lights with `IndexLightmap=1`.
+    pub indexed: Vec<IndexedLightmap>,
+}
+
+/// One entry of `IndexedLightMaps`: up to four lights share the four channels of a texture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedLightmap {
+    /// The lights as the level names them (`Layer3/DojoLight29`: scope, type name, instance number).
+    pub lights: Vec<String>,
+    /// Indices into [`LevelDescription::lights`] for the names that match a light of the level.
+    pub light_indices: Vec<Option<usize>>,
+    pub texture: String,
+    pub coords: [f32; 4],
+    pub baked_falloff_mask: Option<bool>,
+}
+
+impl Lightmap {
+    /// The texture pair named by `LightMap={clr,dir}`: the colour page and its direction page.
+    pub fn pages(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.textures.first().map(String::as_str),
+            self.textures.get(1).map(String::as_str),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,6 +637,8 @@ pub struct Sheet {
 #[derive(Debug, Clone, Default)]
 pub struct Light {
     pub object: usize,
+    /// The object's `Instance=` number (levels name lights by scope, type and this).
+    pub instance: u32,
     pub type_path: String,
     pub scope: String,
     pub position: [f32; 3],
@@ -676,6 +724,8 @@ pub struct Environment {
     pub reflection_map: Option<String>,
     /// The sky or distant scenery to draw (`BackDropId`).
     pub backdrop: Option<String>,
+    /// Post-processing, exposure, baking and zone lighting settings, typed.
+    pub lighting: EnvironmentLighting,
     /// Every attribute as text.
     pub attributes: Vec<(String, String)>,
 }
@@ -741,6 +791,100 @@ const CLASS_BLOCKING: [&str; 2] = [
 fn vec3(v: Option<Vec<f32>>) -> Option<[f32; 3]> {
     let v = v?;
     (v.len() == 3).then(|| [v[0], v[1], v[2]])
+}
+
+/// Reads `IndexedLightMaps={{lights={...}\nlightMap=...\nlightMapCoords={...}\nbakedFalloffMask=0},...}`.
+fn indexed_lightmaps(r: &Resolved) -> Vec<IndexedLightmap> {
+    let Some((v, base)) = r.get("IndexedLightMaps") else {
+        return Vec::new();
+    };
+    v.items()
+        .iter()
+        .filter_map(|e| {
+            let texture = e.get("lightMap")?.text()?.trim();
+            if texture.is_empty() {
+                return None;
+            }
+            Some(IndexedLightmap {
+                lights: e
+                    .get("lights")
+                    .map(|l| {
+                        l.items()
+                            .iter()
+                            .filter_map(|x| x.text().map(|t| t.trim().to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                light_indices: Vec::new(),
+                texture: resolve_path(base, texture),
+                coords: vec4(e.get("lightMapCoords").and_then(Value::floats)).unwrap_or_default(),
+                baked_falloff_mask: e
+                    .get("bakedFalloffMask")
+                    .and_then(Value::text)
+                    .map(|t| t.trim() != "0"),
+            })
+        })
+        .collect()
+}
+
+/// The values a type chain and an object's own text give a struct-valued key, root first.
+fn layered(r: &Resolved, key: &str) -> Vec<Value> {
+    let mut v =
+        r.ty.and_then(|t| t.layers.get(key))
+            .cloned()
+            .unwrap_or_default();
+    if let Some(own) = r.own.get(key) {
+        v.push(own.clone());
+    }
+    v
+}
+
+/// Reads the post-processing, baking and zone settings of a `LevelInfo` or `ZoneAttribs`.
+fn environment_lighting(
+    r: &Resolved,
+    zone: bool,
+    types: &mut TypeResolver,
+) -> Result<EnvironmentLighting> {
+    let post_process = overlay_tables(layered(r, "PostProcessInfo").iter());
+    let post_process_alt = overlay_tables(layered(r, "PostProcessInfoAlt").iter());
+    let lighting_params = {
+        let layers = layered(r, "LightingParams");
+        (!layers.is_empty()).then(|| {
+            let mut out = LightingParams::default();
+            for l in &layers {
+                out.overlay(&LightingParams::from_value(l));
+            }
+            out
+        })
+    };
+    let zone = zone.then(|| {
+        let mut z = ZoneLighting::default();
+        if let Some(ty) = r.ty {
+            for (k, (v, _)) in &ty.props {
+                z.set(k, v);
+            }
+        }
+        for (k, v) in &r.own.0 {
+            z.set(k, v);
+        }
+        z
+    });
+    let post_fx = match post_process
+        .as_ref()
+        .and_then(|p| p.post_fx_material.clone())
+    {
+        Some(path) => types
+            .material(&path)?
+            .map(|m| PostFxMaterial::from_properties(&path, &m.props)),
+        None => None,
+    };
+    Ok(EnvironmentLighting {
+        post_process,
+        post_process_alt,
+        lighting_params,
+        zone,
+        post_fx,
+    })
 }
 
 fn vec4(v: Option<Vec<f32>>) -> Option<[f32; 4]> {
@@ -832,6 +976,7 @@ impl LevelDescription {
                 CLASS_LIGHT => {
                     d.lights.push(Light {
                         object: i,
+                        instance: o.instance,
                         type_path: o.type_path.clone(),
                         scope: o.scope.clone(),
                         position: o.position,
@@ -883,6 +1028,7 @@ impl LevelDescription {
                     attributes: r.all_text(),
                 }),
                 CLASS_LEVEL_INFO | CLASS_ZONE_ATTRIBS => {
+                    let lighting = environment_lighting(&r, class == CLASS_ZONE_ATTRIBS, types)?;
                     let post = r.get("PostProcessInfo").map(|(v, _)| v.clone());
                     let from_post = |key: &str| post.as_ref().and_then(|p| p.get(key)).cloned();
                     d.environments.push(Environment {
@@ -904,6 +1050,7 @@ impl LevelDescription {
                         override_level_fog: r.flag("OverrideLevelFog"),
                         reflection_map: r.path("ReflectionMap"),
                         backdrop: r.text("BackDropId").map(str::to_string),
+                        lighting,
                         attributes: r.all_text(),
                     });
                 }
@@ -971,6 +1118,7 @@ impl LevelDescription {
                                 normalize: vec4(r.floats("LightMapNormalize")).unwrap_or_default(),
                                 normalize1: vec4(r.floats("LightMapNormalize1"))
                                     .unwrap_or_default(),
+                                indexed: indexed_lightmaps(&r),
                             })
                         }
                         None => None,
@@ -1000,7 +1148,38 @@ impl LevelDescription {
                 }
             }
         }
+        d.resolve_indexed_lights();
         Ok(d)
+    }
+
+    /// Fills [`IndexedLightmap::light_indices`] from the light names.
+    fn resolve_indexed_lights(&mut self) {
+        let keys: HashMap<String, usize> = self
+            .lights
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (light_key(l), i))
+            .collect();
+        for inst in &mut self.instances {
+            if let Some(lm) = &mut inst.lightmap {
+                for ix in &mut lm.indexed {
+                    ix.light_indices = ix.lights.iter().map(|n| keys.get(n).copied()).collect();
+                }
+            }
+        }
+    }
+}
+
+/// How a level names a light in `IndexedLightMaps`: its scope without the
+/// outer slashes, then its type's name followed by its instance number
+/// (`Layer3/DojoLight29`).
+pub fn light_key(l: &Light) -> String {
+    let scope = l.scope.trim_matches('/');
+    let name = l.type_path.rsplit('/').next().unwrap_or(&l.type_path);
+    if scope.is_empty() {
+        format!("{name}{}", l.instance)
+    } else {
+        format!("{scope}/{name}{}", l.instance)
     }
 }
 

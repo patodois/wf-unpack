@@ -1,0 +1,289 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>wf-unpack view</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}</style>
+<script type="importmap">
+{ "imports": { "three": "/node_modules/three/build/three.module.js", "three/addons/": "/node_modules/three/examples/jsm/" } }
+</script></head><body>
+<script type="module">
+// Query parameters (all optional):
+//   m        glTF to load (set by shot.cjs)
+//   pos tgt fov            camera: "x,y,z", "x,y,z", degrees
+//   exp      exposure before the tone mapper (default 1)
+//   tm       aces (default) or none (clamped linear)
+//   clipy    hide everything above this height (top-down views)
+//   bg       background hex; envbg=1 uses the level's fog colour
+//   nometal  1 forces metalness 0
+//   emis     emissive intensity (default 1)
+//   game     1: light level meshes with the game's baked lightmaps, decoded as in
+//            src/lightmap.rs (needs the lm<N>_clr/_dir.png pages and the nodes' lightmap extras)
+//   lmdebug  1: show the lightmap light alone (albedo 1)
+//   dirscale the directional term's gain scale S, which the data does not give: a number, or n1 for LightMapNormalize1.w
+//            (a hypothesis; default 0: ambient only)
+//   lmboost  scales the lightmap radiance (PostProcessInfo.lightMapBoost; default 1)
+//   probe    1: use the zone's reflection probe (probe<N>_equirect.hdr) for reflections
+//   env      environment intensity (default 0.25 without probe, 1 with)
+//   hemi     hemisphere light intensity (default 0.5 without game=1, 0 with it)
+//   dyn      1: add the level's lights as point lights (scaled by ls); default 0 with game=1
+//   extra    another glTF to add as it is (e.g. a helmet next to a body)
+//   post     game: render to a float target, expose like the game (target / geometric-mean luminance,
+//            targetExposure from the level), vignette, TM_ACES_OPT, sRGB; exp is then ignored
+//   E        fixed exposure for post=game instead of the computed one
+//   lights   assumed: the level's indexed lights, evaluated with the game's falloff and the I_l1 masks;
+//            colour = linear(Color) * Brightness, w = 1/Radius^2, k = PhysicalFalloff (the CPU-side mapping is an assumption)
+//   lscale   multiplies those lights (default 1)
+//   m2 m2c   a second glTF drawn as wireframe (collision shapes)
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+const q = new URLSearchParams(location.search);
+const num = (k, d) => q.has(k) ? Number(q.get(k)) : d;
+const vec = (k, d) => (q.get(k) ? q.get(k).split(',').map(Number) : d);
+const game = q.get('game') === '1';
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = q.get('tm') === 'none' ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = num('exp', 1.0);
+document.body.appendChild(renderer.domElement);
+if (q.has('clipy')) { renderer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(0, -1, 0), num('clipy', 0))]; }
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(Number('0x' + (q.get('bg') || '101418')));
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = game ? null : pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const envIntensity = num('env', game ? 1 : 0.25);   // per material: Scene.environmentIntensity does not exist before three r163
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x3a3326, num('hemi', game ? 0 : 0.5)));
+const camera = new THREE.PerspectiveCamera(num('fov', 60), innerWidth / innerHeight, 0.05, 2000);
+const pos = vec('pos', [0, 5, 0]), tgt = vec('tgt', [0, 0, 0]);
+camera.position.set(...pos); camera.lookAt(...tgt);
+const lightScale = num('ls', 1);
+
+// ---- the game's lightmap decode, as a patch of MeshStandardMaterial -------------------------
+const LM_FRAG_HEAD = /* glsl */`
+uniform sampler2D uLmClr; uniform sampler2D uLmDir;
+uniform vec4 uLmCoords; uniform vec4 uLmNorm;
+uniform vec2 uLmClrSize; uniform vec2 uLmDirSize; uniform float uLmBoost; uniform float uLmDirScale;
+varying vec2 vLmUv; varying vec3 vLmWorld;
+uniform sampler2D uIdxTex0; uniform sampler2D uIdxTex1; uniform vec2 uIdxSize0; uniform vec2 uIdxSize1;
+uniform vec4 uIdxCoords[2]; uniform vec4 uIdxPos[8]; uniform vec4 uIdxCol[8]; uniform float uLScale;
+vec4 lmFetch(sampler2D t, ivec2 p, ivec2 sz) { return texelFetch(t, clamp(p, ivec2(0), sz - 1), 0); }
+vec4 lmWeights(float f) { return vec4((1.-f)*(1.-f)*(1.-f), 3.*f*f*f - 6.*f*f + 4., -3.*f*f*f + 3.*f*f + 3.*f + 1., f*f*f) / 6.; }
+// the cubic B-spline the game's pixel shaders apply to lightmaps
+vec4 lmBSpline(sampler2D t, vec2 uv, vec2 size) {
+  vec2 x = uv * size - 0.5; vec2 i = floor(x); vec2 f = x - i;
+  vec4 wx = lmWeights(f.x), wy = lmWeights(f.y);
+  ivec2 sz = ivec2(size), i0 = ivec2(i);
+  vec4 acc = vec4(0.);
+  for (int b = 0; b < 4; b++) for (int a = 0; a < 4; a++) acc += wx[a] * wy[b] * lmFetch(t, i0 + ivec2(a - 1, b - 1), sz);
+  return acc;
+}`;
+const LM_FRAG_BODY = /* glsl */`
+{
+  vec3 lmAlbedo = LM_ALBEDO;
+  vec2 a = vLmUv * uLmCoords.zw + uLmCoords.xy;
+  vec4 clr = lmBSpline(uLmClr, a, uLmClrSize);
+  vec3 chroma = clr.rgb * uLmNorm.rgb;
+  float luma = clr.a * clr.a * uLmNorm.w;
+  vec2 dl = lmBSpline(uLmDir, vec2(0.5 * a.x, a.y), uLmDirSize).rg;
+  vec2 dr = lmBSpline(uLmDir, vec2(0.5 * a.x + 0.5, a.y), uLmDirSize).rg;
+  vec3 d = vec3(2. * dl.x - 1., 2. * dl.y - 1., 2. * dr.x - 1.);
+  d.x = -d.x;                                   // the game's left-handed object space to glTF's
+  // S, the directional gain scale, is not identified in the game's data: dirscale (default 0) stands in for it
+  float gain = dr.y * dr.y * uLmDirScale;
+  vec3 dw = gain * d;
+  vec3 nW = inverseTransformDirection(normal, viewMatrix);
+  vec3 light = (luma + max(dot(nW, dw), 0.)) * chroma * uLmBoost;
+  reflectedLight.indirectDiffuse += light * lmAlbedo;
+  // indexed lights: mask (one channel per light) * colour * falloff * N.L, the fill shaders' form
+  for (int e = 0; e < 2; e++) {
+    vec4 cds = uIdxCoords[e];
+    if (cds.z <= 0.0) continue;
+    vec2 ia = vLmUv * cds.zw + cds.xy;
+    vec4 mask = e == 0 ? lmBSpline(uIdxTex0, ia, uIdxSize0) : lmBSpline(uIdxTex1, ia, uIdxSize1);
+    for (int i = 0; i < 4; i++) {
+      vec4 pos = uIdxPos[e * 4 + i]; vec4 col = uIdxCol[e * 4 + i];
+      vec3 d = pos.xyz - vLmWorld; float d2 = dot(d, d);
+      float w = pos.w; float t = max(1.0 - (w * d2) * (w * d2), 0.0);
+      float f = w > 0.0 ? t * t * (1.0 + col.w * (1.0 / (1.0 + d2) - 1.0)) : 1.0;
+      float ndl = max(dot(nW, d * inversesqrt(max(d2, 1e-8))), 0.0);
+      reflectedLight.indirectDiffuse += mask[i] * col.rgb * (f * ndl * uLScale) * lmAlbedo;
+    }
+  }
+}`;
+function patchLightmap(mat, p) {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uLmClr = { value: p.clr }; shader.uniforms.uLmDir = { value: p.dir };
+    shader.uniforms.uLmCoords = { value: new THREE.Vector4(...p.coords) };
+    shader.uniforms.uLmNorm = { value: new THREE.Vector4(...p.normalize) };
+    shader.uniforms.uLmClrSize = { value: new THREE.Vector2(p.clr.image.width, p.clr.image.height) };
+    shader.uniforms.uLmDirSize = { value: new THREE.Vector2(p.dir.image.width, p.dir.image.height) };
+    shader.uniforms.uLmDirScale = { value: p.dirScale };
+    const ix = p.indexed;
+    shader.uniforms.uIdxTex0 = { value: ix.tex[0] || p.clr }; shader.uniforms.uIdxTex1 = { value: ix.tex[1] || p.clr };
+    shader.uniforms.uIdxSize0 = { value: new THREE.Vector2(...ix.size[0]) }; shader.uniforms.uIdxSize1 = { value: new THREE.Vector2(...ix.size[1]) };
+    shader.uniforms.uIdxCoords = { value: ix.coords }; shader.uniforms.uIdxPos = { value: ix.pos }; shader.uniforms.uIdxCol = { value: ix.col };
+    shader.uniforms.uLScale = { value: ix.scale };
+    shader.uniforms.uLmBoost = { value: p.boost };
+    shader.vertexShader = 'attribute vec2 lmUv; varying vec2 vLmUv; varying vec3 vLmWorld;\n' + shader.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n vLmUv = lmUv; vLmWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    shader.fragmentShader = LM_FRAG_HEAD + '\n' + shader.fragmentShader.replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + LM_FRAG_BODY.replace('LM_ALBEDO', q.get('lmdebug') === '1' ? 'vec3(1.0)' : 'material.diffuseColor'));
+  };
+  mat.customProgramCacheKey = () => 'wf-lightmap-v1';
+  mat.needsUpdate = true;
+}
+async function bitmapTexture(url) {
+  // Unpremultiplied, no colour conversion: the texels are data (alpha is luma)
+  const blob = await (await fetch(url)).blob();
+  const bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none', imageOrientation: 'none' });
+  const t = new THREE.Texture(bmp);
+  t.colorSpace = THREE.NoColorSpace; t.flipY = false; t.generateMipmaps = false;
+  t.minFilter = THREE.NearestFilter; t.magFilter = THREE.NearestFilter; t.needsUpdate = true;
+  return t;
+}
+// reflection probe: equirect .hdr in game space -> three's equirect convention (centre = +X), as a PMREM
+async function probeEnvironment(url) {
+  const tex = await new RGBELoader().setDataType(THREE.FloatType).loadAsync(url);
+  const { width: w, height: h } = tex.image, src = tex.image.data, out = new Float32Array(src.length);
+  // the file's centre column looks along +Z (x_game to the right); three's looks along +X: shift by a quarter turn
+  const shift = Math.round(w * 0.25);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const s = ((y * w) + ((x - shift + w) % w)) * 4, d = ((y * w) + x) * 4;
+    out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]; out[d + 3] = 1;
+  }
+  const t2 = new THREE.DataTexture(out, w, h, THREE.RGBAFormat, THREE.FloatType);
+  t2.mapping = THREE.EquirectangularReflectionMapping; t2.colorSpace = THREE.LinearSRGBColorSpace;
+  t2.minFilter = THREE.LinearFilter; t2.magFilter = THREE.LinearFilter; t2.flipY = tex.flipY; t2.needsUpdate = true;
+  return pmrem.fromEquirectangular(t2).texture;
+}
+
+if (q.get('m2')) {
+  new GLTFLoader().load(q.get('m2'), (g2) => {
+    g2.scene.traverse((o) => { if (o.isMesh) { o.material = new THREE.MeshBasicMaterial({ color: Number('0x' + (q.get('m2c') || '00ff66')), wireframe: true, transparent: true, opacity: 0.6 }); } });
+    scene.add(g2.scene);
+  });
+}
+if (q.get('extra')) new GLTFLoader().load(q.get('extra'), (g3) => { g3.scene.traverse((o) => { if (o.isMesh) for (const m of (Array.isArray(o.material) ? o.material : [o.material])) m.side = THREE.DoubleSide; }); scene.add(g3.scene); });
+// The game's last steps: exposure from the geometric-mean luminance, vignette, TM_ACES_OPT, sRGB.
+async function gamePost(sc) {
+  const w = innerWidth, h = innerHeight;
+  const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.FloatType, format: THREE.RGBAFormat, depthBuffer: true });
+  const keepBg = scene.background; scene.background = null;
+  renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(scene, camera); renderer.setRenderTarget(null);
+  const px = new Float32Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, px);
+  // ln luminance averaged over a 5x5 grid of cells with the centre-weighted weights, geometry pixels only
+  const wt = [0.1533, 0.2215, 0.2504, 0.2215, 0.1533];
+  const cell = new Float64Array(25), cnt = new Float64Array(25);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4; if (px[i + 3] <= 0) continue;
+    const Y = Math.min(Math.max(0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2], 6.5e-5), 65504);
+    const c = Math.min(4, Math.floor(y / h * 5)) * 5 + Math.min(4, Math.floor(x / w * 5));
+    cell[c] += Math.log(Y); cnt[c]++;
+  }
+  let acc = 0, wsum = 0;
+  for (let j = 0; j < 5; j++) for (let i = 0; i < 5; i++) { const c = j * 5 + i; if (!cnt[c]) continue; acc += wt[i] * wt[j] * cell[c] / cnt[c]; wsum += wt[i] * wt[j]; }
+  const L = Math.exp(acc / wsum);
+  const post = ((sc.environments || []).find((e) => e.kind === 'Level') || {}).lighting?.postProcess || {};
+  const target = num('target', post.targetExposure ?? 0.18), dyn = post.dynamicExposure || [0, 1e9];
+  const E = q.has('E') ? num('E', 1) : Math.min(Math.max(target / L, dyn[0]), dyn[1]);   // E=... overrides the computed exposure
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+    uniforms: { tex: { value: rt.texture }, E: { value: E }, bg: { value: new THREE.Color(Number('0x' + (q.get('bg') || '101418'))) } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+    fragmentShader: `varying vec2 vUv; uniform sampler2D tex; uniform float E; uniform vec3 bg;
+      vec3 aces(vec3 c){ return c*(2.51*c+0.03)/(c*(2.43*c+0.59)+0.14); }
+      vec3 oetf(vec3 c){ c = max(c, 0.); return mix(1.055*pow(c, vec3(1./2.4))-0.055, 12.92*c, step(c, vec3(0.0031308))); }
+      void main(){
+        vec4 t = texture2D(tex, vUv);
+        vec2 p = (vUv - 0.5) * 3.5556; float r = 0.25 * length(p); float d = 1. + r*r; float vig = 1./(d*d);
+        vec3 c = oetf(clamp(aces(t.rgb * E * vig), 0., 1.));
+        gl_FragColor = vec4(mix(bg, c, step(0.0001, t.a)), 1.);
+      }`,
+    depthTest: false, depthWrite: false }));
+  const s2 = new THREE.Scene(); s2.add(quad);
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace; renderer.toneMapping = THREE.NoToneMapping;
+  renderer.render(s2, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
+  return { L, E, target };
+}
+new GLTFLoader().load(q.get('m'), async (gltf) => {
+  const root = gltf.scene;
+  const lights = [];
+  let tris = 0, meshes = 0, lit = 0;
+  root.traverse((o) => {
+    if (o.isLight) { lights.push(o); return; }
+    if (o.isMesh) {
+      meshes++; tris += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) { m.side = THREE.DoubleSide; if (q.get('nometal') === '1') { m.metalness = 0; } if (q.has('emis')) { m.emissiveIntensity = num('emis', 1); } }
+    }
+  });
+  for (const l of lights) l.parent.remove(l);
+  const sc = gltf.scenes[0].userData || {};
+  const base = q.get('m').replace(/[^/]*$/, '');
+  if (game) {
+    const pages = {}, idxTex = {};
+    for (const p of (sc.lightmaps || [])) pages[p.page] = { clr: await bitmapTexture(base + p.clr), dir: p.dir ? await bitmapTexture(base + p.dir) : null };
+    const boost = num('lmboost', 1), dirMode = q.get('dirscale') || '0';   // 'n1': S := LightMapNormalize1.w (a hypothesis, see src/lightmap.rs)
+    // the level's lights in file order, as the lightmaps' `lightIndices` count them
+    const lightNodes = [];
+    root.traverse((o) => { if (o.userData && o.userData.light) lightNodes.push(o); });
+    const useLights = q.get('lights') === 'assumed';
+    const getIdx = async (ix) => { if (!ix.file) return null; if (!idxTex[ix.file]) idxTex[ix.file] = await bitmapTexture(base + ix.file); return idxTex[ix.file]; };
+    const todo = [];
+    root.traverse((o) => { const x = o.userData; if (o.isMesh && x && x.lightmap && x.lightmap.page != null) todo.push(o); });
+    for (const o of todo) {
+      const l = o.userData.lightmap, pg = pages[l.page];
+      if (!pg || !pg.dir || !o.geometry.getAttribute('uv1')) continue;
+      if (!o.geometry.getAttribute('lmUv')) o.geometry.setAttribute('lmUv', o.geometry.getAttribute('uv1'));
+      const indexed = { tex: [], size: [[1, 1], [1, 1]], coords: [new THREE.Vector4(), new THREE.Vector4()], pos: Array.from({ length: 8 }, () => new THREE.Vector4()), col: Array.from({ length: 8 }, () => new THREE.Vector4()), scale: num('lscale', 1) };
+      if (useLights) {
+        for (let e = 0; e < Math.min(2, (l.indexed || []).length); e++) {
+          const ix = l.indexed[e], tex = await getIdx(ix);
+          if (!tex) continue;
+          indexed.tex[e] = tex; indexed.size[e] = [ix.size[0], ix.size[1]]; indexed.coords[e].set(...ix.coords);
+          ix.lightIndices.slice(0, 4).forEach((li, i) => {
+            const ln = li == null ? null : lightNodes[li]; if (!ln) return;
+            const u = ln.userData, c = u.color || [255, 255, 255, 255];
+            const col = new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255).convertSRGBToLinear();
+            const wp = new THREE.Vector3(); ln.getWorldPosition(wp);
+            const R = u.radius || 10, B = u.brightness ?? (u.lumens || 1600) / 1600;
+            indexed.pos[e * 4 + i].set(wp.x, wp.y, wp.z, 1 / (R * R));
+            indexed.col[e * 4 + i].set(col.r * B, col.g * B, col.b * B, u.physicalFalloff === '0' ? 0 : 1);
+          });
+        }
+      }
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      const out = mats.map((m) => { const c = m.clone(); patchLightmap(c, { clr: pg.clr, dir: pg.dir, coords: l.coords, normalize: l.normalize, dirScale: dirMode === 'n1' ? l.normalize1[3] : Number(dirMode), boost, indexed }); return c; });
+      o.material = Array.isArray(o.material) ? out : out[0];
+      lit++;
+    }
+  }
+  if (q.get('probe') === '1' && (sc.reflectionProbes || []).length) {
+    scene.environment = await probeEnvironment(base + sc.reflectionProbes[0].equirect);
+  }
+  if (!game || scene.environment) root.traverse((o) => { if (o.isMesh) for (const m of (Array.isArray(o.material) ? o.material : [o.material])) m.envMapIntensity = envIntensity; });
+  const info = (sc.environments || []).find((e) => e.kind === 'Level' && e.fogColor);
+  if (info && q.get('envbg') === '1') scene.background = new THREE.Color(info.fogColor[0] / 255, info.fogColor[1] / 255, info.fogColor[2] / 255).convertSRGBToLinear();
+  if (!game || q.get('dyn') === '1') {
+    root.traverse((o) => {
+      const x = o.userData;
+      if (x && x.light && x.on !== false) {
+        const c = x.color || [255, 255, 255, 255];
+        const col = new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255).convertSRGBToLinear();
+        const r = x.radius || 10;
+        const L = new THREE.PointLight(col, (x.lumens || 1000) / 800 * lightScale, Math.max(r, x.length || 0) * 2, 2);
+        o.getWorldPosition(L.position);
+        scene.add(L);
+      }
+    });
+  }
+  scene.add(root);
+  root.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root);
+  window.result = { tris, meshes, lightmapped: lit, box: [box.min.toArray(), box.max.toArray()] };
+  if (q.get('post') === 'game') {
+    window.result.exposure = await gamePost(sc);
+    window.done = true;
+    return;
+  }
+  renderer.render(scene, camera);
+  setTimeout(() => { renderer.render(scene, camera); window.done = true; }, q.get('m2') ? 1500 : 0);
+}, undefined, (err) => { window.result = { error: String(err) }; window.done = true; });
+</script></body></html>

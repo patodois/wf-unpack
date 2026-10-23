@@ -13,11 +13,14 @@ use crate::cache::Package;
 use crate::gltf::{LevelWriter, ModelHandle};
 use crate::gltf::{Material as GltfMaterial, Slot};
 use crate::level::{InstanceRole, LevelDescription, Transform};
+use crate::lightmap::LightmapPage;
 use crate::material::{folder, resolve_path};
 use crate::model::{Model, ModelHeader};
 use crate::pbr::{Image, MaterialBaker};
 use crate::physx::{read_shapes, Collider, Shape};
+use crate::probe::{radiance_hdr, Probe};
 use crate::scene;
+use crate::texture::TexturePackages;
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -29,6 +32,10 @@ pub struct ExportOptions {
     pub textures: bool,
     /// Shrink baked textures to at most this many pixels on a side.
     pub max_texture: Option<u32>,
+    /// Write the lightmap pages the placed objects use as PNGs and describe them in the extras.
+    pub lightmaps: bool,
+    /// Decode the zones' reflection probes to equirectangular `.hdr` files.
+    pub probes: bool,
 }
 
 impl Default for ExportOptions {
@@ -38,6 +45,8 @@ impl Default for ExportOptions {
             include_hidden: false,
             textures: true,
             max_texture: None,
+            lightmaps: true,
+            probes: true,
         }
     }
 }
@@ -61,6 +70,11 @@ pub struct ExportReport {
     pub instances_without_geometry: usize,
     pub hidden_skipped: usize,
     pub buffer_bytes: usize,
+    /// Lightmap pages written (a `_clr` and its `_dir` count as one), and pages that failed.
+    pub lightmap_pages: usize,
+    pub lightmap_failures: Vec<(String, String)>,
+    pub probes_written: usize,
+    pub probe_failures: Vec<(String, String)>,
 }
 
 /// Halves an image until it fits `max` (a box filter over 2x2 blocks).
@@ -140,6 +154,7 @@ impl Materials<'_> {
                     mat.metallic_factor = baked.metallic_factor;
                     mat.roughness_factor = baked.roughness_factor;
                     mat.emissive_factor = baked.emissive_factor;
+                    mat.emissive_strength = baked.emissive_strength;
                 }
                 Err(e) => report
                     .material_failures
@@ -173,6 +188,200 @@ struct Stored {
     materials: Vec<String>,
     triangles: u64,
     slots: usize,
+}
+
+/// A lightmap page written next to the glTF.
+#[derive(Debug, Clone)]
+struct PageFiles {
+    index: usize,
+    clr_path: String,
+    dir_path: Option<String>,
+    clr_file: String,
+    dir_file: Option<String>,
+    clr_size: [usize; 2],
+    dir_size: Option<[usize; 2]>,
+}
+
+fn png_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width as u32, height as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header()?;
+    writer.write_image_data(rgba)?;
+    writer.finish()?;
+    Ok(out)
+}
+
+/// Writes every lightmap page the placed instances use (`lm<N>_clr.png`,
+/// `lm<N>_dir.png`, exactly the game's decoded texels) and returns them by name.
+fn export_lightmap_pages(
+    game: &Path,
+    d: &LevelDescription,
+    out_dir: &Path,
+    include_hidden: bool,
+    placed: &[bool],
+    report: &mut ExportReport,
+) -> HashMap<(String, Option<String>), PageFiles> {
+    let mut pages: HashMap<(String, Option<String>), PageFiles> = HashMap::new();
+    let Ok(mut pk) = TexturePackages::open_family(game, "LightMap") else {
+        report
+            .lightmap_failures
+            .push(("H.LightMap".into(), "package not found".into()));
+        return pages;
+    };
+    for (k, inst) in d.instances.iter().enumerate() {
+        if !placed[k] || (inst.hidden && !include_hidden) {
+            continue;
+        }
+        let Some(lm) = &inst.lightmap else { continue };
+        let (Some(clr), dir) = lm.pages() else {
+            continue;
+        };
+        let key = (clr.to_string(), dir.map(str::to_string));
+        if pages.contains_key(&key) {
+            continue;
+        }
+        let index = pages.len();
+        let result = LightmapPage::load(&mut pk, clr, dir).and_then(|page| {
+            let clr_file = format!("lm{index}_clr.png");
+            fs::write(
+                out_dir.join(&clr_file),
+                png_rgba(page.clr.width, page.clr.height, &page.clr.rgba)?,
+            )?;
+            let (dir_file, dir_size) = match &page.dir {
+                Some(a) => {
+                    let f = format!("lm{index}_dir.png");
+                    fs::write(out_dir.join(&f), png_rgba(a.width, a.height, &a.rgba)?)?;
+                    (Some(f), Some([a.width, a.height]))
+                }
+                None => (None, None),
+            };
+            Ok(PageFiles {
+                index,
+                clr_path: clr.to_string(),
+                dir_path: dir.map(str::to_string),
+                clr_file,
+                dir_file,
+                clr_size: [page.clr.width, page.clr.height],
+                dir_size,
+            })
+        });
+        match result {
+            Ok(files) => {
+                report.lightmap_pages += 1;
+                pages.insert(key, files);
+            }
+            Err(e) => report
+                .lightmap_failures
+                .push((clr.to_string(), format!("{e:#}"))),
+        }
+    }
+    pages
+}
+
+/// Writes the indexed light map textures (`lm_idx<N>.png`, RGBA: one light per channel) the placed instances name.
+fn export_indexed_pages(
+    game: &Path,
+    d: &LevelDescription,
+    out_dir: &Path,
+    placed: &[bool],
+    include_hidden: bool,
+    report: &mut ExportReport,
+) -> HashMap<String, (String, [usize; 2])> {
+    let mut out: HashMap<String, (String, [usize; 2])> = HashMap::new();
+    let Ok(mut pk) = TexturePackages::open_family(game, "LightMap") else {
+        return out;
+    };
+    for (k, inst) in d.instances.iter().enumerate() {
+        if !placed[k] || (inst.hidden && !include_hidden) {
+            continue;
+        }
+        let Some(lm) = &inst.lightmap else { continue };
+        for ix in &lm.indexed {
+            if out.contains_key(&ix.texture) {
+                continue;
+            }
+            let file = format!("lm_idx{}.png", out.len());
+            let result = pk.load(&ix.texture).and_then(|t| {
+                let a = crate::lightmap::Atlas::from_texture(&t)?;
+                fs::write(out_dir.join(&file), png_rgba(a.width, a.height, &a.rgba)?)?;
+                Ok([a.width, a.height])
+            });
+            match result {
+                Ok(size) => {
+                    out.insert(ix.texture.clone(), (file, size));
+                }
+                Err(e) => report
+                    .lightmap_failures
+                    .push((ix.texture.clone(), format!("{e:#}"))),
+            }
+        }
+    }
+    out
+}
+
+/// Decodes the zones' reflection probes to `probe<N>_equirect.hdr`; returns the extras entries.
+fn export_probes(
+    game: &Path,
+    d: &LevelDescription,
+    out_dir: &Path,
+    report: &mut ExportReport,
+) -> Vec<Value> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for e in &d.environments {
+        let Some(path) = &e.reflection_map else {
+            continue;
+        };
+        if seen.contains(path) {
+            continue;
+        }
+        seen.push(path.clone());
+        let result = Probe::load(game, path).and_then(|p| {
+            let (w, h) = (p.size * 4, p.size * 2);
+            let file = format!("probe{}_equirect.hdr", seen.len() - 1);
+            fs::write(out_dir.join(&file), radiance_hdr(w, h, &p.to_equirect(w, h))?)?;
+            Ok(json!({
+                "path": path, "equirect": file, "faceSize": p.size, "mipLevels": p.mip_levels,
+                "meanClamped100": p.mean_clamped(100.0), "maxFinite": p.max_finite(),
+                "convention": "game space (left-handed, y up); centre column looks along +Z, +X is to the right of centre; \
+                               top row is +Y. Flip x for glTF's right-handed space. Texels no capture ray hit are 65504.",
+            }))
+        });
+        match result {
+            Ok(j) => {
+                report.probes_written += 1;
+                out.push(j);
+            }
+            Err(e) => report.probe_failures.push((path.clone(), format!("{e:#}"))),
+        }
+    }
+    out
+}
+
+/// What the glTF's `extras` say about the lightmap decode.
+fn lightmap_format_doc() -> Value {
+    json!({
+        "summary": "Baked lighting, exactly as the game's pixel shaders decode it (see src/lightmap.rs).",
+        "uv": "a = TEXCOORD_1 * lightmap.coords.zw + lightmap.coords.xy; no flip of v; textures clamp; the pages are the game's decoded texels",
+        "clr": "RGBA: rgb chroma, a luma (stored squared)",
+        "dir": "RG, two pages side by side (left page at u/2, right page at u/2 + 0.5)",
+        "formula": [
+            "clr = bspline(clr, a); dL = bspline(dir, (0.5 a.x, a.y)).rg; dR = bspline(dir, (0.5 a.x + 0.5, a.y)).rg",
+            "chroma = clr.rgb * normalize.rgb; luma = clr.a^2 * normalize.w",
+            "ambient = luma * chroma   (applied)",
+            "d = (2 dL.x - 1, 2 dL.y - 1, 2 dR.x - 1); gain = dR.y^2 * S   (S unidentified: not applied)",
+            "light = (luma + max(dot(n, gain * M d), 0)) * chroma   (linear radiance, scaled outside by PostProcessInfo.lightMapBoost and lightMapTint)",
+            "diffuse = light * baseColor * (1 - metallic)",
+        ],
+        "mirroring": "The game's space is left-handed; the glTF nodes mirror x. d is in the game's (level) space: flip its x for glTF.",
+        "notIdentified": [
+            "S, the directional gain scale (not LightMapNormalize1.w); M, taken to be ProcRotation (identity in fixed levels)",
+        ],
+        "indexedLightMaps": "RGBA page, one light per channel of each IndexedLightMaps entry (lights in order): a per-light mask. The fill shaders evaluate up to 8 lights per object as mask * colour * max(1 - (w d^2)^2, 0)^2 * (1 + k (1 / (1 + d^2) - 1)) * N.L, with w = 1 / radius^2 inferred; how Brightness, Lumens, Color and PhysicalFalloff become colour and k is CPU code and not in the data.",
+        "notDecoded": ["light probes (.lpd), sky spherical harmonics"],
+    })
 }
 
 /// Writes `<name>.gltf` (+ `.bin` and PNGs) for the level.
@@ -254,6 +463,24 @@ pub fn export_level(
         }
     }
 
+    // Lightmap pages of the instances that get a mesh
+    let placed: Vec<bool> = d
+        .instances
+        .iter()
+        .map(|i| stored[i.model].is_some())
+        .collect();
+    let lm_pages = if opts.lightmaps {
+        export_lightmap_pages(game, d, out_dir, opts.include_hidden, &placed, &mut report)
+    } else {
+        HashMap::new()
+    };
+
+    let idx_pages = if opts.lightmaps {
+        export_indexed_pages(game, d, out_dir, &placed, opts.include_hidden, &mut report)
+    } else {
+        HashMap::new()
+    };
+
     // Meshes: one per model and material set
     let mut mesh_of: HashMap<(usize, Vec<String>), usize> = HashMap::new();
     for inst in &d.instances {
@@ -300,9 +527,21 @@ pub fn export_level(
                 "hidden": inst.hidden,
                 "zone": inst.role == InstanceRole::Zone,
                 "model": d.models[inst.model],
-                "lightmap": inst.lightmap.as_ref().map(|l| json!({
-                    "textures": l.textures, "coords": l.coords,
-                    "normalize": l.normalize, "normalize1": l.normalize1})),
+                "lightmap": inst.lightmap.as_ref().map(|l| {
+                    let (clr, dir) = l.pages();
+                    let files = clr.and_then(|c| lm_pages.get(&(c.to_string(), dir.map(str::to_string))));
+                    json!({
+                        "textures": l.textures, "coords": l.coords,
+                        "normalize": l.normalize, "normalize1": l.normalize1,
+                        "page": files.map(|f| f.index),
+                        "indexed": l.indexed.iter().map(|ix| json!({
+                            "lights": ix.lights, "lightIndices": ix.light_indices,
+                            "texture": ix.texture, "coords": ix.coords,
+                            "file": idx_pages.get(&ix.texture).map(|p| p.0.clone()),
+                            "size": idx_pages.get(&ix.texture).map(|p| p.1),
+                            "bakedFalloffMask": ix.baked_falloff_mask})).collect::<Vec<_>>(),
+                    })
+                }),
             }),
         );
         node["mesh"] = json!(mesh);
@@ -346,6 +585,9 @@ pub fn export_level(
                 "falloff": l.falloff, "falloffExponent": l.falloff_exponent,
                 "lightType": l.light_type, "texture": l.texture, "ies": l.ies,
                 "on": l.on, "directional": l.directional, "direction": l.direction,
+                "physicalFalloff": l.attributes.iter().find(|(k, _)| k == "PhysicalFalloff").map(|(_, v)| v.clone()),
+                "indexLightmap": l.attributes.iter().find(|(k, _)| k == "IndexLightmap").map(|(_, v)| v.clone()),
+                "lightCache": l.attributes.iter().find(|(k, _)| k == "LightCache").map(|(_, v)| v.clone()),
             }),
         );
         node["extensions"] = json!({"KHR_lights_punctual": {"light": idx}});
@@ -382,6 +624,13 @@ pub fn export_level(
                    "height": v.height, "radius": v.radius}),
         ));
     }
+    let probes = if opts.probes {
+        export_probes(game, d, out_dir, &mut report)
+    } else {
+        Vec::new()
+    };
+    let mut page_list: Vec<&PageFiles> = lm_pages.values().collect();
+    page_list.sort_by_key(|p| p.index);
     w.set_scene_extras(json!({
         "level": d.path,
         "environments": d.environments.iter().map(|e| json!({
@@ -389,7 +638,15 @@ pub fn export_level(
             "position": e.position, "ambientLight": e.ambient_light, "fogColor": e.fog_color,
             "fogDensity": e.fog_density, "overrideLevelFog": e.override_level_fog,
             "reflectionMap": e.reflection_map, "backdrop": e.backdrop,
+            "lighting": e.lighting.to_json(),
         })).collect::<Vec<_>>(),
+        "lightmaps": page_list.iter().map(|p| json!({
+            "page": p.index, "clr": p.clr_file, "clrSize": p.clr_size,
+            "dir": p.dir_file, "dirSize": p.dir_size,
+            "clrPath": p.clr_path, "dirPath": p.dir_path,
+        })).collect::<Vec<_>>(),
+        "lightmapFormat": lightmap_format_doc(),
+        "reflectionProbes": probes,
     }));
     report.buffer_bytes = w.buffer_len();
     w.finish(name, out_dir)?;
