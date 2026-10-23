@@ -55,31 +55,44 @@ fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|k| v[k] + w * t[k] + c[k])
 }
 
-/// A sphere, or a capsule along the local x axis when `half_height` > 0.
-fn uv_sphere(
+/// A sphere, or a capsule along the local x axis (PhysX's convention) when `half_height` > 0.
+///
+/// Rings run from the pole at +x to the pole at -x. The upper hemisphere's rings sit `half_height`
+/// out along +x, the lower one's `half_height` out along -x, and both have an equator ring, so
+/// the band between the two equators is the straight wall of the capsule. A sphere has a single
+/// equator.
+pub(crate) fn uv_sphere(
     radius: f32,
     half_height: f32,
     place: &dyn Fn([f32; 3]) -> [f32; 3],
 ) -> (Vec<[f32; 3]>, Vec<u32>) {
-    const RINGS: u32 = 10;
+    const HALF_RINGS: u32 = 5;
     const SEGMENTS: u32 = 16;
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let mut rings: Vec<(f32, f32)> = Vec::new(); // polar angle from +x, shift along x
+    for i in 0..=HALF_RINGS {
+        rings.push((quarter * i as f32 / HALF_RINGS as f32, half_height));
+    }
+    for i in 0..=HALF_RINGS {
+        if i == 0 && half_height == 0.0 {
+            continue;
+        }
+        rings.push((
+            quarter + quarter * i as f32 / HALF_RINGS as f32,
+            -half_height,
+        ));
+    }
     let mut verts = Vec::new();
-    for ring in 0..=RINGS {
-        let phi = std::f32::consts::PI * ring as f32 / RINGS as f32;
-        // The poles are on the x axis; the caps move out by the half height
-        let (x, rr) = (phi.cos() * radius, phi.sin() * radius);
-        let x = x + if ring <= RINGS / 2 {
-            half_height
-        } else {
-            -half_height
-        };
+    for &(phi, shift) in &rings {
+        // The poles are on the x axis
+        let (x, rr) = (phi.cos() * radius + shift, phi.sin() * radius);
         for seg in 0..SEGMENTS {
             let a = std::f32::consts::TAU * seg as f32 / SEGMENTS as f32;
             verts.push(place([x, rr * a.cos(), rr * a.sin()]));
         }
     }
     let mut idx = Vec::new();
-    for ring in 0..RINGS {
+    for ring in 0..rings.len() as u32 - 1 {
         for seg in 0..SEGMENTS {
             let (a, b) = (
                 ring * SEGMENTS + seg,
@@ -256,5 +269,76 @@ mod tests {
             ("convex", vec![0, 1, 2, 0, 2, 3])
         );
         assert!(shape_mesh(&shape(Collider::Empty)).is_none());
+    }
+
+    fn ident(p: [f32; 3]) -> [f32; 3] {
+        p
+    }
+
+    /// Distance from the segment `(-h, 0, 0)..(h, 0, 0)`.
+    fn axis_distance(p: [f32; 3], h: f32) -> f32 {
+        let along = (p[0].abs() - h).max(0.0);
+        (along * along + p[1] * p[1] + p[2] * p[2]).sqrt()
+    }
+
+    #[test]
+    fn a_capsule_has_a_straight_wall_between_two_equators() {
+        let (r, h) = (0.4f32, 0.7f32);
+        let (verts, idx) = uv_sphere(r, h, &ident);
+        // Every vertex is on the capsule's surface and the poles are at +-(h + r)
+        for v in &verts {
+            assert!((axis_distance(*v, h) - r).abs() < 1e-5, "{v:?}");
+        }
+        let (lo, hi) = verts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| {
+            (lo.min(v[0]), hi.max(v[0]))
+        });
+        assert!((lo + h + r).abs() < 1e-5 && (hi - h - r).abs() < 1e-5);
+        // A full-radius ring at each end of the wall: 16 vertices each, none in between
+        let on_wall: Vec<&[f32; 3]> = verts
+            .iter()
+            .filter(|v| (v[1] * v[1] + v[2] * v[2]).sqrt() > r - 1e-5)
+            .collect();
+        assert_eq!(on_wall.len(), 32);
+        assert_eq!(
+            on_wall.iter().filter(|v| (v[0] - h).abs() < 1e-5).count(),
+            16
+        );
+        assert_eq!(
+            on_wall.iter().filter(|v| (v[0] + h).abs() < 1e-5).count(),
+            16
+        );
+        // The wall's triangles are parallel to the axis: no vertex of a triangle with both
+        // ends on the wall is off it
+        let wall_tris = idx
+            .chunks(3)
+            .filter(|t| t.iter().all(|&i| on_wall.contains(&&verts[i as usize])))
+            .count();
+        assert_eq!(wall_tris, 32);
+        assert!(idx.iter().all(|&i| (i as usize) < verts.len()));
+        assert_eq!(idx.len() % 3, 0);
+    }
+
+    #[test]
+    fn a_sphere_has_one_equator_and_no_flat_band() {
+        let (verts, idx) = uv_sphere(2.0, 0.0, &ident);
+        assert_eq!(verts.len(), 11 * 16);
+        for v in &verts {
+            assert!((v.iter().map(|c| c * c).sum::<f32>().sqrt() - 2.0).abs() < 1e-5);
+        }
+        // No zero-area triangles from a doubled ring
+        let area = |t: &[u32]| {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| verts[i as usize]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let x = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            x.iter().map(|c| c * c).sum::<f32>().sqrt() / 2.0
+        };
+        // The cap fans at the poles have a collapsed side, everything else has area
+        let degenerate = idx.chunks(3).filter(|t| area(t) < 1e-6).count();
+        assert_eq!(degenerate, 2 * 16);
     }
 }

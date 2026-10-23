@@ -761,49 +761,12 @@ fn shape_triangles(s: &Shape) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
                 .collect();
             Some((verts, idx))
         }
-        Collider::Sphere { radius } => Some(uv_sphere(*radius, 0.0, &place)),
+        Collider::Sphere { radius } => Some(crate::collision::uv_sphere(*radius, 0.0, &place)),
         Collider::Capsule {
             radius,
             half_height,
-        } => Some(uv_sphere(*radius, *half_height, &place)),
+        } => Some(crate::collision::uv_sphere(*radius, *half_height, &place)),
     }
-}
-
-/// A sphere, or a capsule along the local x axis (PhysX's convention) when `half_height` > 0.
-fn uv_sphere(
-    radius: f32,
-    half_height: f32,
-    place: &dyn Fn([f32; 3]) -> [f32; 3],
-) -> (Vec<[f32; 3]>, Vec<u32>) {
-    const RINGS: u32 = 10;
-    const SEGMENTS: u32 = 16;
-    let mut verts = Vec::new();
-    for ring in 0..=RINGS {
-        let phi = std::f32::consts::PI * ring as f32 / RINGS as f32;
-        // The poles are on the x axis; the caps move out by the half height
-        let (x, rr) = (phi.cos() * radius, phi.sin() * radius);
-        let x = x + if ring <= RINGS / 2 {
-            half_height
-        } else {
-            -half_height
-        };
-        for seg in 0..SEGMENTS {
-            let a = std::f32::consts::TAU * seg as f32 / SEGMENTS as f32;
-            verts.push(place([x, rr * a.cos(), rr * a.sin()]));
-        }
-    }
-    let mut idx = Vec::new();
-    for ring in 0..RINGS {
-        for seg in 0..SEGMENTS {
-            let (a, b) = (
-                ring * SEGMENTS + seg,
-                ring * SEGMENTS + (seg + 1) % SEGMENTS,
-            );
-            let (c, e) = (a + SEGMENTS, b + SEGMENTS);
-            idx.extend([a, b, c, b, e, c]);
-        }
-    }
-    (verts, idx)
 }
 
 /// Writes `<name>_collision.gltf`: every model's shapes once, a node per
