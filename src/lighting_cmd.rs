@@ -288,3 +288,174 @@ pub fn palette_cmd(game: &Path, suit: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Runs over every level: the lightmap pages and probes they name, and the typed settings.
+pub fn check_lighting_cmd(game: &Path) -> Result<()> {
+    use std::collections::BTreeSet;
+    use wf_unpack::cache::Package;
+    use wf_unpack::texture::{Format, TextureHeader};
+
+    let started = std::time::Instant::now();
+    let mut head = Package::open(&game.join("H.AnimRetarget.toc"))?;
+    let mut body = Package::open(&game.join("B.AnimRetarget.toc"))?;
+    let levels: Vec<String> = head
+        .toc
+        .entries
+        .iter()
+        .filter(|e| e.path.ends_with(".level"))
+        .map(|e| e.path.clone())
+        .collect();
+    let bin = wf_unpack::packages::PackagesBin::load(game)?;
+    let mut types = wf_unpack::level::TypeResolver::new(&bin)?;
+    let mut pages: BTreeSet<String> = BTreeSet::new();
+    let mut probes: BTreeSet<String> = BTreeSet::new();
+    let (mut with_lightmaps, mut lightmapped, mut failed) = (0usize, 0usize, 0usize);
+    let mut indexed = (0usize, 0usize); // entries, with every light found
+    let mut other_keys: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut pp_levels, mut pp_fields, mut zones) = (0usize, 0usize, 0usize);
+    let mut tone: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &levels {
+        let d = (|| -> Result<_> {
+            let h = head.read_path(path)?.unwrap_or_default();
+            let b = body.read_path(path)?.unwrap_or_default();
+            let raw = wf_unpack::level::RawLevel::parse(&h, &b)?;
+            wf_unpack::level::LevelDescription::build(&raw, path, &mut types)
+        })();
+        let d = match d {
+            Ok(d) => d,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let n = d.instances.iter().filter(|i| i.lightmap.is_some()).count();
+        if n > 0 {
+            with_lightmaps += 1;
+            lightmapped += n;
+        }
+        for i in &d.instances {
+            if let Some(lm) = &i.lightmap {
+                for t in &lm.textures {
+                    pages.insert(t.clone());
+                }
+                for ix in &lm.indexed {
+                    pages.insert(ix.texture.clone());
+                    indexed.0 += 1;
+                    indexed.1 += usize::from(ix.light_indices.iter().all(Option::is_some));
+                }
+            }
+        }
+        for e in &d.environments {
+            if let Some(r) = &e.reflection_map {
+                probes.insert(r.clone());
+            }
+            if let Some(p) = &e.lighting.post_process {
+                pp_levels += 1;
+                pp_fields += p.set_count();
+                for k in p.other.keys() {
+                    *other_keys.entry(k.clone()).or_default() += 1;
+                }
+                if let Some(t) = &p.tone_map_type {
+                    *tone.entry(t.name().to_string()).or_default() += 1;
+                }
+            }
+            zones += usize::from(e.lighting.zone.is_some());
+        }
+    }
+    println!(
+        "{} levels ({failed} failed to describe): {with_lightmaps} have lightmaps ({lightmapped} lightmapped instances), {} distinct page textures named, {} probes named",
+        levels.len(),
+        pages.len(),
+        probes.len()
+    );
+    println!(
+        "post-process: {pp_levels} PostProcessInfo tables with {pp_fields} typed fields, {zones} zone settings; tone map types {tone:?}"
+    );
+    println!(
+        "indexed light maps: {} entries, {} with every light found in the level",
+        indexed.0, indexed.1
+    );
+    let mut other: Vec<_> = other_keys.into_iter().collect();
+    other.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    println!(
+        "PostProcessInfo keys kept as text: {:?}",
+        other.iter().take(12).collect::<Vec<_>>()
+    );
+
+    // Page headers against the sizes of their B./F. parts, without reading the pixels
+    let mut h = Package::open_in(game, "H.LightMap")?.context("no H.LightMap")?;
+    let b = Package::open_in(game, "B.LightMap")?;
+    let f = Package::open_in(game, "F.LightMap")?;
+    let (mut ok, mut missing, mut bad) = (0usize, 0usize, 0usize);
+    let mut formats: BTreeMap<String, usize> = BTreeMap::new();
+    let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in &pages {
+        let Some(raw) = h.read_path(p)? else {
+            missing += 1;
+            continue;
+        };
+        let result = TextureHeader::parse(&raw).and_then(|th| {
+            let len = |pk: &Option<Package>| {
+                pk.as_ref()
+                    .and_then(|k| k.toc.get(p))
+                    .map_or(0, |e| e.len as usize)
+            };
+            th.layout(len(&b), len(&f)).map(|l| (th.format, l))
+        });
+        match result {
+            Ok((fmt, _)) => {
+                ok += 1;
+                *formats
+                    .entry(format!("{:?}", fmt.map(|f: Format| f)))
+                    .or_default() += 1;
+            }
+            Err(e) => {
+                bad += 1;
+                errors
+                    .entry(
+                        format!("{e:#}")
+                            .chars()
+                            .filter(|c| !c.is_ascii_digit())
+                            .collect(),
+                    )
+                    .or_default()
+                    .push(p.clone());
+            }
+        }
+    }
+    println!("page textures: {ok} headers fit their B./F. sizes, {bad} do not, {missing} not in H.LightMap; formats {formats:?}");
+    for (m, l) in errors.iter().take(3) {
+        println!("  {} x {m} e.g. {}", l.len(), l[0]);
+    }
+    // Probes: decode every one
+    let mut pk = TexturePackages::open_family(game, "LightMap")?;
+    let (mut probe_ok, mut probe_fail) = (0usize, 0usize);
+    let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut other_pk = TexturePackages::open(game)?;
+    for p in &probes {
+        let cube = if pk.contains(p) {
+            pk.load_cube(p)
+        } else {
+            other_pk.load_cube(p)
+        };
+        match cube.and_then(|c| Probe::from_texture(&c)) {
+            Ok(pr) => {
+                probe_ok += 1;
+                *sizes.entry(pr.size).or_default() += 1;
+            }
+            Err(e) => {
+                probe_fail += 1;
+                if probe_fail <= 3 {
+                    println!("  probe {p}: {e:#}");
+                }
+            }
+        }
+    }
+    println!("reflection probes: {probe_ok} decoded, {probe_fail} failed; face sizes {sizes:?}");
+    println!(
+        "{:.1}s, peak memory {}",
+        started.elapsed().as_secs_f64(),
+        crate::level_cmd::peak_rss_text()
+    );
+    Ok(())
+}

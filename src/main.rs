@@ -225,6 +225,12 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Check the lighting data of every level: lightmap page headers against their B./F. sizes,
+    /// every reflection probe decoded, post-process fields read
+    CheckLighting {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Parse every level and summarise failures, with the peak memory used
     CheckLevels {
         /// Also build every level's description and read the geometry and PhysX shapes of the models it places
@@ -339,6 +345,7 @@ fn main() -> Result<()> {
         Command::Lightmaps { path, out, game } => {
             lighting_cmd::lightmaps_cmd(&expand_home(&game), &path, out.as_deref())
         }
+        Command::CheckLighting { game } => lighting_cmd::check_lighting_cmd(&expand_home(&game)),
         Command::CheckLevels { deep, game } => level_cmd::check_levels(&expand_home(&game), deep),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }

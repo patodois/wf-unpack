@@ -280,6 +280,47 @@ fn export_lightmap_pages(
     pages
 }
 
+/// Writes the indexed light map textures (`lm_idx<N>.png`, RGBA: one light per channel) the placed instances name.
+fn export_indexed_pages(
+    game: &Path,
+    d: &LevelDescription,
+    out_dir: &Path,
+    placed: &[bool],
+    include_hidden: bool,
+    report: &mut ExportReport,
+) -> HashMap<String, (String, [usize; 2])> {
+    let mut out: HashMap<String, (String, [usize; 2])> = HashMap::new();
+    let Ok(mut pk) = TexturePackages::open_family(game, "LightMap") else {
+        return out;
+    };
+    for (k, inst) in d.instances.iter().enumerate() {
+        if !placed[k] || (inst.hidden && !include_hidden) {
+            continue;
+        }
+        let Some(lm) = &inst.lightmap else { continue };
+        for ix in &lm.indexed {
+            if out.contains_key(&ix.texture) {
+                continue;
+            }
+            let file = format!("lm_idx{}.png", out.len());
+            let result = pk.load(&ix.texture).and_then(|t| {
+                let a = crate::lightmap::Atlas::from_texture(&t)?;
+                fs::write(out_dir.join(&file), png_rgba(a.width, a.height, &a.rgba)?)?;
+                Ok([a.width, a.height])
+            });
+            match result {
+                Ok(size) => {
+                    out.insert(ix.texture.clone(), (file, size));
+                }
+                Err(e) => report
+                    .lightmap_failures
+                    .push((ix.texture.clone(), format!("{e:#}"))),
+            }
+        }
+    }
+    out
+}
+
 /// Decodes the zones' reflection probes to `probe<N>_equirect.hdr`; returns the extras entries.
 fn export_probes(
     game: &Path,
@@ -338,7 +379,8 @@ fn lightmap_format_doc() -> Value {
         "notIdentified": [
             "S, the directional gain scale (not LightMapNormalize1.w); M, taken to be ProcRotation (identity in fixed levels)",
         ],
-        "notDecoded": ["indexed light maps (IndexedLightMaps, *_I_l1.png)", "light probes (.lpd), sky spherical harmonics", "the lights' own contribution"],
+        "indexedLightMaps": "RGBA page, one light per channel of each IndexedLightMaps entry (lights in order): a per-light mask. The fill shaders evaluate up to 8 lights per object as mask * colour * max(1 - (w d^2)^2, 0)^2 * (1 + k (1 / (1 + d^2) - 1)) * N.L, with w = 1 / radius^2 inferred; how Brightness, Lumens, Color and PhysicalFalloff become colour and k is CPU code and not in the data.",
+        "notDecoded": ["light probes (.lpd), sky spherical harmonics"],
     })
 }
 
@@ -433,6 +475,12 @@ pub fn export_level(
         HashMap::new()
     };
 
+    let idx_pages = if opts.lightmaps {
+        export_indexed_pages(game, d, out_dir, &placed, opts.include_hidden, &mut report)
+    } else {
+        HashMap::new()
+    };
+
     // Meshes: one per model and material set
     let mut mesh_of: HashMap<(usize, Vec<String>), usize> = HashMap::new();
     for inst in &d.instances {
@@ -489,6 +537,8 @@ pub fn export_level(
                         "indexed": l.indexed.iter().map(|ix| json!({
                             "lights": ix.lights, "lightIndices": ix.light_indices,
                             "texture": ix.texture, "coords": ix.coords,
+                            "file": idx_pages.get(&ix.texture).map(|p| p.0.clone()),
+                            "size": idx_pages.get(&ix.texture).map(|p| p.1),
                             "bakedFalloffMask": ix.baked_falloff_mask})).collect::<Vec<_>>(),
                     })
                 }),
@@ -535,6 +585,9 @@ pub fn export_level(
                 "falloff": l.falloff, "falloffExponent": l.falloff_exponent,
                 "lightType": l.light_type, "texture": l.texture, "ies": l.ies,
                 "on": l.on, "directional": l.directional, "direction": l.direction,
+                "physicalFalloff": l.attributes.iter().find(|(k, _)| k == "PhysicalFalloff").map(|(_, v)| v.clone()),
+                "indexLightmap": l.attributes.iter().find(|(k, _)| k == "IndexLightmap").map(|(_, v)| v.clone()),
+                "lightCache": l.attributes.iter().find(|(k, _)| k == "LightCache").map(|(_, v)| v.clone()),
             }),
         );
         node["extensions"] = json!({"KHR_lights_punctual": {"light": idx}});

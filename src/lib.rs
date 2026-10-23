@@ -18,6 +18,7 @@ pub mod packages;
 pub mod palette;
 pub mod pbr;
 pub mod physx;
+pub mod pipeline;
 pub mod postprocess;
 pub mod probe;
 pub mod scene;
