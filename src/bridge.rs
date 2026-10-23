@@ -89,7 +89,7 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -105,7 +105,7 @@ use crate::cache::Package;
 use crate::clipspec::clip_spec;
 use crate::header::CommonHeader;
 use crate::level::TypeResolver;
-use crate::model::{self, KIND_SKINNED, KIND_STATIC};
+use crate::model::{self, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use crate::packages::PackagesBin;
 use crate::pbr::{self, Baked, MaterialBaker};
 use crate::scene::{self, Scene};
@@ -174,6 +174,8 @@ struct Inner {
     bin: Option<PackagesBin>,
     /// Model paths with their type, read once
     index: Option<Vec<(String, u16)>>,
+    /// The models of the index that are whole characters ([`is_whole_character`])
+    characters: HashSet<String>,
 }
 
 /// A clip that was found for a model but not loaded.
@@ -198,16 +200,75 @@ pub struct AnimatedClips {
     pub other_skeletons: usize,
 }
 
-/// The asset kind a model path suggests.
-pub fn kind_of(path: &str) -> AssetKind {
+/// The asset kind of a model. `whole_character` is [`is_whole_character`] of its header.
+///
+/// Weapons are told by their folder. Everything in `/Lotus/Characters/` is a character's *part*
+/// until its header says otherwise: that folder also holds the helmets, armour, cloth, hair and
+/// reference meshes that are worn on a character, and only a model that is a whole character is
+/// [`AssetKind::Character`]. The rest, and everything else in the game, is a [`AssetKind::Prop`].
+pub fn kind_of(path: &str, whole_character: bool) -> AssetKind {
     if path.starts_with("/Lotus/Weapons/") {
         AssetKind::Weapon
-    } else if path.starts_with("/Lotus/Characters/") {
+    } else if path.starts_with(CHARACTERS_FOLDER) && whole_character {
         AssetKind::Character
     } else {
         AssetKind::Prop
     }
 }
+
+/// The folder whose models may be characters.
+const CHARACTERS_FOLDER: &str = "/Lotus/Characters/";
+
+/// Whether a model's header describes a whole character, as opposed to a piece that is worn on
+/// one. The rule reads only what the model says about itself:
+///
+/// - **a skeleton** (type 281). A static model (type 102), such as a cloth reference mesh or an
+///   armour plate, has none: there is nothing to animate;
+/// - **a full body rig**: the bones that carry weights include a head, a spine and at least three
+///   of the four limbs (left and right arm, left and right leg). The game names them
+///   `GAME_L1_ARM1`, `GAME_R1_LEG2`, `GAME_C1_HEAD1`, `GAME_C1_SPINE3`. Cloth hangs on rigs of its
+///   own (`GAME_C1_FLOIN12`), and a helmet or a glove weights a handful of bones of the body's;
+/// - **feet on the ground**: in its bind pose the mesh reaches down to y = 0, within
+///   [`FEET_TOLERANCE_M`]. The bridge places characters by their feet, so a body that does not
+///   reach the ground is a torso, a jacket or a pair of sleeves, whatever its rig says (they
+///   share the body's whole skeleton in the game).
+///
+/// What the rule cannot tell: full-length garments that are skinned to the whole rig and reach the
+/// ground (a Kubrow's armour, a body suit), which count as characters.
+pub fn is_whole_character(header: &ModelHeader) -> bool {
+    let Some(skeleton) = &header.skeleton else {
+        return false;
+    };
+    // A bone name is `_`-separated tokens: a side (`L1`, `R1`, `C1`) and a part with a number
+    let token = |name: &str, part: &str, side: Option<&str>| {
+        let numbered = |t: &str, prefix: &str| {
+            t.strip_prefix(prefix)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let tokens: Vec<&str> = name.split('_').collect();
+        tokens.iter().any(|t| numbered(t, part))
+            && side.is_none_or(|s| tokens.iter().any(|t| numbered(t, s)))
+    };
+    let weighted = |part: &str, side: Option<&str>| {
+        skeleton
+            .weighted
+            .iter()
+            .any(|n| token(&n.to_ascii_uppercase(), part, side))
+    };
+    let limbs = ["ARM", "LEG"]
+        .into_iter()
+        .flat_map(|part| ["L", "R"].map(move |side| (part, side)))
+        .filter(|&(part, side)| weighted(part, Some(side)))
+        .count();
+    weighted("HEAD", None)
+        && weighted("SPINE", None)
+        && limbs >= 3
+        && header.bounds_min[1] <= FEET_TOLERANCE_M
+}
+
+/// How far (metres) the lowest point of a whole character may be above y = 0; the bridge's
+/// conformance checker uses the same distance for "feet off the ground".
+pub const FEET_TOLERANCE_M: f32 = 0.3;
 
 impl Warframe {
     /// Opens the model packages of a `Cache.Windows` folder.
@@ -225,6 +286,7 @@ impl Warframe {
                 baker: None,
                 bin: None,
                 index: None,
+                characters: HashSet::new(),
             }),
             clips: Mutex::new(BTreeMap::new()),
         })
@@ -272,6 +334,7 @@ impl Warframe {
             let mut entries: Vec<_> = inner.head.toc.entries.clone();
             entries.sort_by_key(|e| e.offset);
             let mut index = Vec::new();
+            let mut characters = HashSet::new();
             for e in &entries {
                 // Duplicate paths: only the live (later) entry counts
                 if inner.head.toc.get(&e.path).map(|live| live.offset) != Some(e.offset) {
@@ -285,10 +348,17 @@ impl Warframe {
                 };
                 if common.kind == KIND_STATIC || common.kind == KIND_SKINNED {
                     index.push((e.path.clone(), common.kind));
+                    if common.kind == KIND_SKINNED
+                        && e.path.starts_with(CHARACTERS_FOLDER)
+                        && ModelHeader::parse(&raw).is_ok_and(|h| is_whole_character(&h))
+                    {
+                        characters.insert(e.path.clone());
+                    }
                 }
             }
             index.sort();
             inner.index = Some(index);
+            inner.characters = characters;
         }
         Ok(inner.index.clone().unwrap())
     }
@@ -708,13 +778,14 @@ impl Provider for Warframe {
                 .trim_end_matches(".level")
                 .to_string()
         };
-        let mut out: Vec<AssetInfo> = self
-            .models()?
+        let models = self.models()?;
+        let characters = self.inner.lock().unwrap().characters.clone();
+        let mut out: Vec<AssetInfo> = models
             .into_iter()
             .filter(|(path, _)| path.contains(filter))
             .map(|(path, _)| AssetInfo {
                 name: stem(&path),
-                kind: kind_of(&path),
+                kind: kind_of(&path, characters.contains(&path)),
                 id: path,
             })
             .collect();
@@ -760,14 +831,93 @@ mod tests {
     #[test]
     fn kinds_from_paths() {
         assert_eq!(
-            kind_of("/Lotus/Weapons/Tenno/Melee/Swords/X.fbx"),
+            kind_of("/Lotus/Weapons/Tenno/Melee/Swords/X.fbx", false),
             AssetKind::Weapon
         );
+        let excalibur = "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx";
+        assert_eq!(kind_of(excalibur, true), AssetKind::Character);
+        // A piece in the characters folder is not a character
+        assert_eq!(kind_of(excalibur, false), AssetKind::Prop);
+        // The rule applies to that folder only
         assert_eq!(
-            kind_of("/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx"),
-            AssetKind::Character
+            kind_of("/Lotus/Objects/Lasria/Sign.fbx", true),
+            AssetKind::Prop
         );
-        assert_eq!(kind_of("/Lotus/Objects/Lasria/Sign.fbx"), AssetKind::Prop);
+    }
+
+    /// A header with a skeleton that weights `bones`, whose mesh starts `lowest` metres up.
+    fn header(bones: &[&str], lowest: f32) -> ModelHeader {
+        use crate::header::CommonHeader;
+        ModelHeader {
+            common: CommonHeader {
+                hash: [0; 16],
+                sources: Vec::new(),
+                attributes: String::new(),
+                kind: KIND_SKINNED,
+                kind_high: 0,
+                len: 0,
+            },
+            bounds_min: [-0.5, lowest, -0.5, 0.0],
+            bounds_max: [0.5, lowest + 1.8, 0.5, 0.0],
+            vertex_count: 0,
+            index_count: 0,
+            morph_count: 0,
+            bone_count: bones.len() as u32,
+            body_vertex_count: 0,
+            body_index_count: 0,
+            meshes: Vec::new(),
+            physx_lens: Vec::new(),
+            physx_shapes: Vec::new(),
+            messages: Vec::new(),
+            skeleton: Some(crate::model::SkeletonHeader {
+                weighted: bones.iter().map(|b| b.to_string()).collect(),
+                ..Default::default()
+            }),
+            material_paths: Vec::new(),
+        }
+    }
+
+    const BODY: [&str; 8] = [
+        "GAME_C1_SPINE1",
+        "GAME_C1_HEAD1",
+        "GAME_L1_ARM1",
+        "GAME_R1_ARM1",
+        "GAME_L1_LEG1",
+        "GAME_R1_LEG1",
+        "ATT_L1_SHOULDERARMOUR",
+        "GAME_C1_ROOT",
+    ];
+
+    #[test]
+    fn a_whole_character_has_a_body_rig_and_stands_on_the_ground() {
+        assert!(is_whole_character(&header(&BODY, -0.01)));
+        // Three limbs are enough (a creature that lost one to the data)
+        assert!(is_whole_character(&header(&BODY[..5], 0.0)));
+    }
+
+    #[test]
+    fn pieces_that_are_worn_are_not_whole_characters() {
+        // A helmet weights a few bones of the body's rig
+        let helmet = header(&["GAME_C1_SPINE5", "GAME_C1_NECK1", "GAME_C1_HEAD1"], 1.6);
+        assert!(!is_whole_character(&helmet));
+        // A jacket has the whole rig but hangs from the shoulders
+        assert!(!is_whole_character(&header(&BODY, 1.0)));
+        // Cloth has a rig of its own
+        let apron: Vec<String> = (1..=30).map(|i| format!("GAME_C1_FLOIN{i}")).collect();
+        let apron: Vec<&str> = apron.iter().map(String::as_str).collect();
+        assert!(!is_whole_character(&header(&apron, 0.0)));
+        // SHOULDERARMOUR is not an arm, and a leg alone is not a body
+        let armour = [
+            "GAME_C1_SPINE1",
+            "GAME_C1_HEAD1",
+            "ATT_L1_SHOULDERARMOUR",
+            "ATT_R1_SHOULDERARMOUR",
+        ];
+        assert!(!is_whole_character(&header(&armour, 0.0)));
+        // A static model has no skeleton at all
+        let mut stat = header(&BODY, 0.0);
+        stat.skeleton = None;
+        assert!(!is_whole_character(&stat));
     }
 
     #[test]

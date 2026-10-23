@@ -184,7 +184,22 @@ wf-unpack bridge-anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --ani
 wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures]
 wf-unpack check-bridge-scenes --game $C       # build and validate the scenes of every level (no textures)
 wf-unpack player                              # the movement values with units and sources
+wf-unpack check-conformance --id /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx   # check the provider's output against the bridge's conventions
 ```
+
+`check-conformance` runs the bridge's conformance checker over what the provider returns, one asset at a time:
+scale, orientation, winding, skins, materials, scenes. Its options are the checker's (`--id` repeatable,
+`--filter`, `--kind`, `--limit`, `--compare-load`, `--allow`, `-v`, `--strict`; `--help` lists them); put `--game`
+before them. A model id with `?animations=FILTER` is checked with its clips (`list` does not give those ids, hence
+`--allow provider.unlisted_id`). Exit status 1 means an asset has an error. A model is loaded, checked and
+dropped before the next, so the peak is that of one model (0.74 GB for Excalibur with textures).
+
+The provider bakes a material with the same plan and bake as the glTF export (`pbr::MaterialBaker`), so the
+base colour is the same image: the layered tint (0.5, lerped towards each of the four `PS:TintColor` by its
+mask, doubled), with the tint colours of the materials themselves. Excalibur's body has a mean linear albedo of
+0.051 and his helmet 0.073 either way. The bridge's `Material` holds the baked images, so the four tint colours
+cannot be changed after loading (the player's colour picks), and the suit's energy colours (`model --suit`)
+are not applied to the emissive images.
 
 `check-bridge-scenes` builds the visible and collision scenes of all 4,601 levels without textures and validates
 them: all pass (2,721,966 instances, 27,392 lights, 971,406 collision shapes) in 16 minutes at a peak of
@@ -198,10 +213,18 @@ model's front faces +Z. Warframe's space is left-handed with the same up and fro
 it, for vertices, bones, animation keys, instance transforms and light positions alike. The units are
 metres already (Excalibur is 1.84 m tall).
 
-**`list(filter)`** returns every static (type 102) and skinned (type 281) model, with the kind taken
-from the path (`/Lotus/Weapons` is Weapon, `/Lotus/Characters` is Character, anything else Prop), and
-every `.level` as `AssetKind::Level` (4,601 of them). Ids are asset paths. The type 105/109 geometry of a
-level's zones is loaded through its level, not listed.
+**`list(filter)`** returns every static (type 102) and skinned (type 281) model, and every `.level` as
+`AssetKind::Level` (4,601 of them). The kind comes from the path and, for `/Lotus/Characters`, from the
+model's header (`bridge::is_whole_character`): `/Lotus/Weapons` is Weapon, anything else is Prop, and a model in
+`/Lotus/Characters` is Character only when it is a whole one. That folder also holds the helmets, armour,
+cloth, hair and reference meshes that are worn on a character (11,389 models there, 570 of them whole). A
+whole character is skinned (a static model has no skeleton), its weighted bones include a head, a spine and
+at least three of the four limbs (`GAME_C1_HEAD1`, `GAME_C1_SPINE3`, `GAME_L1_ARM1`, `GAME_R1_LEG2`; cloth hangs
+on rigs of its own and a helmet weights a few bones of the body's), and its bind-pose mesh reaches down to
+y = 0 within 0.3 m (the bridge places characters by their feet; a jacket or a pair of sleeves skinned to the
+whole rig hangs from the shoulders). Full-length garments skinned to the whole rig (a Kubrow's armour, a body
+suit) pass the rule, and creatures and machines whose bones are not named like a body (a Moa) do not.
+Ids are asset paths. The type 105/109 geometry of a level's zones is loaded through its level, not listed.
 
 **`load(id)`** returns a validated `Model`. Geometry goes through `scene::prepare`, so it matches the glTF
 export. Each material slot becomes one mesh holding only the vertices its LOD 0 triangles use. Skinned

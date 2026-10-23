@@ -219,6 +219,94 @@ fn bridge_provider_loads_valid_models_in_metres() {
     assert!(sword.materials[0].normal.is_some() && sword.materials[0].metallic_roughness.is_some());
 }
 
+/// Only whole characters are `Character`; the folder also holds what is worn on them.
+#[cfg(feature = "bridge")]
+#[test]
+fn only_whole_characters_are_listed_as_characters() {
+    use rewrite_bridge::{AssetKind, Provider};
+    use wf_unpack::bridge::Warframe;
+    let Some(dir) = game_dir() else { return };
+    let wf = Warframe::open(&dir).unwrap();
+    let kind = |id: &str| {
+        let l = wf.list(id).unwrap();
+        l.iter()
+            .find(|a| a.id == id)
+            .unwrap_or_else(|| panic!("{id} is not listed"))
+            .kind
+    };
+    for whole in [
+        "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx",
+        "/Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx",
+        "/Lotus/Characters/Tenno/Rhino/Rhino_skel.fbx",
+    ] {
+        assert_eq!(kind(whole), AssetKind::Character, "{whole}");
+    }
+    for part in [
+        // helmets weight a few bones of the body's rig
+        "/Lotus/Characters/Tenno/Excalibur/ExcaliburHelmet_skel.fbx",
+        // an armour plate and a cloth reference mesh are static models
+        "/Lotus/Characters/Tenno/Antimatter/NovaDeluxeUpArmLB.fbx",
+        "/Lotus/Characters/Zariman/Holdfasts/Yonta/Cloth/YontaCapeRefMesh.fbx",
+        // cloth has a rig of its own
+        "/Lotus/Characters/Solaris/SolarisYouthOne/Cloth/YouthOneApron_skel.fbx",
+    ] {
+        assert_eq!(kind(part), AssetKind::Prop, "{part}");
+    }
+    // The folder holds characters and the props worn on them, nothing else
+    assert!(wf
+        .list("/Lotus/Characters/")
+        .unwrap()
+        .iter()
+        .all(|a| matches!(a.kind, AssetKind::Character | AssetKind::Prop)));
+}
+
+/// The provider bakes a material the way the glTF export does: the same plan and bake, so the
+/// same layered tint (0.5 lerped towards each tint colour by its mask, doubled), the same pixels.
+#[cfg(feature = "bridge")]
+#[test]
+fn provider_base_colour_is_the_export_base_colour() {
+    use rewrite_bridge::Provider;
+    use wf_unpack::bridge::Warframe;
+    use wf_unpack::pbr::{srgb_to_linear, MaterialBaker};
+    let Some(dir) = game_dir() else { return };
+    let id = "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx";
+    let model = Warframe::open(&dir).unwrap().load(id).unwrap();
+    let names = wf_unpack::model::Model::load(&dir, id)
+        .unwrap()
+        .header
+        .materials();
+    let mut baker = MaterialBaker::open(&dir).unwrap();
+    for (name, material) in names.iter().zip(&model.materials) {
+        let plan = baker.plan(id, name).unwrap();
+        let baked = baker.bake(&plan).unwrap();
+        let (export, provider) = (
+            baked.base_color.unwrap(),
+            material.base_color.as_ref().unwrap(),
+        );
+        assert_eq!(
+            (export.width, export.height, &export.rgba),
+            (provider.width, provider.height, &provider.rgba),
+            "{name}"
+        );
+        assert_eq!(baked.base_color_factor, material.base_color_factor);
+        // Excalibur is dark steel, not black: the untinted pipeline gave a mean linear albedo
+        // of 0.027, the layered tint 0.051 (body) and 0.073 (helmet)
+        let texels = provider.rgba.as_chunks::<4>().0;
+        let n = texels.len() as f64;
+        let mean = texels
+            .iter()
+            .map(|p| {
+                (0..3)
+                    .map(|k| f64::from(srgb_to_linear(f32::from(p[k]) / 255.0)))
+                    .sum::<f64>()
+                    / 3.0
+            })
+            .sum::<f64>()
+            / n;
+        assert!(mean > 0.04, "{name}: mean linear albedo {mean:.4}");
+    }
+}
+
 #[test]
 fn excalibur_jog_animation() {
     use wf_unpack::animation::{AnimationPackages, Target};
