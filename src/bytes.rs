@@ -36,6 +36,11 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// The bytes not read yet.
+    pub fn peek(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
     pub fn skip(&mut self, n: usize) -> Result<()> {
         self.bytes(n).map(|_| ())
     }

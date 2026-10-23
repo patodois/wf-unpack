@@ -1,4 +1,5 @@
 mod anim_cmd;
+mod animtree_cmd;
 #[cfg(feature = "bridge")]
 mod bridge_cmd;
 mod player_cmd;
@@ -197,6 +198,25 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Excalibur's (or another suit's) animation controller: state machine, transitions, blend times,
+    /// the variables, and the clips of each state
+    Animtree {
+        /// A suit path, e.g. /Lotus/Powersuits/Excalibur/ExcaliburBaseSuit
+        suit: String,
+        /// Only the clips of this folder (Unarmed, Rifle, Sword, Bow...)
+        #[arg(long)]
+        stance: Option<String>,
+        /// Levels of nodes to print under each state (3 without --stance)
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Parse every state machine (.animfsm) and animation tree (.animtree) and summarise failures
+    CheckAnimtrees {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// Decode every animation (type 132) in H.Misc/B.Misc and summarise failures
     CheckAnims {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
@@ -349,6 +369,13 @@ fn main() -> Result<()> {
             game,
         } => anim_cmd::anim_cmd(&expand_home(&game), &target, filter.as_deref()),
         Command::CheckAnims { game } => anim_cmd::check_anims_cmd(&expand_home(&game)),
+        Command::Animtree {
+            suit,
+            stance,
+            depth,
+            game,
+        } => animtree_cmd::animtree_cmd(&expand_home(&game), &suit, stance.as_deref(), depth),
+        Command::CheckAnimtrees { game } => animtree_cmd::check_cmd(&expand_home(&game)),
         Command::Level {
             path,
             verbose,

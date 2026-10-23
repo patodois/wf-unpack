@@ -716,3 +716,374 @@ fn the_tenno_movement_values_match_the_known_ones() {
         .iter()
         .any(|e| e.name == "BulletJumpStart"));
 }
+
+fn excalibur_animtree() -> (
+    wf_unpack::animtree::SuitAnimation,
+    wf_unpack::animtree::Tree,
+    Vec<Option<wf_unpack::animtree::Fsm>>,
+) {
+    use wf_unpack::animtree::{suit_animation, GraphPackages};
+    use wf_unpack::level::TypeResolver;
+    use wf_unpack::material::{folder, resolve_path};
+    use wf_unpack::packages::PackagesBin;
+    let dir = game_dir().unwrap();
+    let bin = PackagesBin::load(&dir).unwrap();
+    let mut types = TypeResolver::new(&bin).unwrap();
+    let suit = suit_animation(&mut types, "/Lotus/Powersuits/Excalibur/ExcaliburBaseSuit").unwrap();
+    let mut pk = GraphPackages::open(&dir).unwrap();
+    let tree = pk.tree(&suit.anim_tree).unwrap().unwrap();
+    let base = folder(&suit.anim_tree).to_string();
+    let fsms = tree
+        .fsms
+        .iter()
+        .map(|p| pk.fsm(&resolve_path(&base, p)).unwrap())
+        .collect();
+    (suit, tree, fsms)
+}
+
+#[test]
+fn excalibur_controller_and_tree() {
+    use wf_unpack::animtree::Node;
+    if game_dir().is_none() {
+        return;
+    }
+    let (suit, tree, fsms) = excalibur_animtree();
+    assert_eq!(
+        suit.mesh.as_deref(),
+        Some("/Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx")
+    );
+    assert_eq!(
+        suit.animation_set.as_deref(),
+        Some("/Lotus/Upgrades/Skins/Excalibur/ExcaliburNobleAnims")
+    );
+    assert_eq!(suit.subtree_overrides.len(), 1);
+    assert_eq!(suit.subtree_overrides[0].0, "PRN_IDLE_OVERRIDE");
+    assert!(suit.controller_is_default);
+    assert_eq!(suit.controller, "/Lotus/Types/Player/TennoAnimController");
+    assert_eq!(
+        suit.anim_tree,
+        "/Lotus/Types/Player/Animation/SimpleTennoAnimTree.animtree"
+    );
+    // The IV_ names the controller assigns
+    assert!(suit
+        .controller_variables
+        .iter()
+        .any(|(v, x)| v == "IV_JUMP" && x == "JS_JUMPING"));
+
+    assert_eq!(tree.nodes.len(), 1936);
+    assert_eq!(
+        (tree.clips.len(), tree.fsms.len(), tree.subtrees.len()),
+        (910, 45, 10)
+    );
+    assert!(tree.errors.is_empty());
+    // Every state machine the tree names decodes
+    assert!(fsms.iter().all(Option::is_some));
+    // Every node decodes and every edge points at a node
+    let n = tree.nodes.len() as i32;
+    assert!(tree
+        .graph
+        .edges
+        .iter()
+        .flatten()
+        .all(|&c| (-1..n).contains(&c)));
+    // The root of the tree is the one node nothing points to
+    assert_eq!(tree.root(), Some(0));
+    // Every clip index in the nodes is in the pool
+    for node in &tree.nodes {
+        for c in node.clip_refs() {
+            assert!((c as usize) < tree.clips.len());
+        }
+    }
+    // Clips are named by path, without a folder prefix problem
+    assert!(tree.clips.iter().all(|c| c.starts_with('/')));
+    // The direction blend: five clips by the angle between movement and facing
+    assert!(tree.nodes.iter().any(|n| matches!(n,
+        Node::SingleAxis { var: 65, names, points, .. }
+            if names == &["BackLeft", "Left", "Forward", "Right", "BackRight"]
+                && points.iter().map(|p| p.pos).collect::<Vec<_>>() == [-180.0, -90.0, 0.0, 90.0, 180.0])));
+}
+
+#[test]
+fn excalibur_locomotion_state_machine() {
+    use wf_unpack::animtree::{find_locomotion, Node};
+    if game_dir().is_none() {
+        return;
+    }
+    let (_, tree, fsms) = excalibur_animtree();
+    let loco = find_locomotion(&tree, &fsms).unwrap();
+    let Node::Fsm { fsm } = &tree.nodes[loco.fsm_node] else {
+        panic!()
+    };
+    assert!(tree.fsms[*fsm as usize].ends_with("FsmTestLocomotion.animfsm"));
+    let f = fsms[*fsm as usize].as_ref().unwrap();
+    let names: Vec<_> = f.exposed.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Idle",
+            "Moving",
+            "Sprinting",
+            "SprintStart",
+            "SprintStop",
+            "FullBodyAction",
+            "Roll",
+            "Slide",
+            "ZipLine",
+            "WallRun",
+            "GrapplingHook"
+        ]
+    );
+    assert_eq!(f.start, 0);
+    let by_name = |n: &str| f.states.iter().position(|s| s.name == n).unwrap();
+    let (idle, moving, sprinting) = (by_name("Idle"), by_name("Moving"), by_name("Sprinting"));
+    // The state machine plays the children of its node by exposed state
+    let children = &tree.graph.edges[loco.fsm_node];
+    assert_eq!(children.len(), names.len());
+    assert_eq!(f.child_name(&f.states[moving]), Some("Moving"));
+    assert!(children[1] >= 0 && children[3] < 0);
+
+    // Moving -> Sprinting on MoveState == SPRINT, 0.3 s; v108 is the move state
+    let t = &f.states[moving].transitions[0];
+    assert_eq!(t.target as usize, sprinting);
+    assert_eq!(
+        (t.blend, t.conditions[0].var, t.conditions[0].op_symbol()),
+        (0.3, 108, "==".into())
+    );
+    assert_eq!(
+        (t.conditions[0].text.as_str(), t.conditions[0].value),
+        ("SPRINT", 2.0)
+    );
+    // Moving -> Slide 0.3 s, Moving -> Idle when the speed (v126) drops under 0.05
+    let slide = by_name("Slide");
+    let t = f.states[moving]
+        .transitions
+        .iter()
+        .find(|t| t.target as usize == slide)
+        .unwrap();
+    assert_eq!(t.blend, 0.3);
+    let t = f.states[moving]
+        .transitions
+        .iter()
+        .find(|t| t.target as usize == idle)
+        .unwrap();
+    assert_eq!(
+        (
+            t.conditions[0].var,
+            t.conditions[0].op_symbol().as_str(),
+            t.conditions[0].text.as_str()
+        ),
+        (126, "<", "0.05")
+    );
+    assert_eq!(t.blend, 0.3);
+    // Sprinting back to Moving: 0.3 s when the move state leaves SPRINT with the weapon firing, 0.05 s otherwise
+    let blends: Vec<f32> = f.states[sprinting]
+        .transitions
+        .iter()
+        .filter(|t| t.target as usize == moving)
+        .map(|t| t.blend)
+        .collect();
+    assert_eq!(blends, [0.3, 0.05]);
+    // 38 transitions in the machine; every one has a blend time
+    assert_eq!(
+        f.states.iter().map(|s| s.transitions.len()).sum::<usize>(),
+        38
+    );
+    assert!(f
+        .states
+        .iter()
+        .flat_map(|s| &s.transitions)
+        .all(|t| t.blend > 0.0));
+    assert!(f
+        .states
+        .iter()
+        .flat_map(|s| &s.transitions)
+        .any(|t| t.blend == 0.2));
+    // The sprint events name the footfall cues
+    assert_eq!(f.states[sprinting].events[0].name, "SprintStart");
+    assert_eq!(f.states[sprinting].events[1].name, "SprintStopped");
+}
+
+#[test]
+fn speed_blend_points_are_the_root_speeds_of_their_clips() {
+    use wf_unpack::animation::AnimationPackages;
+    use wf_unpack::animtree::Node;
+    if game_dir().is_none() {
+        return;
+    }
+    let (_, tree, _) = excalibur_animtree();
+    let mut anim = AnimationPackages::open(&game_dir().unwrap()).unwrap();
+    // The Sword's walk/jog blend: idle, walk and jog clips with their speeds and rates
+    let sword =
+        |c: &str| format!("/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/{c}_anim.fbx");
+    let mut seen = 0;
+    for node in &tree.nodes {
+        let Node::SpeedBlend { var, points, .. } = node else {
+            continue;
+        };
+        assert_eq!(*var, 126);
+        let paths: Vec<&str> = points
+            .iter()
+            .map(|p| tree.clips[p.clip as usize].as_str())
+            .collect();
+        if paths != [sword("Idle"), sword("WalkForward"), sword("JogForward")] {
+            continue;
+        }
+        seen += 1;
+        for p in points.iter().skip(1) {
+            // The speed stored next to a clip is the speed its root bone moves at
+            let a = &anim.load(&tree.clips[p.clip as usize]).unwrap()[0];
+            let speed = a.root_translation[2] / a.duration;
+            assert!(
+                (speed - p.speed).abs() < 0.01,
+                "{}: {speed} vs {}",
+                a.path,
+                p.speed
+            );
+        }
+        assert_eq!(points[0].speed, 0.0);
+        assert!((points[1].rate - 0.909).abs() < 1e-3 && (points[2].rate - 1.2).abs() < 1e-6);
+    }
+    assert!(seen >= 1);
+}
+
+#[test]
+fn every_state_machine_and_most_trees_decode() {
+    use wf_unpack::animtree::GraphPackages;
+    let Some(dir) = game_dir() else { return };
+    let mut pk = GraphPackages::open(&dir).unwrap();
+    let fsms = pk.fsm_paths();
+    assert!(fsms.len() >= 419);
+    for p in &fsms {
+        pk.fsm(p).unwrap_or_else(|e| panic!("{p}: {e:#}"));
+    }
+    let trees = pk.tree_paths();
+    let ok = trees.iter().filter(|p| pk.tree(p).is_ok()).count();
+    assert!(ok >= 570 && ok < trees.len(), "{ok} of {}", trees.len());
+}
+
+#[test]
+fn every_clip_the_excalibur_tree_names_exists() {
+    use wf_unpack::animation::AnimationPackages;
+    use wf_unpack::animtree::Node;
+    if game_dir().is_none() {
+        return;
+    }
+    let (_, tree, _) = excalibur_animtree();
+    let anim = AnimationPackages::open(&game_dir().unwrap()).unwrap();
+    let have: std::collections::HashSet<&str> =
+        anim.entries().iter().map(|e| e.path.as_str()).collect();
+    let mut names: Vec<&str> = tree.clips.iter().map(String::as_str).collect();
+    names.extend(tree.nodes.iter().filter_map(|n| match n {
+        Node::Parametric { path } => Some(path.as_str()),
+        _ => None,
+    }));
+    assert!(names.len() >= 1163);
+    let missing: Vec<_> = names.iter().filter(|n| !have.contains(*n)).collect();
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
+#[test]
+fn moving_state_with_a_sword() {
+    use wf_unpack::animtree::{bone_mask, find_locomotion};
+    use wf_unpack::level::TypeResolver;
+    use wf_unpack::packages::PackagesBin;
+    let Some(dir) = game_dir() else { return };
+    let (_, tree, fsms) = excalibur_animtree();
+    let loco = find_locomotion(&tree, &fsms).unwrap();
+    // The child of the locomotion machine that plays "Moving" (exposed state 1)
+    let moving = usize::try_from(tree.graph.edges[loco.fsm_node][1]).unwrap();
+    let leaves = tree.leaves(moving, Some("Sword"));
+    assert!(!leaves.is_empty());
+    let walk = leaves
+        .iter()
+        .find(|l| l.kind == "SpeedBlendNode" && l.clips.len() == 3)
+        .expect("a speed blend with the Sword's idle, walk and jog");
+    let names: Vec<&str> = walk
+        .clips
+        .iter()
+        .map(|c| c.clip.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Idle_anim.fbx",
+            "WalkForward_anim.fbx",
+            "JogForward_anim.fbx"
+        ]
+    );
+    let speeds: Vec<f32> = walk.clips.iter().map(|c| c.speed.unwrap()).collect();
+    assert_eq!(speeds[0], 0.0);
+    assert!((speeds[1] - 1.81).abs() < 0.01 && (speeds[2] - 4.22).abs() < 0.01);
+    // The way there goes through the stance and the weapon class variables
+    let vars: Vec<u32> = walk.path.iter().filter_map(|s| s.var).collect();
+    assert!(vars.contains(&158) && vars.contains(&100) && vars.contains(&44));
+    // No clip of another stance
+    assert!(leaves
+        .iter()
+        .flat_map(|l| &l.clips)
+        .all(|c| c.clip.contains("/Sword/")));
+
+    // Layering: the bone weights of a blend mask are in Packages.bin
+    let bin = PackagesBin::load(&dir).unwrap();
+    let mut types = TypeResolver::new(&bin).unwrap();
+    let mask = bone_mask(
+        &mut types,
+        "/Lotus/Types/Player/Animation/TennoUpperBodyRequestMask",
+    )
+    .unwrap()
+    .unwrap();
+    let weight = |b: &str| mask.iter().find(|m| m.bone == b).unwrap().weight;
+    assert_eq!(weight("GAME_C1_HIP1"), 0.0);
+    assert_eq!(weight("GAME_C1_SPINE1"), 0.75);
+    assert_eq!(weight("GAME_C1_HEAD1"), 1.0);
+    assert!(bone_mask(&mut types, "/Lotus/Nothing").unwrap().is_none());
+}
+
+#[test]
+fn movement_and_aim_pose_sets() {
+    use wf_unpack::animtree::{GraphPackages, KIND_AIM_POSE_SET, KIND_MOVEMENT_SET};
+    let Some(dir) = game_dir() else { return };
+    let mut pk = GraphPackages::open(&dir).unwrap();
+    // The Sword's sprint: a jog, a sprint and two 90 degree turns
+    let set = pk
+        .movement_set("/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/SwordSprinting")
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.kind, KIND_MOVEMENT_SET);
+    assert_eq!(
+        set.names,
+        [
+            "JogForward_anim.fbx",
+            "Sprint_anim.fbx",
+            "Sprint90Left_anim.fbx",
+            "Sprint90Right_anim.fbx"
+        ]
+    );
+    assert!(set
+        .sources
+        .iter()
+        .all(|s| s.starts_with("/Lotus/Animations/Tenno/")));
+    let p = set.params.unwrap();
+    assert_eq!(
+        (p.a, p.b, p.angle, p.turn, p.d),
+        (0, 12.0, 180.0, 720.0, 10.0)
+    );
+    // The Bow's aim-walk set: idle, forward, back, left and right
+    let aim = pk
+        .movement_set("/Lotus/Animations/Tenno/Movement/Bow/BowMovement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(aim.names.len(), 5);
+    assert_eq!(aim.params.unwrap().a, 1);
+    let poses = pk
+        .movement_set("/Lotus/Animations/Tenno/Movement/Bow/AimPoses")
+        .unwrap()
+        .unwrap();
+    assert_eq!(poses.kind, KIND_AIM_POSE_SET);
+    assert_eq!(poses.bone.as_deref(), Some("GAME_L1_WEAPON1"));
+    assert!(pk.movement_set("/Lotus/Nothing").unwrap().is_none());
+    // A level is not a set
+    assert!(pk
+        .movement_set("/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/Idle_anim.fbx")
+        .is_err());
+}
