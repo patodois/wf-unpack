@@ -134,6 +134,13 @@ impl Graph {
             "node type index out of range"
         );
         let edges = parse_edges(body, n, edge_count)?;
+        // Children and transition targets are node numbers (-1 is an empty slot): everything that
+        // walks the graph indexes by them
+        for (node, list) in edges.iter().enumerate() {
+            if let Some(&c) = list.iter().find(|&&c| c < -1 || c as i64 >= n as i64) {
+                bail!("node {node} lists child {c} but the graph has {n} nodes");
+            }
+        }
         Ok(Graph {
             common,
             parent,
@@ -2069,6 +2076,19 @@ mod tests {
             }]
         );
         assert_eq!(f.errors, ["Anim [Error]: x"]);
+    }
+
+    #[test]
+    fn child_numbers_outside_the_graph_are_rejected() {
+        let (h, _) = fsm_bytes();
+        // The same machine with a transition target of 2 (it has states 0 and 1), then -2
+        for bad in [2, 7, i32::MAX, -2, i32::MIN] {
+            let err = Fsm::parse(&h, &edges(&[&[-1, bad], &[]])).err().unwrap();
+            assert!(err.to_string().contains("lists child"), "{bad}: {err:#}");
+        }
+        // Empty slots and the last node are fine
+        assert!(Fsm::parse(&h, &edges(&[&[-1, 1], &[]])).is_ok());
+        assert!(Fsm::parse(&h, &edges(&[&[1, -1], &[]])).is_ok());
     }
 
     #[test]

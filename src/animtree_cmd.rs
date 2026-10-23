@@ -119,6 +119,14 @@ struct Ctx<'a> {
     keep: HashMap<usize, bool>,
 }
 
+/// A variable's enum values ordered by value, then name. A NaN (a condition's text can parse to
+/// one) sorts last instead of panicking the comparison.
+fn sorted_values(info: &VarInfo) -> Vec<(&String, &f32)> {
+    let mut vals: Vec<_> = info.values.iter().collect();
+    vals.sort_by(|a, b| a.1.total_cmp(b.1).then(a.0.cmp(b.0)));
+    vals
+}
+
 impl Ctx<'_> {
     fn var(&self, v: u32) -> String {
         match self.hints.get(&v).map(VarInfo::label) {
@@ -684,8 +692,7 @@ pub fn animtree_cmd(
             if !i.label().is_empty() {
                 line += &format!(" {}", i.label());
             }
-            let mut vals: Vec<_> = i.values.iter().collect();
-            vals.sort_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(a.0.cmp(b.0)));
+            let vals = sorted_values(i);
             if !vals.is_empty() {
                 line += &format!(
                     "  {}",
@@ -976,5 +983,23 @@ fn print_machine(ctx: &Ctx, f: &Fsm) {
         if !ev.is_empty() {
             println!("      events: {}", ev.join(", "));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_values_sort_with_a_nan() {
+        let mut info = VarInfo::default();
+        for (n, v) in [("B", 2.0), ("NAN", f32::NAN), ("A", 2.0), ("Z", 0.5)] {
+            info.values.insert(n.to_string(), v);
+        }
+        let names: Vec<&str> = sorted_values(&info)
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["Z", "A", "B", "NAN"]);
     }
 }
