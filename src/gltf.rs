@@ -264,6 +264,7 @@ pub struct LevelWriter {
     nodes: Vec<Value>,
     scene_nodes: Vec<usize>,
     lights: Vec<Value>,
+    scene_extras: Option<Value>,
 }
 
 impl LevelWriter {
@@ -455,6 +456,11 @@ impl LevelWriter {
         i
     }
 
+    /// Data stored in the scene's `extras` (level-wide settings).
+    pub fn set_scene_extras(&mut self, extras: Value) {
+        self.scene_extras = Some(extras);
+    }
+
     /// Adds a KHR_lights_punctual light definition; returns its index.
     pub fn add_light(&mut self, light: Value) -> usize {
         self.lights.push(light);
@@ -471,6 +477,9 @@ impl LevelWriter {
             "scenes": [{"name": name, "nodes": self.scene_nodes}],
             "nodes": self.nodes,
         });
+        if let Some(extras) = &self.scene_extras {
+            doc["scenes"][0]["extras"] = extras.clone();
+        }
         if !self.meshes.is_empty() {
             doc["meshes"] = json!(self.meshes);
             doc["accessors"] = json!(self.accessors);

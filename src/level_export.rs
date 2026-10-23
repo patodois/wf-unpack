@@ -56,6 +56,9 @@ pub struct ExportReport {
     /// Models that could not be loaded, and the instances lost with them.
     pub model_failures: Vec<(String, String)>,
     pub instances_lost: usize,
+    /// Models without triangles (collision or trigger shapes only), and their instances.
+    pub no_geometry: Vec<String>,
+    pub instances_without_geometry: usize,
     pub hidden_skipped: usize,
     pub buffer_bytes: usize,
 }
@@ -237,9 +240,7 @@ pub fn export_level(
                 report.triangles_stored += prepared.triangles() as u64;
             }
             Ok(_) => {
-                report
-                    .model_failures
-                    .push((path.clone(), "no triangles at this LOD".into()));
+                report.no_geometry.push(path.clone());
                 stored.push(None);
             }
             Err(e) => {
@@ -257,7 +258,11 @@ pub fn export_level(
             continue;
         }
         let Some(s) = &stored[inst.model] else {
-            report.instances_lost += 1;
+            if report.no_geometry.contains(&d.models[inst.model]) {
+                report.instances_without_geometry += 1;
+            } else {
+                report.instances_lost += 1;
+            }
             continue;
         };
         let wanted: Vec<String> = (0..s.slots)
@@ -356,6 +361,14 @@ pub fn export_level(
                    "object": s.object, "tag": s.tag}),
         ));
     }
+    for p in &d.portals {
+        w.add_node(node_for(
+            &p.transform,
+            &format!("{}portal {}", p.scope, short_name(&p.type_path)),
+            json!({"portal": true, "type": p.type_path, "scope": p.scope, "object": p.object,
+                   "width": p.width, "height": p.height}),
+        ));
+    }
     for v in &d.volumes {
         w.add_node(node_for(
             &v.transform,
@@ -365,6 +378,15 @@ pub fn export_level(
                    "height": v.height, "radius": v.radius}),
         ));
     }
+    w.set_scene_extras(json!({
+        "level": d.path,
+        "environments": d.environments.iter().map(|e| json!({
+            "kind": format!("{:?}", e.kind), "type": e.type_path, "scope": e.scope,
+            "position": e.position, "ambientLight": e.ambient_light, "fogColor": e.fog_color,
+            "fogDensity": e.fog_density, "overrideLevelFog": e.override_level_fog,
+            "reflectionMap": e.reflection_map, "backdrop": e.backdrop,
+        })).collect::<Vec<_>>(),
+    }));
     report.buffer_bytes = w.buffer_len();
     w.finish(name, out_dir)?;
     Ok(report)

@@ -634,6 +634,51 @@ pub struct Volume {
     pub radius: Option<f32>,
 }
 
+/// A connection point of a tile (`LevelPortal`): where the level joins
+/// another one. Procedural missions chain tiles by matching portals.
+#[derive(Debug, Clone)]
+pub struct Portal {
+    pub object: usize,
+    pub type_path: String,
+    pub scope: String,
+    pub transform: Transform,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    /// Every attribute as text.
+    pub attributes: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentKind {
+    /// `LevelInfo`: settings of the whole level.
+    Level,
+    /// `ZoneAttribs`: settings of a region (ambient light, fog, reflection probe, ambience).
+    Zone,
+}
+
+/// Sky, fog and ambient settings as the level gives them. Colours are as
+/// stored (0..255, alpha last).
+#[derive(Debug, Clone)]
+pub struct Environment {
+    pub object: usize,
+    pub kind: EnvironmentKind,
+    pub type_path: String,
+    pub scope: String,
+    pub position: [f32; 3],
+    pub ambient_light: Option<[f32; 4]>,
+    /// `FogColor`, or `PostProcessInfo.fogColor` of a level.
+    pub fog_color: Option<[f32; 4]>,
+    /// `DistanceFogDensity`, or `PostProcessInfo.distanceFogDensity`.
+    pub fog_density: Option<f32>,
+    pub override_level_fog: Option<bool>,
+    /// The reflection probe's cube map (`ReflectionMap`).
+    pub reflection_map: Option<String>,
+    /// The sky or distant scenery to draw (`BackDropId`).
+    pub backdrop: Option<String>,
+    /// Every attribute as text.
+    pub attributes: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
     Player,
@@ -664,6 +709,8 @@ pub struct LevelDescription {
     pub lights: Vec<Light>,
     pub volumes: Vec<Volume>,
     pub spawns: Vec<Spawn>,
+    pub environments: Vec<Environment>,
+    pub portals: Vec<Portal>,
     /// Objects that were not turned into anything above, by reason or type.
     pub skipped: BTreeMap<String, usize>,
     /// `.static` files the level's zones refer to (`StaticLevel=`); their
@@ -675,6 +722,9 @@ pub struct LevelDescription {
 const CLASS_LIGHT: &str = "/EE/Types/Engine/Light";
 const CLASS_ZONE: &str = "/EE/Types/Engine/CsgZone";
 const CLASS_SHEET: &str = "/EE/Types/Alias/CsgSheet";
+const CLASS_PORTAL: &str = "/EE/Types/Framework/LevelPortal";
+const CLASS_LEVEL_INFO: &str = "/EE/Types/Engine/LevelInfo";
+const CLASS_ZONE_ATTRIBS: &str = "/EE/Types/Engine/ZoneAttribs";
 const CLASS_PLAYER_SPAWN: &str = "/EE/Types/Engine/PlayerSpawn";
 const CLASS_NPC_SPAWN: &str = "/EE/Types/Npc/NpcSpawnPoint";
 const CLASS_BLOCKING: [&str; 2] = [
@@ -807,6 +857,43 @@ impl LevelDescription {
                         transform,
                         material: r.path("Material").unwrap_or_default(),
                         points,
+                    });
+                }
+                CLASS_PORTAL => d.portals.push(Portal {
+                    object: i,
+                    type_path: o.type_path.clone(),
+                    scope: o.scope.clone(),
+                    transform: Transform {
+                        scale: [1.0; 3],
+                        ..transform
+                    },
+                    width: r.float("Width"),
+                    height: r.float("Height"),
+                    attributes: r.all_text(),
+                }),
+                CLASS_LEVEL_INFO | CLASS_ZONE_ATTRIBS => {
+                    let post = r.get("PostProcessInfo").map(|(v, _)| v.clone());
+                    let from_post = |key: &str| post.as_ref().and_then(|p| p.get(key)).cloned();
+                    d.environments.push(Environment {
+                        object: i,
+                        kind: if class == CLASS_LEVEL_INFO {
+                            EnvironmentKind::Level
+                        } else {
+                            EnvironmentKind::Zone
+                        },
+                        type_path: o.type_path.clone(),
+                        scope: o.scope.clone(),
+                        position: o.position,
+                        ambient_light: vec4(r.floats("AmbientLight")),
+                        fog_color: vec4(r.floats("FogColor"))
+                            .or_else(|| vec4(from_post("fogColor").and_then(|v| v.floats()))),
+                        fog_density: r
+                            .float("DistanceFogDensity")
+                            .or_else(|| from_post("distanceFogDensity").and_then(|v| v.float())),
+                        override_level_fog: r.flag("OverrideLevelFog"),
+                        reflection_map: r.path("ReflectionMap"),
+                        backdrop: r.text("BackDropId").map(str::to_string),
+                        attributes: r.all_text(),
                     });
                 }
                 CLASS_PLAYER_SPAWN | CLASS_NPC_SPAWN => d.spawns.push(Spawn {
@@ -1036,6 +1123,26 @@ pub(crate) mod tests {
             ),
             ("/EE/Types/Engine/", "CsgZone", "", None),
             ("/EE/Types/Engine/", "PlayerSpawn", "", None),
+            ("/EE/Types/Engine/", "LevelInfo", "", None),
+            (
+                "/EE/Types/Framework/",
+                "LevelPortal",
+                "",
+                Some("Mesh=/EE/Editor/X.fbx\n"),
+            ),
+            (
+                "/Lotus/Levels/Portals/",
+                "Door5x3",
+                "/EE/Types/Framework/LevelPortal",
+                Some("Width=5\nHeight=3\n"),
+            ),
+            ("/EE/Types/Engine/", "ZoneAttribs", "", None),
+            (
+                "/Lotus/Levels/",
+                "RoomAttribs",
+                "/EE/Types/Engine/ZoneAttribs",
+                Some("AmbientLight={50,50,50,0}\n"),
+            ),
             ("/EE/Types/Engine/", "SimpleBlockingVolume", "", None),
             ("/EE/Types/Alias/", "CsgSheet", "", None),
             (
@@ -1110,6 +1217,21 @@ pub(crate) mod tests {
             ),
             ("/EE/Types/Engine/Decoration", [0.0; 3], id, "/", "Mesh=/EE/Editor/Darkitect/Objects/X.fbx\n"),
             ("/Lotus/Unknown/Thing", [0.0; 3], id, "/", "Foo=1\n"),
+            (
+                "/EE/Types/Engine/LevelInfo",
+                [0.0; 3],
+                id,
+                "/",
+                "PostProcessInfo={fogColor={102,110,126,255}\ndistanceFogDensity=0.17\n}\n",
+            ),
+            ("Portals/Door5x3", [2.0, 0.0, -20.0], [0.0, 1.0, 0.0, 0.0], "/", "Tag=Entry\n"),
+            (
+                "RoomAttribs",
+                [1.0, 8.0, 10.0],
+                id,
+                "/",
+                "FogColor={53,88,105,60}\nDistanceFogDensity=0.435\nReflectionMap=0_cross.hdr\nBackDropId=Sky\n",
+            ),
         ]);
         let level = RawLevel::parse(&h, &b).unwrap();
         let bin = PackagesBin::parse(&type_bin()).unwrap();
@@ -1174,6 +1296,27 @@ pub(crate) mod tests {
         assert_eq!(d.sheets[0].material, "/M/Sheet");
         assert_eq!(d.skipped["editor helper mesh"], 1);
         assert_eq!(d.skipped["no mesh: /Lotus/Unknown/Thing"], 1);
+
+        assert_eq!(d.portals.len(), 1);
+        let p = &d.portals[0];
+        assert_eq!((p.width, p.height), (Some(5.0), Some(3.0)));
+        assert_eq!(p.transform.translation, [2.0, 0.0, -20.0]);
+        assert!(p.attributes.contains(&("Tag".into(), "Entry".into())));
+
+        assert_eq!(d.environments.len(), 2);
+        let (info, zone) = (&d.environments[0], &d.environments[1]);
+        assert_eq!(info.kind, EnvironmentKind::Level);
+        assert_eq!(info.fog_color, Some([102.0, 110.0, 126.0, 255.0]));
+        assert_eq!(info.fog_density, Some(0.17));
+        assert_eq!(zone.kind, EnvironmentKind::Zone);
+        assert_eq!(zone.ambient_light, Some([50.0, 50.0, 50.0, 0.0]));
+        assert_eq!(zone.fog_color, Some([53.0, 88.0, 105.0, 60.0]));
+        assert_eq!(
+            zone.reflection_map.as_deref(),
+            Some("/Lotus/Levels/X/0_cross.hdr")
+        );
+        assert_eq!(zone.backdrop.as_deref(), Some("Sky"));
+        assert_eq!(zone.position, [1.0, 8.0, 10.0]);
 
         // Static levels add their objects once each
         let s = StaticLevel {

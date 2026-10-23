@@ -106,6 +106,7 @@ pub fn check_levels(game: &Path, deep: bool) -> Result<()> {
     let mut desc_errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let (mut instances, mut lights, mut volumes, mut spawns, mut sheets, mut hidden) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut portals, mut environments) = (0usize, 0usize);
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in &entries {
         let Ok(raw) = head.read(e) else { continue };
@@ -183,6 +184,8 @@ pub fn check_levels(game: &Path, deep: bool) -> Result<()> {
                 volumes += d.volumes.len();
                 spawns += d.spawns.len();
                 sheets += d.sheets.len();
+                portals += d.portals.len();
+                environments += d.environments.len();
                 referenced.extend(d.models);
             }
             Err(err) => note(&mut desc_errors, &err, &e.path),
@@ -216,7 +219,7 @@ pub fn check_levels(game: &Path, deep: bool) -> Result<()> {
 
     let desc_failed: usize = desc_errors.values().map(Vec::len).sum();
     println!(
-        "descriptions: {described}/{ok} built with their static levels, {desc_failed} errors; {instances} instances ({hidden} start hidden), {lights} lights, {volumes} volumes, {spawns} spawns, {sheets} sheets; {} distinct models",
+        "descriptions: {described}/{ok} built with their static levels, {desc_failed} errors; {instances} instances ({hidden} start hidden), {lights} lights, {volumes} volumes, {spawns} spawns, {portals} portals, {environments} environment settings, {sheets} sheets; {} distinct models",
         referenced.len()
     );
     print_errors(&desc_errors);
@@ -317,14 +320,16 @@ pub fn level_cmd(
         .count();
     let hidden = d.instances.iter().filter(|i| i.hidden).count();
     println!(
-        "{}: {} instances of {} models ({zones} zones, {hidden} start hidden), {} sheets, {} lights, {} volumes, {} spawns",
+        "{}: {} instances of {} models ({zones} zones, {hidden} start hidden), {} sheets, {} lights, {} volumes, {} spawns, {} portals, {} environment settings",
         d.path,
         d.instances.len(),
         d.models.len(),
         d.sheets.len(),
         d.lights.len(),
         d.volumes.len(),
-        d.spawns.len()
+        d.spawns.len(),
+        d.portals.len(),
+        d.environments.len()
     );
     let mut per_model = vec![0usize; d.models.len()];
     for i in &d.instances {
@@ -347,6 +352,25 @@ pub fn level_cmd(
             println!(
                 "light {} {:?} at {:?}: color {:?} brightness {:?} lumens {:?} radius {:?} angle {:?} on {:?}",
                 l.type_path, l.light_type, l.position, l.color, l.brightness, l.lumens, l.radius, l.angle, l.on
+            );
+        }
+        for e in &d.environments {
+            println!(
+                "{:?} settings {} at {:?}: ambient {:?} fog {:?} density {:?} reflection {:?} backdrop {:?}",
+                e.kind,
+                e.type_path,
+                e.position,
+                e.ambient_light,
+                e.fog_color,
+                e.fog_density,
+                e.reflection_map,
+                e.backdrop
+            );
+        }
+        for p in &d.portals {
+            println!(
+                "portal {} at {:?} width {:?} height {:?}",
+                p.type_path, p.transform.translation, p.width, p.height
             );
         }
         for s in &d.spawns {
@@ -386,6 +410,13 @@ pub fn level_cmd(
             println!(
                 "{} instances start hidden and were left out (--include-hidden)",
                 r.hidden_skipped
+            );
+        }
+        if !r.no_geometry.is_empty() {
+            println!(
+                "{} models have no triangles at this LOD (collision or trigger shapes): {} instances",
+                r.no_geometry.len(),
+                r.instances_without_geometry
             );
         }
         for (m, e) in &r.model_failures {
