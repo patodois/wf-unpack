@@ -12,7 +12,7 @@ use wf_unpack::level::{
     InstanceRole, LevelDescription, RawLevel, StaticLevel, TypeResolver, KIND_LEVEL,
     KIND_STATIC_LEVEL,
 };
-use wf_unpack::level_export::{export_collision, export_level, load_collision, ExportOptions};
+use wf_unpack::level_export::{export_collision, export_level, ExportOptions};
 use wf_unpack::model::{
     Model, ModelHeader, KIND_LEVEL_FLOAT, KIND_LEVEL_PACKED, KIND_SKINNED, KIND_STATIC,
 };
@@ -312,7 +312,7 @@ pub fn level_cmd(
     collision: bool,
     opts: &ExportOptions,
 ) -> Result<()> {
-    let d = wf_unpack::level::load_description(game, level_path)?;
+    let mut d = wf_unpack::level::load_description(game, level_path)?;
     let zones = d
         .instances
         .iter()
@@ -426,18 +426,18 @@ pub fn level_cmd(
             println!("material failed: {m}: {e}");
         }
         if collision {
-            let c = load_collision(game, &d)?;
-            let (shapes, nodes) = export_collision(&d, &c, out, name)?;
+            let failures = d.load_collision(game)?;
+            let (shapes, nodes) = export_collision(&d, out, name)?;
             println!(
                 "wrote {}_collision.gltf: {shapes} shapes of {} models, {nodes} nodes",
                 out.join(name).display(),
-                c.per_model
+                d.collision
                     .iter()
                     .flatten()
                     .filter(|s| !s.is_empty())
                     .count()
             );
-            for (m, e) in &c.failures {
+            for (m, e) in &failures {
                 println!("collision failed: {m}: {e}");
             }
         }

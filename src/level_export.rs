@@ -395,62 +395,54 @@ pub fn export_level(
 // ---------------------------------------------------------------------------
 // Collision
 
-/// The PhysX shapes of the models of a level, indexed like `LevelDescription::models`.
-#[derive(Default)]
-pub struct LevelCollision {
-    pub per_model: Vec<Option<Rc<Vec<Shape>>>>,
-    pub failures: Vec<(String, String)>,
-}
-
-impl LevelCollision {
-    pub fn shapes(&self, model: usize) -> Option<&[Shape]> {
-        self.per_model.get(model)?.as_deref().map(Vec::as_slice)
-    }
-}
-
-/// Reads the PhysX shapes of every model an instance uses (one model at a time).
-pub fn load_collision(game: &Path, d: &LevelDescription) -> Result<LevelCollision> {
-    let mut head = Package::open_in(game, "H.Misc")?.context("no H.Misc")?;
-    let mut body = Package::open_in(game, "B.Misc")?;
-    let mut used = vec![false; d.models.len()];
-    for i in &d.instances {
-        if !i.hidden {
-            used[i.model] = true;
-        }
-    }
-    let mut out = LevelCollision::default();
-    for (m, path) in d.models.iter().enumerate() {
-        if !used[m] {
-            out.per_model.push(None);
-            continue;
-        }
-        let result = (|| -> Result<Vec<Shape>> {
-            let raw = head
-                .read_path(path)?
-                .with_context(|| format!("{path} is not in H.Misc"))?;
-            let header = ModelHeader::parse(&raw)?;
-            if header
-                .physx_shapes
-                .iter()
-                .all(|s| s.len == 0 && s.kind == 0)
-            {
-                return Ok(Vec::new());
-            }
-            let b = match body.as_mut() {
-                Some(p) => p.read_path(path)?.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            read_shapes(&header.physx_shapes, &b)
-        })();
-        match result {
-            Ok(shapes) => out.per_model.push(Some(Rc::new(shapes))),
-            Err(e) => {
-                out.failures.push((path.clone(), format!("{e:#}")));
-                out.per_model.push(None);
+impl LevelDescription {
+    /// Reads the PhysX shapes of every model a visible instance uses (one
+    /// model at a time) into [`LevelDescription::collision`]. Returns the
+    /// models that failed, with the reason.
+    pub fn load_collision(&mut self, game: &Path) -> Result<Vec<(String, String)>> {
+        let mut head = Package::open_in(game, "H.Misc")?.context("no H.Misc")?;
+        let mut body = Package::open_in(game, "B.Misc")?;
+        let mut used = vec![false; self.models.len()];
+        for i in &self.instances {
+            if !i.hidden {
+                used[i.model] = true;
             }
         }
+        let mut failures = Vec::new();
+        self.collision.clear();
+        for (m, path) in self.models.iter().enumerate() {
+            if !used[m] {
+                self.collision.push(None);
+                continue;
+            }
+            let result = (|| -> Result<Vec<Shape>> {
+                let raw = head
+                    .read_path(path)?
+                    .with_context(|| format!("{path} is not in H.Misc"))?;
+                let header = ModelHeader::parse(&raw)?;
+                if header
+                    .physx_shapes
+                    .iter()
+                    .all(|s| s.len == 0 && s.kind == 0)
+                {
+                    return Ok(Vec::new());
+                }
+                let b = match body.as_mut() {
+                    Some(p) => p.read_path(path)?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                read_shapes(&header.physx_shapes, &b)
+            })();
+            match result {
+                Ok(shapes) => self.collision.push(Some(Rc::new(shapes))),
+                Err(e) => {
+                    failures.push((path.clone(), format!("{e:#}")));
+                    self.collision.push(None);
+                }
+            }
+        }
+        Ok(failures)
     }
-    Ok(out)
 }
 
 fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
@@ -557,7 +549,6 @@ fn uv_sphere(
 /// instance placing them. Returns (shapes drawn, nodes).
 pub fn export_collision(
     d: &LevelDescription,
-    collision: &LevelCollision,
     out_dir: &Path,
     name: &str,
 ) -> Result<(usize, usize)> {
@@ -568,7 +559,7 @@ pub fn export_collision(
         if inst.hidden {
             continue;
         }
-        let Some(shapes) = collision.shapes(inst.model) else {
+        let Some(shapes) = d.collision_shapes(inst.model) else {
             continue;
         };
         let mesh = match mesh_of[inst.model] {

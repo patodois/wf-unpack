@@ -222,12 +222,11 @@ fn bridge_provider_loads_valid_models_in_metres() {
 #[test]
 fn dojo_obstacle_course_level() {
     use wf_unpack::level::{load_description, InstanceRole};
-    use wf_unpack::level_export::load_collision;
     use wf_unpack::model::Model;
     use wf_unpack::physx::{read_shapes, Collider};
     let Some(dir) = game_dir() else { return };
     let path = "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level";
-    let d = load_description(&dir, path).unwrap();
+    let mut d = load_description(&dir, path).unwrap();
     // One CSG zone and 498 placed models of 38 kinds; nothing starts hidden
     assert_eq!((d.instances.len(), d.models.len()), (499, 39));
     assert_eq!(
@@ -251,7 +250,8 @@ fn dojo_obstacle_course_level() {
         .instances
         .iter()
         .find(|i| i.role == InstanceRole::Zone)
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(
         d.models[zone.model],
         "/Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_c.fbx"
@@ -285,9 +285,11 @@ fn dojo_obstacle_course_level() {
             );
         }
     }
-    let c = load_collision(&dir, &d).unwrap();
-    assert!(c.failures.is_empty(), "{:?}", c.failures);
-    assert!(c.per_model.iter().flatten().any(|s| !s.is_empty()));
+    let failures = d.load_collision(&dir).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(d.collision.len(), d.models.len());
+    assert!(d.collision.iter().flatten().any(|s| !s.is_empty()));
+    assert_eq!(d.collision_shapes(zone.model).unwrap().len(), 1);
 }
 
 #[test]

@@ -49,6 +49,7 @@ use crate::ee::{self, Attributes, Value};
 use crate::header::CommonHeader;
 use crate::material::{folder, parse_properties, resolve_path};
 use crate::packages::{PackagesBin, TextReader};
+use crate::physx::Shape;
 
 pub const KIND_LEVEL: u16 = 212;
 
@@ -716,6 +717,10 @@ pub struct LevelDescription {
     /// `.static` files the level's zones refer to (`StaticLevel=`); their
     /// objects are added with [`LevelDescription::add_static_level`].
     pub static_levels: Vec<String>,
+    /// PhysX shapes of each model, indexed like `models`; empty until
+    /// `load_collision` (in [`crate::level_export`]) has read them. `None`
+    /// for models that no visible instance uses or that failed to read.
+    pub collision: Vec<Option<Rc<Vec<Shape>>>>,
     model_index: HashMap<String, usize>,
 }
 
@@ -743,6 +748,11 @@ fn vec4(v: Option<Vec<f32>>) -> Option<[f32; 4]> {
 }
 
 impl LevelDescription {
+    /// The collision shapes of a model, once loaded.
+    pub fn collision_shapes(&self, model: usize) -> Option<&[Shape]> {
+        self.collision.get(model)?.as_deref().map(Vec::as_slice)
+    }
+
     /// The index of a model path, adding it on first use.
     fn model(&mut self, path: &str) -> usize {
         if let Some(&i) = self.model_index.get(path) {
