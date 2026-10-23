@@ -55,10 +55,15 @@ names a type 183 texture in `H.LightMap`: BC6H, six faces per mip level
 (smallest level first; a level is its six faces), Direct3D face order
 (+X, -X, +Y, -Y, +Z, -Z) and orientation, which was confirmed by comparing the
 texels on both sides of all 12 cube edges. `texture2ddecoder` clamps BC6H to
-8 bits, so `src/bc6h.rs` is its decoder with float output. `wfu probe` writes
+8 bits, so `src/bc6h.rs` is its decoder with float output. (That crate also
+treats the half-way endpoint, 512 for 10 bits, as the saturated one instead of
+the all-ones endpoint, and mixes sign-magnitude into the signed case; an
+earlier version of this decoder had both, and 72,344 texels of the game's
+probes came out at 65,504 where the data holds ordinary values. The probes
+have no texel at the half-float maximum.) `wfu probe` writes
 an equirectangular `.hdr` (RLE Radiance) and six face files; `level -o` writes
-`probe<N>_equirect.hdr`. The dojo's probe holds values up to 32,192 (the
-emissive strips).
+`probe<N>_equirect.hdr`. The dojo's probe holds values up to 1.74 (the
+emissive strips); the brightest texel of any probe is 10,944.
 
 **Post-processing and zone settings** (`src/postprocess.rs`). `LevelInfo.PostProcessInfo`
 (about 100 fields: exposure, tone map, colour grading, bloom, fog, `lightMapTint`,

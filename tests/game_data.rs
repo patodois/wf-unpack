@@ -1190,8 +1190,18 @@ fn dojo_reflection_probe() {
     // BC6H, 128 x 128 faces, 8 mip levels
     assert_eq!((p.size, p.mip_levels), (128, 8));
     assert!(p.faces.iter().all(|f| f.len() == 128 * 128));
-    // The probe holds light above 1.0 (the cyan emissive strips)
-    assert!(p.max_finite() > 10.0);
+    // The probe holds light above 1.0 (the cyan emissive strips), and no texel is at the
+    // half-float maximum: that was the old decoder reading a mid-range endpoint as saturated
+    assert!(
+        p.max_finite() > 1.0 && p.max_finite() < 10.0,
+        "{}",
+        p.max_finite()
+    );
+    assert!(p
+        .faces
+        .iter()
+        .flatten()
+        .all(|t| t.iter().all(|c| *c < 65_000.0)));
     // Faces in Direct3D's order and orientation: the colours on both sides of every
     // cube edge agree. Step just outside each face edge, find the neighbouring texel
     // by direction, and compare log luminance.

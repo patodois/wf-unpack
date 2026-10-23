@@ -20,8 +20,10 @@
 //! this convention the texels on both sides of all 12 cube edges agree
 //! (mean difference of log luminance 0.07 against 0.44 to 0.59 for random
 //! permutations of the faces), and flipping or turning any face makes it
-//! worse. The values are linear radiance; texels the capture never hit are
-//! 65,504 (the largest half float) in sky-like directions or black.
+//! worse. The values are linear radiance: the dojo's brightest texel is 1.74
+//! and the brightest of all 8,688 probes of the game is 10,944; none is at the
+//! half float maximum (65,504). Decoders that saturate the wrong endpoint value
+//! (`texture2ddecoder` 0.1.2 does) show such texels, see `bc6h.rs`.
 //!
 //! An equirectangular version is produced by [`CubeTexture::to_equirect`]
 //! (azimuth from the +Z axis towards +X, polar angle from +Y), and
@@ -151,7 +153,7 @@ impl Probe {
         acc.map(|a| (a / n.max(1) as f64) as f32)
     }
 
-    /// Largest texel value below the half-float maximum (which marks texels the capture never hit).
+    /// Largest texel value below 65,000, so that a texel at the half-float maximum does not hide the rest.
     pub fn max_finite(&self) -> f32 {
         self.faces
             .iter()

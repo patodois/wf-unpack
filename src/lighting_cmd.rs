@@ -34,7 +34,7 @@ pub fn probe_cmd(game: &Path, path: &str, out: Option<&Path>) -> Result<()> {
         .filter(|t| t[0] >= 65_000.0 || t[1] >= 65_000.0 || t[2] >= 65_000.0)
         .count();
     println!(
-        "{unhit} of {} texels are at the half-float maximum (no capture ray hit)",
+        "{unhit} of {} texels are at the half-float maximum",
         6 * p.size * p.size
     );
     if let Some(out) = out {

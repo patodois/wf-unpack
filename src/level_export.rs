@@ -346,7 +346,7 @@ fn export_probes(
                 "path": path, "equirect": file, "faceSize": p.size, "mipLevels": p.mip_levels,
                 "meanClamped100": p.mean_clamped(100.0), "maxFinite": p.max_finite(),
                 "convention": "game space (left-handed, y up); centre column looks along +Z, +X is to the right of centre; \
-                               top row is +Y. Flip x for glTF's right-handed space. Texels no capture ray hit are 65504.",
+                               top row is +Y. Flip x for glTF's right-handed space.",
             }))
         });
         match result {
