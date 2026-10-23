@@ -13,6 +13,7 @@ pub mod material;
 pub mod model;
 pub mod packages;
 pub mod pbr;
+pub mod physx;
 pub mod scene;
 pub mod texture;
 pub mod toc;

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -13,8 +14,9 @@ use crate::gltf::{LevelWriter, ModelHandle};
 use crate::gltf::{Material as GltfMaterial, Slot};
 use crate::level::{InstanceRole, LevelDescription, Transform};
 use crate::material::{folder, resolve_path};
-use crate::model::Model;
+use crate::model::{Model, ModelHeader};
 use crate::pbr::{Image, MaterialBaker};
+use crate::physx::{read_shapes, Collider, Shape};
 use crate::scene;
 
 #[derive(Debug, Clone)]
@@ -366,4 +368,295 @@ pub fn export_level(
     report.buffer_bytes = w.buffer_len();
     w.finish(name, out_dir)?;
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Collision
+
+/// The PhysX shapes of the models of a level, indexed like `LevelDescription::models`.
+#[derive(Default)]
+pub struct LevelCollision {
+    pub per_model: Vec<Option<Rc<Vec<Shape>>>>,
+    pub failures: Vec<(String, String)>,
+}
+
+impl LevelCollision {
+    pub fn shapes(&self, model: usize) -> Option<&[Shape]> {
+        self.per_model.get(model)?.as_deref().map(Vec::as_slice)
+    }
+}
+
+/// Reads the PhysX shapes of every model an instance uses (one model at a time).
+pub fn load_collision(game: &Path, d: &LevelDescription) -> Result<LevelCollision> {
+    let mut head = Package::open_in(game, "H.Misc")?.context("no H.Misc")?;
+    let mut body = Package::open_in(game, "B.Misc")?;
+    let mut used = vec![false; d.models.len()];
+    for i in &d.instances {
+        if !i.hidden {
+            used[i.model] = true;
+        }
+    }
+    let mut out = LevelCollision::default();
+    for (m, path) in d.models.iter().enumerate() {
+        if !used[m] {
+            out.per_model.push(None);
+            continue;
+        }
+        let result = (|| -> Result<Vec<Shape>> {
+            let raw = head
+                .read_path(path)?
+                .with_context(|| format!("{path} is not in H.Misc"))?;
+            let header = ModelHeader::parse(&raw)?;
+            if header
+                .physx_shapes
+                .iter()
+                .all(|s| s.len == 0 && s.kind == 0)
+            {
+                return Ok(Vec::new());
+            }
+            let b = match body.as_mut() {
+                Some(p) => p.read_path(path)?.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            read_shapes(&header.physx_shapes, &b)
+        })();
+        match result {
+            Ok(shapes) => out.per_model.push(Some(Rc::new(shapes))),
+            Err(e) => {
+                out.failures.push((path.clone(), format!("{e:#}")));
+                out.per_model.push(None);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let t = Transform {
+        translation: [0.0; 3],
+        rotation: q,
+        scale: [1.0; 3],
+    }
+    .matrix();
+    std::array::from_fn(|i| (0..3).map(|j| t[i][j] * v[j]).sum())
+}
+
+/// Triangles for one shape in the model's space (game handedness).
+fn shape_triangles(s: &Shape) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
+    let place = |p: [f32; 3]| -> [f32; 3] {
+        let r = quat_rotate(s.rotation, p);
+        std::array::from_fn(|k| r[k] + s.translation[k])
+    };
+    match &s.collider {
+        Collider::Empty => None,
+        Collider::Triangles(m) => Some((
+            m.vertices.iter().map(|&p| place(p)).collect(),
+            m.indices.clone(),
+        )),
+        Collider::Convex(m) => {
+            let mut idx = Vec::new();
+            for (corners, _) in &m.polygons {
+                for k in 1..corners.len().saturating_sub(1) {
+                    idx.extend([corners[0], corners[k], corners[k + 1]]);
+                }
+            }
+            Some((m.vertices.iter().map(|&p| place(p)).collect(), idx))
+        }
+        Collider::Box { half_extents: h } => {
+            let verts: Vec<[f32; 3]> = (0..8)
+                .map(|i| {
+                    place([
+                        if i & 1 == 0 { -h[0] } else { h[0] },
+                        if i & 2 == 0 { -h[1] } else { h[1] },
+                        if i & 4 == 0 { -h[2] } else { h[2] },
+                    ])
+                })
+                .collect();
+            let quads = [
+                [0, 1, 3, 2],
+                [4, 6, 7, 5],
+                [0, 2, 6, 4],
+                [1, 5, 7, 3],
+                [0, 4, 5, 1],
+                [2, 3, 7, 6],
+            ];
+            let idx = quads
+                .iter()
+                .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
+                .collect();
+            Some((verts, idx))
+        }
+        Collider::Sphere { radius } => Some(uv_sphere(*radius, 0.0, &place)),
+        Collider::Capsule {
+            radius,
+            half_height,
+        } => Some(uv_sphere(*radius, *half_height, &place)),
+    }
+}
+
+/// A sphere, or a capsule along the local x axis (PhysX's convention) when `half_height` > 0.
+fn uv_sphere(
+    radius: f32,
+    half_height: f32,
+    place: &dyn Fn([f32; 3]) -> [f32; 3],
+) -> (Vec<[f32; 3]>, Vec<u32>) {
+    const RINGS: u32 = 10;
+    const SEGMENTS: u32 = 16;
+    let mut verts = Vec::new();
+    for ring in 0..=RINGS {
+        let phi = std::f32::consts::PI * ring as f32 / RINGS as f32;
+        // The poles are on the x axis; the caps move out by the half height
+        let (x, rr) = (phi.cos() * radius, phi.sin() * radius);
+        let x = x + if ring <= RINGS / 2 {
+            half_height
+        } else {
+            -half_height
+        };
+        for seg in 0..SEGMENTS {
+            let a = std::f32::consts::TAU * seg as f32 / SEGMENTS as f32;
+            verts.push(place([x, rr * a.cos(), rr * a.sin()]));
+        }
+    }
+    let mut idx = Vec::new();
+    for ring in 0..RINGS {
+        for seg in 0..SEGMENTS {
+            let (a, b) = (
+                ring * SEGMENTS + seg,
+                ring * SEGMENTS + (seg + 1) % SEGMENTS,
+            );
+            let (c, e) = (a + SEGMENTS, b + SEGMENTS);
+            idx.extend([a, b, c, b, e, c]);
+        }
+    }
+    (verts, idx)
+}
+
+/// Writes `<name>_collision.gltf`: every model's shapes once, a node per
+/// instance placing them. Returns (shapes drawn, nodes).
+pub fn export_collision(
+    d: &LevelDescription,
+    collision: &LevelCollision,
+    out_dir: &Path,
+    name: &str,
+) -> Result<(usize, usize)> {
+    let mut w = LevelWriter::new();
+    let mut mesh_of: Vec<Option<usize>> = vec![None; d.models.len()];
+    let (mut shapes_drawn, mut nodes) = (0, 0);
+    for inst in &d.instances {
+        if inst.hidden {
+            continue;
+        }
+        let Some(shapes) = collision.shapes(inst.model) else {
+            continue;
+        };
+        let mesh = match mesh_of[inst.model] {
+            Some(m) => m,
+            None => {
+                // All shapes of the model merged into one mesh
+                let (mut verts, mut idx) = (Vec::new(), Vec::new());
+                for s in shapes {
+                    if let Some((v, i)) = shape_triangles(s) {
+                        let base = verts.len() as u32;
+                        verts.extend(v.into_iter().map(|p| [-p[0], p[1], p[2]]));
+                        // Mirroring x flips the winding
+                        idx.extend(
+                            i.as_chunks::<3>()
+                                .0
+                                .iter()
+                                .flat_map(|t| [t[0] + base, t[2] + base, t[1] + base]),
+                        );
+                        shapes_drawn += 1;
+                    }
+                }
+                if idx.is_empty() {
+                    continue;
+                }
+                let m = w.add_simple_mesh(short_name(&d.models[inst.model]), &verts, &idx);
+                mesh_of[inst.model] = Some(m);
+                m
+            }
+        };
+        let mut node = node_for(
+            &inst.transform,
+            &format!("{}{}", inst.scope, short_name(&d.models[inst.model])),
+            json!({"object": inst.object, "model": d.models[inst.model]}),
+        );
+        node["mesh"] = json!(mesh);
+        w.add_node(node);
+        nodes += 1;
+    }
+    w.finish(&format!("{name}_collision"), out_dir)?;
+    Ok((shapes_drawn, nodes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrinks_by_box_filter() {
+        let mut img = Image::new(4, 2);
+        for (i, px) in img.rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            px.copy_from_slice(&[(i * 10) as u8, 100, 0, 255]);
+        }
+        let s = shrink(&img, 2);
+        assert_eq!((s.width, s.height), (2, 1));
+        // Pixels 0, 1, 4, 5 average to (0 + 10 + 40 + 50) / 4 = 25
+        assert_eq!(s.rgba[..4], [25, 100, 0, 255]);
+        // Already small enough: unchanged
+        assert_eq!(shrink(&img, 4).width, 4);
+    }
+
+    #[test]
+    fn matrices_are_column_major() {
+        let m = Transform {
+            translation: [1.0, 2.0, 3.0],
+            ..Transform::IDENTITY
+        }
+        .matrix();
+        let c = column_major(m);
+        assert_eq!(&c[12..], [1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(c[0], 1.0);
+    }
+
+    #[test]
+    fn collision_shapes_become_triangles() {
+        let boxed = Shape {
+            translation: [10.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            collider: Collider::Box {
+                half_extents: [1.0, 2.0, 3.0],
+            },
+        };
+        let (v, i) = shape_triangles(&boxed).unwrap();
+        assert_eq!((v.len(), i.len()), (8, 36));
+        assert!(v
+            .iter()
+            .all(|p| (9.0..=11.0).contains(&p[0]) && p[1].abs() <= 2.0 && p[2].abs() <= 3.0));
+        assert!(i.iter().all(|&k| (k as usize) < v.len()));
+        // Rotating a quarter turn about z swaps the x and y extents
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        let turned = Shape {
+            rotation: [0.0, 0.0, q, q],
+            translation: [0.0; 3],
+            ..boxed.clone()
+        };
+        let (v, _) = shape_triangles(&turned).unwrap();
+        let max_x = v.iter().map(|p| p[0]).fold(f32::MIN, f32::max);
+        assert!((max_x - 2.0).abs() < 1e-5);
+        let sphere = Shape {
+            collider: Collider::Sphere { radius: 2.0 },
+            ..boxed.clone()
+        };
+        let (v, i) = shape_triangles(&sphere).unwrap();
+        assert!(v.iter().all(
+            |p| (((p[0] - 10.0).powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt() - 2.0).abs() < 1e-4
+        ));
+        assert!(i.iter().all(|&k| (k as usize) < v.len()));
+        let empty = Shape {
+            collider: Collider::Empty,
+            ..boxed
+        };
+        assert!(shape_triangles(&empty).is_none());
+    }
 }

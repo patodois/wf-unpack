@@ -146,6 +146,9 @@ enum Command {
         /// Skip texture baking: flat material colours only
         #[arg(long)]
         no_textures: bool,
+        /// Also write <name>_collision.gltf with the models' PhysX shapes
+        #[arg(long)]
+        collision: bool,
         /// Shrink baked textures to at most this many pixels on a side
         #[arg(long)]
         max_texture: Option<u32>,
@@ -154,6 +157,9 @@ enum Command {
     },
     /// Parse every level and summarise failures, with the peak memory used
     CheckLevels {
+        /// Also build every level's description and read the geometry and PhysX shapes of the models it places
+        #[arg(long)]
+        deep: bool,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -217,6 +223,7 @@ fn main() -> Result<()> {
             lod,
             include_hidden,
             no_textures,
+            collision,
             max_texture,
             game,
         } => level_cmd::level_cmd(
@@ -224,6 +231,7 @@ fn main() -> Result<()> {
             &path,
             verbose,
             out.as_deref(),
+            collision,
             &wf_unpack::level_export::ExportOptions {
                 lod,
                 include_hidden,
@@ -231,7 +239,7 @@ fn main() -> Result<()> {
                 max_texture,
             },
         ),
-        Command::CheckLevels { game } => level_cmd::check_levels(&expand_home(&game)),
+        Command::CheckLevels { deep, game } => level_cmd::check_levels(&expand_home(&game), deep),
         Command::Textures { game } => textures_cmd(&expand_home(&game)),
     }
 }

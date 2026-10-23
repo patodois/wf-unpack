@@ -393,6 +393,37 @@ impl LevelWriter {
         }
     }
 
+    /// A mesh of positions and triangles only (collision shapes), stored with
+    /// its own vertices; returns the mesh index.
+    pub fn add_simple_mesh(
+        &mut self,
+        name: &str,
+        positions: &[[f32; 3]],
+        indices: &[u32],
+    ) -> usize {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let bytes: Vec<u8> = positions
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let view = self.push_view(&bytes, Some(34962));
+        let pos = self.push_accessor(view, "VEC3", 5126, positions.len());
+        self.accessors[pos]["min"] = json!(lo);
+        self.accessors[pos]["max"] = json!(hi);
+        let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let view = self.push_view(&bytes, Some(34963));
+        let idx = self.push_accessor(view, "SCALAR", 5125, indices.len());
+        self.meshes.push(json!({"name": name, "primitives": [{"attributes": {"POSITION": pos}, "indices": idx}]}));
+        self.meshes.len() - 1
+    }
+
     /// A mesh over a stored model; `materials[slot]` is the glTF material of each mesh slot.
     pub fn add_mesh(
         &mut self,

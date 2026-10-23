@@ -38,11 +38,13 @@
 //! same conversion as [`crate::scene`] (negate x).
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::bytes::Reader;
+use crate::cache::Package;
 use crate::ee::{self, Attributes, Value};
 use crate::header::CommonHeader;
 use crate::material::{folder, parse_properties, resolve_path};
@@ -156,6 +158,162 @@ impl RawLevel {
             sublevels,
             objects,
             trailing,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static levels (type 30, `.static`)
+
+pub const KIND_STATIC_LEVEL: u16 = 30;
+
+/// One placed model of a static level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticObject {
+    pub position: [f32; 3],
+    /// Quaternion (x, y, z, w).
+    pub rotation: [f32; 4],
+    pub scale: f32,
+    /// Index into [`StaticLevel::models`].
+    pub model: u16,
+    /// Index into [`StaticLevel::natural_paths`] (meaning unknown).
+    pub natural: u16,
+    /// Index into [`StaticLevel::materials`].
+    pub material: u16,
+    /// Index into the level's matrix table (not read).
+    pub matrix: u16,
+}
+
+/// A batch of placed models stored apart from the object list: hub and
+/// mission levels with thousands of props keep them in a `0.static` next to
+/// the level, which its CSG zones refer to (`StaticLevel=`).
+///
+/// The `H.` entry is a [`CommonHeader`] followed by (little-endian):
+///
+/// ```text
+/// u32 n, n x str                   unknown paths
+/// u32 0
+/// u32 object_count
+/// u32 n, n x { u32, u32 }          index group sizes; their sum is the number of u16 "indices 1"
+/// u32 n, n x str                   model paths (absolute)
+/// u32 n, n x str                   unknown paths
+/// u32 n, n x str                   texture names
+/// u32 n, n x str                   texture names
+/// u32 n, n x str                   natural paths
+/// u32 n, n x str                   attribute texts
+/// u32 n, n x str                   light paths
+/// u32 n, n x str                   material paths
+/// u32 indices_2, u32 unknown_1, u32 unknown_2, u32 0, u32 matrices
+/// u32 object_count, u32 0
+/// ```
+///
+/// `B.` holds `object_count` records of 48 bytes (position, 4 unknown bytes,
+/// rotation, scale, 12 unknown bytes), then the tables (`indices 1` and
+/// `indices 2` as u16, `unknown_1` x 20 bytes, `unknown_2` x 48 bytes,
+/// matrices x 36 bytes), then `object_count` records of 176 bytes whose
+/// fields at 120, 128, 130 and 132 are the model, natural, material and
+/// matrix indices (u16).
+///
+/// Learned from Warframe-Exporter's reader for this type; no code was copied.
+#[derive(Debug, Clone)]
+pub struct StaticLevel {
+    pub common: CommonHeader,
+    pub models: Vec<String>,
+    pub natural_paths: Vec<String>,
+    pub attributes: Vec<String>,
+    pub materials: Vec<String>,
+    pub objects: Vec<StaticObject>,
+    /// Pairs of counts, one per group; the groups' `u16` entries follow each other in `group_indices`.
+    pub group_sizes: Vec<(u32, u32)>,
+    pub group_indices: Vec<u16>,
+}
+
+impl StaticLevel {
+    pub fn parse(head: &[u8], body: &[u8]) -> Result<Self> {
+        let common = CommonHeader::parse(head).context("common header")?;
+        ensure!(
+            common.kind == KIND_STATIC_LEVEL,
+            "static level type {} is not supported (only {KIND_STATIC_LEVEL})",
+            common.kind
+        );
+        let mut r = Reader::at(head, common.len)?;
+        let _unknown_paths = string_list(&mut r).context("unknown paths")?;
+        ensure!(r.u32()? == 0, "unexpected value before the object count");
+        let count = r.u32()? as usize;
+        ensure!(count < 1_000_000, "implausible object count {count}");
+        let groups = r.u32()?;
+        ensure!(groups < 1_000_000, "implausible index group count {groups}");
+        let mut indices1 = 0usize;
+        let mut group_sizes = Vec::new();
+        for _ in 0..groups {
+            let (a, b) = (r.u32()?, r.u32()?);
+            indices1 += a as usize + b as usize;
+            group_sizes.push((a, b));
+        }
+        let models = string_list(&mut r).context("model paths")?;
+        let _ = string_list(&mut r).context("unknown paths")?;
+        let _ = string_list(&mut r).context("texture names")?;
+        let _ = string_list(&mut r).context("texture names")?;
+        let natural_paths = string_list(&mut r).context("natural paths")?;
+        let attributes = string_list(&mut r).context("attributes")?;
+        let _lights = string_list(&mut r).context("light paths")?;
+        let materials = string_list(&mut r).context("material paths")?;
+        let indices2 = r.u32()? as usize;
+        let unknown1 = r.u32()? as usize;
+        let unknown2 = r.u32()? as usize;
+        ensure!(r.u32()? == 0, "unexpected value before the matrix count");
+        let matrices = r.u32()? as usize;
+        ensure!(
+            r.u32()? as usize == count,
+            "second object count differs from the first"
+        );
+        ensure!(r.u32()? == 0, "unexpected final value");
+        ensure!(r.rest().is_empty(), "bytes left after the header");
+
+        let mut b = Reader::new(body);
+        let mut objects = Vec::with_capacity(count);
+        for _ in 0..count {
+            let position = [b.f32()?, b.f32()?, b.f32()?];
+            b.skip(4)?;
+            let rotation = b.f32x4()?;
+            let scale = b.f32()?;
+            b.skip(12)?;
+            objects.push(StaticObject {
+                position,
+                rotation,
+                scale,
+                model: 0,
+                natural: 0,
+                material: 0,
+                matrix: 0,
+            });
+        }
+        let group_indices = (0..indices1).map(|_| b.u16()).collect::<Result<Vec<_>>>()?;
+        b.skip(indices2 * 2 + unknown1 * 20 + unknown2 * 48 + matrices * 36)?;
+        for o in &mut objects {
+            let rec = b.bytes(176)?;
+            let u16_at = |i: usize| u16::from_le_bytes([rec[i], rec[i + 1]]);
+            o.model = u16_at(120);
+            o.natural = u16_at(128);
+            o.material = u16_at(130);
+            o.matrix = u16_at(132);
+            ensure!(
+                (o.model as usize) < models.len(),
+                "model index {} out of range ({} models)",
+                o.model,
+                models.len()
+            );
+        }
+        ensure!(b.rest().is_empty(), "bytes left after the object records");
+        Ok(StaticLevel {
+            common,
+            models,
+            natural_paths,
+            attributes,
+            materials,
+            objects,
+            group_sizes,
+            group_indices,
         })
     }
 }
@@ -508,6 +666,10 @@ pub struct LevelDescription {
     pub spawns: Vec<Spawn>,
     /// Objects that were not turned into anything above, by reason or type.
     pub skipped: BTreeMap<String, usize>,
+    /// `.static` files the level's zones refer to (`StaticLevel=`); their
+    /// objects are added with [`LevelDescription::add_static_level`].
+    pub static_levels: Vec<String>,
+    model_index: HashMap<String, usize>,
 }
 
 const CLASS_LIGHT: &str = "/EE/Types/Engine/Light";
@@ -531,6 +693,47 @@ fn vec4(v: Option<Vec<f32>>) -> Option<[f32; 4]> {
 }
 
 impl LevelDescription {
+    /// The index of a model path, adding it on first use.
+    fn model(&mut self, path: &str) -> usize {
+        if let Some(&i) = self.model_index.get(path) {
+            return i;
+        }
+        self.models.push(path.to_string());
+        self.model_index
+            .insert(path.to_string(), self.models.len() - 1);
+        self.models.len() - 1
+    }
+
+    /// Adds the objects of a static level as instances. Every object is added
+    /// once, though a static level lists some of them under several zones.
+    pub fn add_static_level(&mut self, path: &str, s: &StaticLevel) {
+        for (i, o) in s.objects.iter().enumerate() {
+            if s.models[o.model as usize].starts_with("/EE/Editor/") {
+                *self
+                    .skipped
+                    .entry("editor helper mesh".to_string())
+                    .or_default() += 1;
+                continue;
+            }
+            let model = self.model(&s.models[o.model as usize]);
+            self.instances.push(Instance {
+                model,
+                transform: Transform {
+                    translation: o.position,
+                    rotation: o.rotation,
+                    scale: [o.scale; 3],
+                },
+                materials: Vec::new(),
+                object: i,
+                type_path: "(static level)".to_string(),
+                scope: path.to_string(),
+                hidden: false,
+                role: InstanceRole::Prop,
+                lightmap: None,
+            });
+        }
+    }
+
     /// Builds the description of the level at `level_path`.
     pub fn build(level: &RawLevel, level_path: &str, types: &mut TypeResolver) -> Result<Self> {
         let level_folder = folder(level_path);
@@ -544,7 +747,6 @@ impl LevelDescription {
             path: level_path.to_string(),
             ..Default::default()
         };
-        let mut model_index: HashMap<String, usize> = HashMap::new();
         for (i, o) in level.objects.iter().enumerate() {
             let own = o.attrs()?;
             let ty = types.resolve(&resolve_path(level_folder, &o.type_path))?;
@@ -644,10 +846,14 @@ impl LevelDescription {
                         skip("editor helper mesh".to_string());
                         continue;
                     }
-                    let model = *model_index.entry(mesh.clone()).or_insert_with(|| {
-                        d.models.push(mesh.clone());
-                        d.models.len() - 1
-                    });
+                    let model = d.model(&mesh);
+                    if class == CLASS_ZONE {
+                        if let Some(p) = r.path("StaticLevel") {
+                            if !d.static_levels.contains(&p) {
+                                d.static_levels.push(p);
+                            }
+                        }
+                    }
                     let lightmap = match r.get("LightMap") {
                         Some((v, base)) => {
                             let textures: Vec<String> = v
@@ -689,10 +895,38 @@ impl LevelDescription {
     }
 }
 
+/// Reads the level at `level_path` (and the static levels its zones refer
+/// to) from a `Cache.Windows` folder and describes it.
+pub fn load_description(game: &Path, level_path: &str) -> Result<LevelDescription> {
+    let read = |package: &str, path: &str| -> Result<Vec<u8>> {
+        let mut pkg =
+            Package::open_in(game, package)?.with_context(|| format!("no {package} package"))?;
+        Ok(pkg.read_path(path)?.unwrap_or_default())
+    };
+    let head = read("H.AnimRetarget", level_path)?;
+    ensure!(!head.is_empty(), "{level_path} is not in H.AnimRetarget");
+    let body = read("B.AnimRetarget", level_path)?;
+    let raw = RawLevel::parse(&head, &body).with_context(|| level_path.to_string())?;
+    let bin = PackagesBin::load(game)?;
+    let mut types = TypeResolver::new(&bin)?;
+    let mut d = LevelDescription::build(&raw, level_path, &mut types)?;
+    for path in d.static_levels.clone() {
+        let (h, b) = (
+            read("H.AnimRetarget", &path)?,
+            read("B.AnimRetarget", &path)?,
+        );
+        ensure!(!h.is_empty(), "{path} is not in H.AnimRetarget");
+        let s = StaticLevel::parse(&h, &b).with_context(|| path.clone())?;
+        d.add_static_level(&path, &s);
+    }
+    Ok(d)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::header::tests::build;
+    use crate::packages::PackagesBin;
 
     fn str32(out: &mut Vec<u8>, s: &str) {
         out.extend((s.len() as u32).to_le_bytes());
@@ -700,7 +934,10 @@ pub(crate) mod tests {
     }
 
     /// A level with the given (type, position, rotation, scope, attributes) objects.
-    pub fn build_level(objects: &[(&str, [f32; 3], [f32; 4], &str, &str)]) -> (Vec<u8>, Vec<u8>) {
+    /// (type, position, rotation, scope, attributes)
+    pub type TestObject<'a> = (&'a str, [f32; 3], [f32; 4], &'a str, &'a str);
+
+    pub fn build_level(objects: &[TestObject]) -> (Vec<u8>, Vec<u8>) {
         let mut h = build(&[], "", u32::from(KIND_LEVEL));
         for list in [
             &["/Lotus/Types/Game/!index.epkg"][..],
@@ -716,8 +953,8 @@ pub(crate) mod tests {
         h.extend(0u32.to_le_bytes());
         h.extend((objects.len() as u32).to_le_bytes());
         let mut b = Vec::new();
-        for (i, (_, ..)) in objects.iter().enumerate() {
-            b.extend((objects[i].4.len() as u32).to_le_bytes());
+        for o in objects {
+            b.extend((o.4.len() as u32).to_le_bytes());
         }
         for (i, (ty, pos, rot, scope, attrs)) in objects.iter().enumerate() {
             str32(&mut h, ty);
@@ -761,6 +998,299 @@ pub(crate) mod tests {
         assert_eq!(level.objects[1].rotation, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(level.objects[1].attributes, "");
         assert_eq!(level.trailing, [77]);
+    }
+
+    #[test]
+    fn transform_matrix_and_handedness() {
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        let t = Transform {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [0.0, q, 0.0, q], // 90 degrees about y: +z goes to +x
+            scale: [2.0, 1.0, 1.0],
+        };
+        let m = t.matrix();
+        let apply = |m: &[[f32; 4]; 4], p: [f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
+        };
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        // Scale first (x doubles), then rotate (x axis goes to -z), then move
+        assert!(near(apply(&m, [1.0, 0.0, 0.0]), [1.0, 2.0, 1.0]));
+        assert!(near(apply(&m, [0.0, 0.0, 1.0]), [2.0, 2.0, 3.0]));
+        // Mirroring x: the right-handed matrix is S * M * S with S = diag(-1, 1, 1)
+        let rh = t.to_right_handed().matrix();
+        for p in [[1.0, 0.0, 0.0], [0.3, -2.0, 5.0], [0.0, 0.0, 1.0]] {
+            let want = apply(&m, [-p[0], p[1], p[2]]);
+            assert!(near(apply(&rh, p), [-want[0], want[1], want[2]]), "{p:?}");
+        }
+        assert_eq!(Transform::IDENTITY.matrix()[1][1], 1.0);
+    }
+
+    fn type_bin() -> Vec<u8> {
+        crate::packages::tests::build(&[
+            ("/EE/Types/Engine/", "Light", "", None),
+            (
+                "/EE/Types/Engine/",
+                "Decoration",
+                "",
+                Some("UseLightMap=1\n"),
+            ),
+            ("/EE/Types/Engine/", "CsgZone", "", None),
+            ("/EE/Types/Engine/", "PlayerSpawn", "", None),
+            ("/EE/Types/Engine/", "SimpleBlockingVolume", "", None),
+            ("/EE/Types/Alias/", "CsgSheet", "", None),
+            (
+                "/Lotus/Levels/",
+                "DojoLight",
+                "/EE/Types/Engine/Light",
+                Some("AllowPortalWalks=0\n"),
+            ),
+            (
+                "/Lotus/Deco/",
+                "Chair",
+                "/EE/Types/Engine/Decoration",
+                Some("Mesh=Chair.fbx\nMeshScale=0.5\n"),
+            ),
+            (
+                "/Lotus/Deco/",
+                "RedChair",
+                "Chair",
+                Some("Mesh=/Lotus/Other/Red.fbx\n"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn builds_a_description() {
+        let id = [0.0, 0.0, 0.0, 1.0];
+        let (h, b) = build_level(&[
+            (
+                "/EE/Types/Engine/CsgZone",
+                [0.0; 3],
+                id,
+                "/",
+                "Mesh=0_c.fbx\nStaticLevel=0.static\nLightMap={a_clr.png,/L/b_dir.png}\nLightMapCoords={0,0,0.5,0.5}\n",
+            ),
+            (
+                "/EE/Types/Engine/Decoration",
+                [1.0, 2.0, 3.0],
+                id,
+                "/Layer1/",
+                "Mesh=/Lotus/Objects/A.fbx\nOverrideMaterial={/M/One,\"\",Rel}\n",
+            ),
+            (
+                "/EE/Types/Engine/Decoration",
+                [0.0; 3],
+                id,
+                "/Layer1/",
+                "Mesh=/Lotus/Objects/A.fbx\nStartHidden=1\n",
+            ),
+            ("/Lotus/Deco/Chair", [0.0; 3], id, "/", ""),
+            ("/Lotus/Deco/RedChair", [0.0; 3], id, "/", "MeshScale={1,2,3}\n"),
+            (
+                "DojoLight",
+                [4.0, 5.0, 6.0],
+                [0.0, 1.0, 0.0, 0.0],
+                "/Layer3/",
+                "Color={204,220,255,255}\nBrightness=6.25\nLumens=10000\nOn=0\nTexture=t.png\nDirectionalLightDir={1,0,0}\n",
+            ),
+            ("/EE/Types/Engine/PlayerSpawn", [7.0, 1.0, 8.0], id, "/", "Tag=Start\n"),
+            (
+                "/EE/Types/Engine/SimpleBlockingVolume",
+                [0.0; 3],
+                id,
+                "/",
+                "Length=4\nWidth=2\nHeight=3\nRadius=1.5\n",
+            ),
+            (
+                "/EE/Types/Alias/CsgSheet",
+                [0.0; 3],
+                id,
+                "/",
+                "Material=/M/Sheet\nPoints={{0,0,0},{1,0,0},{1,1,0}}\n",
+            ),
+            ("/EE/Types/Engine/Decoration", [0.0; 3], id, "/", "Mesh=/EE/Editor/Darkitect/Objects/X.fbx\n"),
+            ("/Lotus/Unknown/Thing", [0.0; 3], id, "/", "Foo=1\n"),
+        ]);
+        let level = RawLevel::parse(&h, &b).unwrap();
+        let bin = PackagesBin::parse(&type_bin()).unwrap();
+        let mut types = TypeResolver::new(&bin).unwrap();
+        let d = LevelDescription::build(&level, "/Lotus/Levels/X.level", &mut types).unwrap();
+
+        // Models: the zone's mesh is relative to the folder named after the level
+        assert_eq!(
+            d.models,
+            [
+                "/Lotus/Levels/X/0_c.fbx",
+                "/Lotus/Objects/A.fbx",
+                // inherited from the type, relative to the type's folder
+                "/Lotus/Deco/Chair.fbx",
+                "/Lotus/Other/Red.fbx"
+            ]
+        );
+        assert_eq!(d.instances.len(), 5);
+        let zone = &d.instances[0];
+        assert_eq!(zone.role, InstanceRole::Zone);
+        let lm = zone.lightmap.as_ref().unwrap();
+        assert_eq!(lm.textures, ["/Lotus/Levels/X/a_clr.png", "/L/b_dir.png"]);
+        assert_eq!(lm.coords, [0.0, 0.0, 0.5, 0.5]);
+        assert_eq!(d.static_levels, ["/Lotus/Levels/X/0.static"]);
+        let a = &d.instances[1];
+        assert_eq!(a.transform.translation, [1.0, 2.0, 3.0]);
+        assert_eq!(a.materials, ["/M/One", "", "/Lotus/Levels/X/Rel"]);
+        assert!(!a.hidden && d.instances[2].hidden);
+        assert_eq!(d.instances[3].transform.scale, [0.5; 3]);
+        assert_eq!(d.instances[3].model, 2);
+        // The child type overrides Mesh and keeps the scale; the object overrides the scale
+        assert_eq!(d.instances[4].model, 3);
+        assert_eq!(d.instances[4].transform.scale, [1.0, 2.0, 3.0]);
+
+        // The relative type name resolves against the level's folder
+        assert_eq!(d.lights.len(), 1);
+        let l = &d.lights[0];
+        assert_eq!(l.color, Some([204.0, 220.0, 255.0, 255.0]));
+        assert_eq!(
+            (l.brightness, l.lumens, l.on),
+            (Some(6.25), Some(10000.0), Some(false))
+        );
+        assert_eq!(l.texture.as_deref(), Some("/Lotus/Levels/X/t.png"));
+        assert_eq!(l.direction, Some([1.0, 0.0, 0.0]));
+        assert!(l
+            .attributes
+            .contains(&("AllowPortalWalks".into(), "0".into())));
+        assert_eq!(l.position, [4.0, 5.0, 6.0]);
+
+        assert_eq!(d.spawns.len(), 1);
+        assert_eq!(
+            (d.spawns[0].kind, d.spawns[0].tag.as_deref()),
+            (SpawnKind::Player, Some("Start"))
+        );
+        assert_eq!(d.volumes.len(), 1);
+        assert_eq!(
+            (d.volumes[0].length, d.volumes[0].width, d.volumes[0].height),
+            (Some(4.0), Some(2.0), Some(3.0))
+        );
+        assert_eq!(d.sheets.len(), 1);
+        assert_eq!(d.sheets[0].points.len(), 3);
+        assert_eq!(d.sheets[0].material, "/M/Sheet");
+        assert_eq!(d.skipped["editor helper mesh"], 1);
+        assert_eq!(d.skipped["no mesh: /Lotus/Unknown/Thing"], 1);
+
+        // Static levels add their objects once each
+        let s = StaticLevel {
+            common: level.common.clone(),
+            models: vec!["/Lotus/Objects/A.fbx".into(), "/EE/Editor/X.fbx".into()],
+            natural_paths: Vec::new(),
+            attributes: Vec::new(),
+            materials: Vec::new(),
+            objects: vec![
+                StaticObject {
+                    position: [9.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: 3.0,
+                    model: 0,
+                    natural: 0,
+                    material: 0,
+                    matrix: 0,
+                },
+                StaticObject {
+                    position: [0.0; 3],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: 1.0,
+                    model: 1,
+                    natural: 0,
+                    material: 0,
+                    matrix: 0,
+                },
+            ],
+            group_sizes: Vec::new(),
+            group_indices: Vec::new(),
+        };
+        let mut d = d;
+        d.add_static_level("/Lotus/Levels/X/0.static", &s);
+        assert_eq!(d.instances.len(), 6);
+        assert_eq!(d.instances[5].transform.scale, [3.0; 3]);
+        assert_eq!(d.instances[5].model, 1);
+        assert_eq!(d.skipped["editor helper mesh"], 2);
+        assert_eq!(d.models.len(), 4);
+    }
+
+    fn build_static(objects: &[(u16, [f32; 3])], models: &[&str]) -> (Vec<u8>, Vec<u8>) {
+        let mut h = build(&[], "", u32::from(KIND_STATIC_LEVEL));
+        let list = |h: &mut Vec<u8>, items: &[&str]| {
+            h.extend((items.len() as u32).to_le_bytes());
+            for p in items {
+                str32(h, p);
+            }
+        };
+        list(&mut h, &["/unknown"]);
+        h.extend(0u32.to_le_bytes());
+        h.extend((objects.len() as u32).to_le_bytes());
+        h.extend(1u32.to_le_bytes()); // one index group
+        h.extend(2u32.to_le_bytes());
+        h.extend(1u32.to_le_bytes());
+        list(&mut h, models);
+        for _ in 0..4 {
+            list(&mut h, &[]); // unknown paths, two texture lists, natural paths
+        }
+        list(&mut h, &[]); // attributes
+        list(&mut h, &[]); // lights
+        list(&mut h, &["/mat"]);
+        // indices 2, unknown 1, unknown 2, 0, matrices
+        for v in [1u32, 1, 1, 0, 1] {
+            h.extend(v.to_le_bytes());
+        }
+        h.extend((objects.len() as u32).to_le_bytes());
+        h.extend(0u32.to_le_bytes());
+
+        let mut b = Vec::new();
+        for (_, pos) in objects {
+            for v in pos {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0; 4]);
+            for v in [0.0f32, 0.0, 0.0, 1.0, 2.0] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0; 12]);
+        }
+        b.extend([0; 3 * 2]); // group indices (2 + 1)
+        b.extend([0; 2]); // indices 2
+        b.extend([0; 20 + 48 + 36]);
+        for (model, _) in objects {
+            let mut rec = [0u8; 176];
+            rec[120..122].copy_from_slice(&model.to_le_bytes());
+            rec[128..130].copy_from_slice(&7u16.to_le_bytes());
+            b.extend(rec);
+        }
+        (h, b)
+    }
+
+    #[test]
+    fn parses_static_levels() {
+        let (h, b) = build_static(
+            &[(1, [1.0, 2.0, 3.0]), (0, [4.0, 5.0, 6.0])],
+            &["/A.fbx", "/B.fbx"],
+        );
+        let s = StaticLevel::parse(&h, &b).unwrap();
+        assert_eq!(s.models, ["/A.fbx", "/B.fbx"]);
+        assert_eq!(s.materials, ["/mat"]);
+        assert_eq!(s.objects.len(), 2);
+        assert_eq!(
+            (s.objects[0].model, s.objects[0].position),
+            (1, [1.0, 2.0, 3.0])
+        );
+        assert_eq!((s.objects[1].scale, s.objects[1].natural), (2.0, 7));
+        assert_eq!(
+            (s.group_sizes.clone(), s.group_indices.len()),
+            (vec![(2, 1)], 3)
+        );
+        // A model index past the list and trailing bytes are errors
+        let (h2, b2) = build_static(&[(5, [0.0; 3])], &["/A.fbx"]);
+        assert!(StaticLevel::parse(&h2, &b2).is_err());
+        let mut longer = b.clone();
+        longer.push(0);
+        assert!(StaticLevel::parse(&h, &longer).is_err());
+        assert!(StaticLevel::parse(&h, &b[..b.len() - 1]).is_err());
     }
 
     #[test]
