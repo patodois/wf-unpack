@@ -142,6 +142,13 @@ impl PackagesBin {
         let frames = buffer(&mut r, &mut junk).context("frame buffer")?.to_vec();
         let entity_count = r.u32()? as usize;
         r.skip(junk.next(0xF))?;
+        // An entity takes 11 bytes at the least: two empty strings (4 bytes each) and 3 more.
+        // The map is sized from the count, so a corrupt one must not ask for gigabytes
+        ensure!(
+            entity_count <= r.peek().len() / 11,
+            "{entity_count} entities do not fit in the {} bytes left",
+            r.peek().len()
+        );
 
         let dict_len = u32::from_le_bytes(
             sizes
@@ -168,7 +175,7 @@ impl PackagesBin {
             r.skip(1)?;
             let count = r.u32()? as usize;
             ensure!(
-                read + count <= entity_count,
+                count <= entity_count - read,
                 "folders hold more than {entity_count} entities"
             );
             for _ in 0..count {
@@ -176,10 +183,14 @@ impl PackagesBin {
                 r.skip(3)?;
                 let parent = r.str32(4096).context("parent name")?;
                 let text = if bits.next()? {
-                    let len = leb(sizes, &mut size_pos)? as usize;
+                    let len = usize::try_from(leb(sizes, &mut size_pos)?)
+                        .ok()
+                        .with_context(|| format!("text of {folder}{name} is too long"))?;
                     let compressed = bits.next()?;
+                    // frame_pos never passes the frames: the dictionary fits in them and every
+                    // text is checked here
                     ensure!(
-                        frame_pos + len <= frames.len(),
+                        len <= frames.len() - frame_pos,
                         "text of {folder}{name} runs past the frames"
                     );
                     let text = Text {
@@ -421,5 +432,67 @@ pub(crate) mod tests {
 
         // A truncated file fails cleanly
         assert!(PackagesBin::parse(&raw[..raw.len() - 3]).is_err());
+    }
+
+    /// A file of three entities named A, B and C whose buffers are given as they are.
+    fn build_with_buffers(flags: &[u8], sizes: &[u8], frames: &[u8], entity_count: u32) -> Vec<u8> {
+        let seed = 12345u32;
+        let mut junk = Junk(u64::from(seed));
+        let mut out = vec![0u8; 16];
+        for v in [20u32, 46, 1, seed] {
+            out.extend(v.to_le_bytes());
+        }
+        out.resize(out.len() + junk.next(0xFF), 0xAA);
+        out.extend(1u32.to_le_bytes());
+        str32(&mut out, "/EE/Types/Base");
+        out.extend([0, 0]);
+        out.extend(1u32.to_le_bytes()); // one folder
+        for buf in [flags, sizes, frames] {
+            out.resize(out.len() + junk.next(0x3FF), 0xBB);
+            out.extend((buf.len() as u32).to_le_bytes());
+            out.extend(buf);
+        }
+        out.extend(entity_count.to_le_bytes());
+        out.resize(out.len() + junk.next(0xF), 0xCC);
+        str32(&mut out, "/F/");
+        out.push(1);
+        out.extend(3u32.to_le_bytes());
+        for n in ["A", "B", "C"] {
+            str32(&mut out, n);
+            out.extend([0x81, 0, 1]);
+            str32(&mut out, "");
+        }
+        out
+    }
+
+    #[test]
+    fn a_text_length_that_wraps_is_an_error() {
+        // Three uncompressed texts of 5, 2^64 - 3 and 8 bytes after a 5 byte dictionary: the
+        // second one added to the position wrapped around to a small number
+        let mut sizes = 5u32.to_le_bytes().to_vec();
+        sizes.push(5);
+        sizes.extend([0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        sizes.push(8);
+        let mut frames = b"dict0".to_vec();
+        frames.extend([b'x'; 10]);
+        let raw = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, 3);
+        let result = std::panic::catch_unwind(|| PackagesBin::parse(&raw).map(|b| b.len()));
+        let err = result.expect("parse panicked").err().expect("accepted");
+        assert!(err.to_string().contains("runs past the frames"), "{err:#}");
+    }
+
+    #[test]
+    fn an_entity_count_the_file_cannot_hold_is_an_error() {
+        // The count sized a hash map before anything checked it against the file
+        let mut sizes = 5u32.to_le_bytes().to_vec();
+        sizes.extend([1, 1, 1]);
+        let frames = b"dict0abc".to_vec();
+        let raw = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, u32::MAX);
+        let result = std::panic::catch_unwind(|| PackagesBin::parse(&raw).map(|b| b.len()));
+        let err = result.expect("parse panicked").err().expect("accepted");
+        assert!(err.to_string().contains("do not fit"), "{err:#}");
+        // The same file with the right count is fine
+        let ok = build_with_buffers(&[0b0001_0101, 0], &sizes, &frames, 3);
+        assert_eq!(PackagesBin::parse(&ok).unwrap().len(), 3);
     }
 }
