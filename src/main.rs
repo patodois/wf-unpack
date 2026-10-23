@@ -1,4 +1,6 @@
 mod anim_cmd;
+#[cfg(feature = "bridge")]
+mod bridge_cmd;
 mod player_cmd;
 
 use std::collections::BTreeMap;
@@ -134,6 +136,56 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Load a skinned model and its compatible clips through the rewrite-bridge provider
+    /// (`load_animated`) and print what came back
+    #[cfg(feature = "bridge")]
+    BridgeAnim {
+        /// A skinned model path, e.g. /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx
+        model: String,
+        /// Clips whose path matches (substring, or glob with * / ** / ?; `|` separates several)
+        #[arg(long)]
+        animations: String,
+        /// Fail when more clips than this match
+        #[arg(long, default_value_t = wf_unpack::bridge::DEFAULT_MAX_CLIPS)]
+        max_clips: usize,
+        /// Bake the model's textures (slower)
+        #[arg(long)]
+        textures: bool,
+        /// List every clip, not only the first 40
+        #[arg(short, long)]
+        verbose: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Build a level's scenes through the rewrite-bridge provider (`load_scene`) and print the report
+    #[cfg(feature = "bridge")]
+    BridgeScene {
+        /// A .level path, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level
+        level: String,
+        /// Skip texture baking: flat material colours only
+        #[arg(long)]
+        no_textures: bool,
+        /// Shrink baked textures to at most this many pixels on a side
+        #[arg(long)]
+        max_texture: Option<u32>,
+        /// Also place objects that start hidden, and lights that start off
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Build and validate the scenes of every level through the provider (no textures)
+    #[cfg(feature = "bridge")]
+    CheckBridgeScenes {
+        /// Only levels whose path contains this text
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Stop after this many levels
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// List the animation clips of a skeleton ("Tenno" is the Warframe rig), of a skinned
     /// model (those that fit its bones), or describe one clip by its path
     Anim {
@@ -233,6 +285,42 @@ fn main() -> Result<()> {
             filter,
             limit,
         } => check_bridge_cmd(&expand_home(&game), textures, &filter, limit),
+        #[cfg(feature = "bridge")]
+        Command::BridgeAnim {
+            model,
+            animations,
+            max_clips,
+            textures,
+            verbose,
+            game,
+        } => bridge_cmd::bridge_anim_cmd(
+            &expand_home(&game),
+            &model,
+            &animations,
+            max_clips,
+            textures,
+            verbose,
+        ),
+        #[cfg(feature = "bridge")]
+        Command::BridgeScene {
+            level,
+            no_textures,
+            max_texture,
+            include_hidden,
+            game,
+        } => bridge_cmd::bridge_scene_cmd(
+            &expand_home(&game),
+            &level,
+            !no_textures,
+            max_texture,
+            include_hidden,
+        ),
+        #[cfg(feature = "bridge")]
+        Command::CheckBridgeScenes {
+            filter,
+            limit,
+            game,
+        } => bridge_cmd::check_bridge_scenes_cmd(&expand_home(&game), &filter, limit),
         Command::CheckMaterials { game, survey } => {
             check_materials_cmd(&expand_home(&game), survey)
         }

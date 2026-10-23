@@ -3,6 +3,10 @@
 pub mod animation;
 #[cfg(feature = "bridge")]
 pub mod bridge;
+#[cfg(feature = "bridge")]
+pub mod bridge_anim;
+#[cfg(feature = "bridge")]
+pub mod bridge_scene;
 pub mod bytes;
 pub mod cache;
 pub mod clipspec;

@@ -406,6 +406,230 @@ fn static_level_of_a_hub() {
     assert!(listed.iter().all(|&b| b));
 }
 
+#[cfg(feature = "bridge")]
+mod bridge {
+    use super::game_dir;
+    use rewrite_bridge::{
+        AssetKind, Environment, Interpolation, LightKind, Provider, SceneModel, Target,
+    };
+    use wf_unpack::bridge::{animated_id, collision_id, Warframe};
+    use wf_unpack::bridge_scene::SceneOptions;
+
+    const EXCALIBUR: &str = "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx";
+    const SWORD: &str = "/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/";
+    const DOJO: &str = "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level";
+
+    #[test]
+    fn excalibur_with_sword_clips_validates_and_has_root_motion() {
+        let Some(dir) = game_dir() else { return };
+        let wf = Warframe::open(&dir).unwrap().with_textures(false);
+        let id = animated_id(EXCALIBUR, SWORD);
+        let animated = wf.load_animated(&id).unwrap();
+        animated.validate().unwrap();
+        // The Sword folder holds 38 clips that fit Excalibur's bones
+        assert_eq!(animated.animations.len(), 38);
+        let jog_name = format!("{SWORD}JogForward_anim.fbx");
+        let jog = animated.animation(&jog_name).expect("JogForward");
+        assert!((jog.duration_s - 25.0 / 30.0).abs() < 1e-6);
+        // Every bone has a translation and a rotation channel, on the model's own nodes
+        assert_eq!(jog.channels.len(), 162);
+        let root = animated
+            .model
+            .nodes
+            .iter()
+            .position(|n| n.name == "GAME_C1_ROOT")
+            .unwrap();
+        assert_eq!(animated.model.nodes[root].parent, Some(0));
+        let t = jog
+            .channels
+            .iter()
+            .find(|c| c.node == root && c.target == Target::Translation)
+            .unwrap();
+        // Root motion is the root bone's translation track: 26 keys, 3.52 m forward (z is kept)
+        assert_eq!(t.times.len(), 26);
+        assert_eq!(t.interpolation, Interpolation::Linear);
+        assert!((t.values[3 * 25 + 2] - 3.519).abs() < 1e-3);
+        assert!(t.values[2].abs() < 1e-3);
+        // The hip's x is mirrored like the model's bones
+        let hip = animated
+            .model
+            .nodes
+            .iter()
+            .position(|n| n.name == "GAME_C1_HIP1")
+            .unwrap();
+        let rest = animated.model.nodes[hip].translation;
+        let hip_t = jog
+            .channels
+            .iter()
+            .find(|c| c.node == hip && c.target == Target::Translation)
+            .unwrap();
+        assert!(
+            (hip_t.values[0] - rest[0]).abs() < 0.2,
+            "hip x {} against its rest pose {}",
+            hip_t.values[0],
+            rest[0]
+        );
+
+        // The side table: events with their times, and the root motion of the whole clip
+        let info = wf.clip_info(&jog_name).unwrap();
+        assert!(info.events_from_header);
+        let (l, r) = (
+            info.event_time("StepL").unwrap(),
+            info.event_time("StepR").unwrap(),
+        );
+        assert!(
+            (l - 0.05).abs() < 1e-3 && (r - 0.425).abs() < 1e-3,
+            "{l} {r}"
+        );
+        assert!((info.root_translation[2] - 3.519).abs() < 1e-3);
+        assert!((info.duration_s - jog.duration_s).abs() < 1e-6);
+        let start = wf.clip_info(&format!("{SWORD}JumpStart_anim.fbx")).unwrap();
+        assert!(
+            (start.event_time("JumpStartImpulse").unwrap() - 0.4 * start.duration_s).abs() < 1e-5
+        );
+
+        // A clip with no events in its header takes them from its Packages.bin entity
+        let bullet = "/Lotus/Animations/Player/Movement/JumpRollForwardB_anim.fbx";
+        let b = wf.load_animated(&animated_id(EXCALIBUR, bullet)).unwrap();
+        assert_eq!(b.animations.len(), 1);
+        let info = wf.clip_info(bullet).unwrap();
+        assert!(!info.events_from_header);
+        assert!(info.event_time("BulletJumpStart").is_some());
+        assert!(info.event_time("JumpStartImpulse").is_some());
+        assert_eq!(info.rate, Some(0.9));
+    }
+
+    #[test]
+    fn animated_ids_without_a_filter_or_with_a_wide_one() {
+        let Some(dir) = game_dir() else { return };
+        let wf = Warframe::open(&dir)
+            .unwrap()
+            .with_textures(false)
+            .with_max_clips(100);
+        // No suffix: the model alone, equal to `load`
+        let plain = wf.load_animated(EXCALIBUR).unwrap();
+        assert!(plain.animations.is_empty());
+        assert_eq!(plain.model, wf.load(EXCALIBUR).unwrap());
+        // `load` ignores the filter of an animated id
+        assert_eq!(
+            wf.load(&animated_id(EXCALIBUR, SWORD)).unwrap(),
+            plain.model
+        );
+        // Several filters, one per `|`
+        let two = wf
+            .load_animated(&animated_id(
+                EXCALIBUR,
+                &format!("{SWORD}Idle_anim.fbx|{SWORD}Sprint_anim.fbx"),
+            ))
+            .unwrap();
+        assert_eq!(two.animations.len(), 2);
+        // A filter that matches too much is an error that says so
+        let err = wf
+            .load_animated(&animated_id(EXCALIBUR, "/Lotus/Animations/"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("narrow it"), "{err}");
+        // A static model has no skeleton for clips to fit
+        let sword = "/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx";
+        assert!(wf.load_animated(&animated_id(sword, SWORD)).is_err());
+        assert!(wf.load_animated(sword).unwrap().animations.is_empty());
+    }
+
+    #[test]
+    fn the_dojo_is_a_valid_scene_with_collision() {
+        let Some(dir) = game_dir() else { return };
+        let wf = Warframe::open(&dir).unwrap().with_textures(false);
+        let listed = wf.list("ClanObstacleCourseA.level").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, AssetKind::Level);
+        assert_eq!(listed[0].id, DOJO);
+        assert_eq!(listed[0].name, "ClanObstacleCourseA");
+
+        let scene = wf.load_scene(DOJO).unwrap();
+        scene.validate().unwrap();
+        // 1 zone and 498 props: 499 instances of 39 models, so the models are shared
+        assert_eq!(scene.instances.len(), 499);
+        assert_eq!(scene.models.len(), 39);
+        assert!(scene
+            .models
+            .iter()
+            .all(|m| matches!(m, SceneModel::Inline(_))));
+        let used: std::collections::HashSet<_> = scene.instances.iter().map(|i| i.model).collect();
+        assert_eq!(used.len(), 39);
+        // The most used prop is placed 176 times
+        let mut count = vec![0usize; scene.models.len()];
+        for i in &scene.instances {
+            count[i.model] += 1;
+        }
+        assert_eq!(count.iter().max(), Some(&176));
+
+        // Placement is mirrored like the models: x negated against the level's own numbers
+        let d = wf_unpack::level::load_description(&dir, DOJO).unwrap();
+        assert_eq!(d.instances.len(), scene.instances.len());
+        for (i, inst) in scene.instances.iter().enumerate() {
+            let g = d.instances[i].transform.translation;
+            assert_eq!(inst.transform.translation, [-g[0], g[1], g[2]]);
+            let SceneModel::Inline(m) = &scene.models[inst.model] else {
+                panic!()
+            };
+            assert_eq!(m.name, d.models[d.instances[i].model]);
+        }
+
+        // Eight lights in candela: 10000 lm point lights of radius 30 m and one 100 degree spot
+        assert_eq!(scene.lights.len(), 8);
+        let l = &scene.lights[0];
+        assert!((l.intensity - 10000.0 / (4.0 * std::f32::consts::PI)).abs() < 0.01);
+        assert_eq!(l.kind, LightKind::Point { range: Some(30.0) });
+        assert!((l.color[0] - 0.604).abs() < 0.01 && l.color[2] == 1.0);
+        let spot = scene
+            .lights
+            .iter()
+            .find(|l| matches!(l.kind, LightKind::Spot { .. }))
+            .unwrap();
+        let LightKind::Spot {
+            outer_cone_angle, ..
+        } = spot.kind
+        else {
+            unreachable!()
+        };
+        assert!((outer_cone_angle - 50f32.to_radians()).abs() < 1e-5);
+        assert!((spot.intensity - 5000.0 / (4.0 * std::f32::consts::PI)).abs() < 0.01);
+        // The level's sky light colour is black
+        assert_eq!(scene.environment, Some(Environment::Color([0.0; 3])));
+
+        // The collision scene: the zone's 5766-triangle mesh and the props' shapes, as models
+        let c = wf.load_scene(&collision_id(DOJO)).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.instances.len(), 498);
+        assert_eq!(c.models.len(), 38);
+        assert!(c.lights.is_empty() && c.environment.is_none());
+        let zone = c
+            .models
+            .iter()
+            .find_map(|m| match m {
+                SceneModel::Inline(m) if m.name.ends_with("/ClanObstacleCourseA/0_c.fbx") => {
+                    Some(m)
+                }
+                _ => None,
+            })
+            .expect("the zone's collision");
+        assert_eq!(zone.meshes.len(), 1);
+        assert_eq!(zone.meshes[0].name, "triangles");
+        assert_eq!(zone.meshes[0].indices.len() / 3, 5766);
+
+        // The full result carries what the bridge has no place for
+        let full = wf.scene(DOJO, &SceneOptions::default()).unwrap();
+        assert_eq!(full.description.volumes.len(), 4);
+        assert_eq!(full.description.portals.len(), 1);
+        assert_eq!(full.report.instances, 499);
+        assert_eq!(full.report.collision_instances, 498);
+        assert!(full.report.model_failures.is_empty());
+        assert!(full.report.collision_failures.is_empty());
+        assert_eq!(full.scene, scene);
+        assert_eq!(full.collision, c);
+    }
+}
+
 #[test]
 fn the_tenno_movement_values_match_the_known_ones() {
     use wf_unpack::player::Player;
