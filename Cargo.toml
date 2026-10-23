@@ -9,7 +9,7 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-oozextract = "0.5.5"
+oozextract = "0.5.6"
 png = "0.18.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 texture2ddecoder = "0.1.2"
@@ -40,8 +40,3 @@ debug = "line-tables-only"
 # The viewer bakes textures pixel by pixel through the library
 [profile.dev.package.wf-unpack]
 opt-level = 3
-
-# oozextract 0.5.5 on crates.io lacks the fix for valid streams it rejected (lvlvllvlvllvlvl/oozextract#3);
-# use the fixed revision until a release is out (lvlvllvlvllvlvl/oozextract#5)
-[patch.crates-io]
-oozextract = { git = "https://github.com/lvlvllvlvllvlvl/oozextract", rev = "71ca5f5" }
