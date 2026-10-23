@@ -669,7 +669,9 @@ pub fn decode_bc6h_block(data: &[u8], outbuf: &mut [[f32; 3]; 16], signed: bool)
         }
 
         if mi.transformed {
-            let mask = (1 << mi.endpoint_bits) - 1;
+            // Mode 15 has 16-bit endpoints: `1 << 16` would overflow a u16 (and wrap to a zero
+            // mask in release builds, which texture2ddecoder 0.1.2 also does)
+            let mask: u16 = u16::MAX >> (16 - mi.endpoint_bits);
 
             ep_r[ii] = ep_r[ii].overflowing_add(ep_r[0]).0 & mask;
             ep_g[ii] = ep_g[ii].overflowing_add(ep_g[0]).0 & mask;
@@ -900,9 +902,28 @@ mod tests {
     }
 
     #[test]
+    // texture2ddecoder overflows on some invalid random blocks in debug builds, so the comparison
+    // runs in release (`cargo test --release`); `random_blocks_decode_in_debug` covers this crate
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "the reference decoder overflows in debug builds"
+    )]
     fn clamped_output_matches_texture2ddecoder() {
-        // 4096 random blocks cover every mode, valid or not
-        let data = blocks(4096);
+        // 4096 random blocks cover every mode, valid or not, except the one with 16-bit
+        // transformed endpoints: texture2ddecoder 0.1.2 masks those to zero (see the endpoint mask
+        // in `decode_bc6h_block`), so those blocks are switched to a two-bit mode here
+        let mut data = blocks(4096);
+        for block in data.chunks_mut(16) {
+            let mode = if block[0] & 2 != 0 {
+                block[0] & 0x1F
+            } else {
+                block[0] & 3
+            };
+            let mi = &S_BC6H_MODE_INFO[mode as usize];
+            if mi.transformed && mi.endpoint_bits == 16 {
+                block[0] &= !2;
+            }
+        }
         let (w, h) = (4 * 64, 4 * 64);
         let mut reference = vec![0u32; w * h];
         texture2ddecoder::decode_bc6_unsigned(&data, w, h, &mut reference).unwrap();
@@ -915,6 +936,42 @@ mod tests {
             compared += 1;
         }
         assert_eq!(compared, w * h);
+    }
+
+    #[test]
+    fn sixteen_bit_transformed_endpoints_keep_their_value() {
+        // The 16-bit transformed mode with every other bit set: the base endpoint is 0xFFFF and
+        // each 4-bit delta is -1, so the second endpoint is 0xFFFE and the texels that use it (all
+        // indices are 15 apart from the anchor) are as bright as the base. A zero mask (the old
+        // overflow, still in texture2ddecoder 0.1.2) turns that endpoint into 0.
+        let mode = (0..32u8)
+            .find(|&m| {
+                let mi = &S_BC6H_MODE_INFO[m as usize];
+                m & 2 != 0 && mi.transformed && mi.endpoint_bits == 16
+            })
+            .unwrap();
+        let mut block = [0xFFu8; 16];
+        block[0] = 0xE0 | mode;
+        let mut out = [[0.0f32; 3]; 16];
+        decode_bc6h_block(&block, &mut out, false);
+        let base = out[0][0];
+        assert!(base > 1.0, "{out:?}");
+        for texel in &out[1..] {
+            for v in texel {
+                assert!((v - base).abs() / base < 0.01, "{v} vs {base}");
+            }
+        }
+    }
+
+    #[test]
+    fn random_blocks_decode_in_debug() {
+        // Every mode, valid or not, decodes without overflow and to finite values
+        let data = blocks(4096);
+        let (w, h) = (4 * 64, 4 * 64);
+        for signed in [false, true] {
+            let out = decode_bc6h(&data, w, h, signed).unwrap();
+            assert!(out.iter().flatten().all(|v| v.is_finite()));
+        }
     }
 
     #[test]

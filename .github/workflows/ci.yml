@@ -24,6 +24,9 @@ jobs:
       - run: cargo test -p wf-unpack
       # The optional rewrite-bridge provider
       - run: cargo test -p wf-unpack --features bridge
+      # The BC6H comparison against texture2ddecoder only runs in release (the reference
+      # overflows in debug builds)
+      - run: cargo test -p wf-unpack --release --lib bc6h
 
   viewer:
     name: Viewer (macOS)
