@@ -1527,3 +1527,257 @@ fn check_conformance_takes_texture_options_among_the_checkers() {
     assert!(a.contains("2 asset(s) checked"), "{a}");
     assert!(b.contains("1 asset(s) checked"), "{b}");
 }
+
+const ORBITER: &str = "/Lotus/Levels/Hub/PlayerShipInteriorOrbiter.level";
+
+#[test]
+fn the_orbiter_names_a_sky_a_sun_and_gi_volumes() {
+    use wf_unpack::atmosphere::{Atmosphere, SunSource};
+    use wf_unpack::cache::Package;
+    let Some(dir) = game_dir() else { return };
+    let d = wf_unpack::level::load_description(&dir, ORBITER).unwrap();
+    let a = Atmosphere::of(&d);
+    // The sky: the level's own grey sky light colour and a global cube map in the install
+    assert_eq!(a.sky.sky_light_color, Some([128.0, 128.0, 128.0, 255.0]));
+    assert!(a.sky.sky_light_color_set_by_level);
+    assert_eq!(
+        a.sky.global_cube_map.as_deref(),
+        Some("/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr")
+    );
+    let lightmap = Package::open_in(&dir, "H.LightMap").unwrap().unwrap();
+    assert!(lightmap
+        .toc
+        .get(a.sky.global_cube_map.as_deref().unwrap())
+        .is_some());
+    // One directional light: direction, colour, Brightness and Lumens as stored (Lumens = 1600 x Brightness)
+    assert_eq!(a.suns.len(), 1);
+    let sun = &a.suns[0];
+    assert_eq!(
+        sun.source,
+        SunSource::DirectionalLight("/Layer6/Light".into())
+    );
+    assert_eq!(sun.toward_sun_game, Some([-0.758222, 0.599279, 1.078493]));
+    assert_eq!(sun.color, Some([255.0, 245.0, 230.0, 255.0]));
+    assert_eq!((sun.brightness, sun.lumens), (Some(0.75), Some(1200.0)));
+    // In the bridge's space x is negated and the vector has length 1
+    let t = sun.toward_sun.unwrap();
+    assert!(t[0] > 0.0 && t[1] > 0.0 && t[2] > 0.0);
+    assert!((t.iter().map(|c| c * c).sum::<f32>() - 1.0).abs() < 1e-5);
+    // Fog: white, with a distance density and a fog texture
+    let fog = a.fog.as_ref().unwrap();
+    assert_eq!(fog.color, Some([255.0, 255.0, 255.0, 255.0]));
+    assert_eq!(fog.distance_density, Some(0.2));
+    // Three GI volumes; every texture they name is in H.LightMap and the probe file is in H.Misc
+    assert_eq!(a.gi.volumes.len(), 3);
+    assert_eq!(a.gi.volumes[0].indirection_size, Some([36, 15, 42]));
+    assert_eq!(a.gi.volumes[0].cell_size, Some(0.5));
+    assert_eq!(a.gi.volumes[0].band1_scale.len(), 3);
+    for v in &a.gi.volumes {
+        for t in v
+            .textures
+            .iter()
+            .chain(&v.indirection)
+            .chain(&v.fallback_band0)
+            .filter(|t| !t.is_empty())
+        {
+            assert!(lightmap.toc.get(t).is_some(), "{t}");
+        }
+    }
+    let misc = Package::open_in(&dir, "H.Misc").unwrap().unwrap();
+    for p in &a.gi.env_probes_data {
+        assert!(misc.toc.get(p).is_some(), "{p}");
+    }
+    // What is left out is said
+    let left: Vec<_> = a.left_out().iter().map(|l| l.what).collect();
+    assert!(left.contains(&"directional light strength"));
+    assert!(left.contains(&"GI volume probes"));
+}
+
+#[test]
+fn time_of_day_skies_keep_their_keyframes() {
+    use wf_unpack::atmosphere::Atmosphere;
+    let Some(dir) = game_dir() else { return };
+    let d = wf_unpack::level::load_description(
+        &dir,
+        "/Lotus/Levels/TheNewWar2021/PlainsLandscapePostWar.level",
+    )
+    .unwrap();
+    let a = Atmosphere::of(&d);
+    // Two dynamic skies; the first has two keys (day and night) and four illumination keys
+    assert_eq!(a.dynamic_skies.len(), 2);
+    assert_eq!(a.dynamic_skies[0].keys.len(), 2);
+    assert_eq!(a.dynamic_skies[0].illumination_keys.len(), 4);
+    assert_eq!(a.dynamic_skies[0].latitude, Some(-35.0));
+    assert!(a.dynamic_skies[1]
+        .keys
+        .iter()
+        .all(|k| k.time.is_some() && k.sun_color.is_some()));
+    // Their sun is not made up: the left-out list says why
+    let left = a.left_out();
+    assert!(left
+        .iter()
+        .any(|l| l.what == "sun position of a dynamic sky" && l.count == 2));
+}
+
+#[cfg(feature = "bridge")]
+mod sky {
+    use super::{game_dir, ORBITER};
+    use rewrite_bridge::Environment;
+    use wf_unpack::bridge::Warframe;
+    use wf_unpack::bridge_scene::{EnvironmentSource, SceneOptions};
+    use wf_unpack::pbr::srgb_to_linear;
+    use wf_unpack::probe::Probe;
+
+    fn scene(path: &str) -> wf_unpack::bridge_scene::WarframeScene {
+        let dir = game_dir().unwrap();
+        let wf = Warframe::open(&dir).unwrap().with_textures(false);
+        wf.scene(
+            path,
+            &SceneOptions {
+                collision: false,
+                ..SceneOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_orbiters_environment_is_its_deep_space_cube_map() {
+        let Some(dir) = game_dir() else { return };
+        let built = scene(ORBITER);
+        let path = "/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr";
+        let Some(Environment::Equirectangular { image, intensity }) = &built.scene.environment
+        else {
+            panic!("{:?}", built.scene.environment)
+        };
+        assert_eq!(
+            built.report.environment_source,
+            EnvironmentSource::GlobalCubeMap {
+                path: path.into(),
+                intensity: *intensity
+            }
+        );
+        // 128 pixel faces make a 512 x 256 picture, scaled by the cube's largest texel (0.6142578)
+        assert_eq!((image.width, image.height), (512, 256));
+        let probe = Probe::load(&dir, path).unwrap();
+        assert_eq!(*intensity, probe.max_finite());
+        assert!((*intensity - 0.6142578).abs() < 1e-6, "{intensity}");
+        // The picture is the cube within 8-bit sRGB quantisation: for texels above 5 % of the peak
+        // the mean relative error is under 2 %
+        let source = probe.to_bridge_equirect(512, 256);
+        let (mut err, mut n) = (0.0f64, 0usize);
+        for (px, want) in image.rgba.chunks(4).zip(&source) {
+            for k in 0..3 {
+                if want[k] > 0.05 * intensity {
+                    let got = srgb_to_linear(f32::from(px[k]) / 255.0) * intensity;
+                    err += f64::from(((got - want[k]) / want[k]).abs());
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 10_000, "{n}");
+        eprintln!(
+            "mean relative error of the 8-bit picture: {:.4} over {n} values",
+            err / n as f64
+        );
+        assert!(err / (n as f64) < 0.02, "{}", err / n as f64);
+        // The sun is beside the scene, not in it: no directional light in the scene
+        assert!(built
+            .scene
+            .lights
+            .iter()
+            .all(|l| !matches!(l.kind, rewrite_bridge::LightKind::Directional)));
+        assert_eq!(built.atmosphere.suns.len(), 1);
+        built.scene.validate().unwrap();
+    }
+
+    #[test]
+    fn a_level_with_no_picture_keeps_its_flat_sky_and_one_with_a_missing_picture_says_so() {
+        if game_dir().is_none() {
+            return;
+        }
+        // The dojo names no cube map: its (black) sky light colour is the environment
+        let dojo = scene("/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level");
+        assert_eq!(
+            dojo.report.environment_source,
+            EnvironmentSource::SkyLightColor
+        );
+        assert_eq!(dojo.scene.environment, Some(Environment::Color([0.0; 3])));
+        assert!(dojo.report.environment_notes.is_empty());
+        // A level whose cube map is an editor file the install does not have falls back to the
+        // flat colour (or to nothing) and lists the picture it could not use
+        let missing = "/EE/Editor/Darkitect/Materials/IBL/ZarimanGlobalcubemap_cross.hdr";
+        let zariman = scene("/Lotus/Levels/Zariman/AOTZ/AOTZIntShuttleBay.level");
+        assert!(!matches!(
+            zariman.report.environment_source,
+            EnvironmentSource::GlobalCubeMap { .. }
+        ));
+        assert_eq!(
+            zariman.atmosphere.sky.global_cube_map.as_deref(),
+            Some(missing)
+        );
+        assert!(
+            zariman
+                .report
+                .environment_notes
+                .iter()
+                .any(|n| n.starts_with(missing)),
+            "{:?}",
+            zariman.report.environment_notes
+        );
+    }
+
+    #[test]
+    fn the_four_shipped_global_cube_maps_make_valid_pictures() {
+        let Some(dir) = game_dir() else { return };
+        for (path, peak) in [
+            (
+                "/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr",
+                0.6142578,
+            ),
+            (
+                "/EE/Editor/Darkitect/Materials/IBL/LandscapeC_cross.hdr",
+                1.125,
+            ),
+            (
+                "/Lotus/Materials/Cubemaps/DeepSpaceRedGlobal_cross.hdr",
+                0.9472656,
+            ),
+            (
+                "/Lotus/Levels/Backdrops/UranusRegion/1_cross.hdr",
+                0.2998047,
+            ),
+        ] {
+            let probe = Probe::load(&dir, path).unwrap();
+            let env = wf_unpack::bridge_scene::sky_picture(&probe).unwrap();
+            let Environment::Equirectangular { intensity, .. } = &env else {
+                panic!()
+            };
+            assert!((intensity - peak).abs() < 1e-6, "{path}: {intensity}");
+            let scene = rewrite_bridge::Scene {
+                environment: Some(env),
+                ..Default::default()
+            };
+            scene.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn the_atmosphere_command_prints_text_and_json() {
+    let Some(dir) = game_dir() else { return };
+    let game = dir.to_str().unwrap();
+    let text = run_cli(&["atmosphere", ORBITER, "--game", game]);
+    assert!(text.contains("DeepSpaceGlobal_cross.hdr"), "{text}");
+    assert!(text.contains("sun [light /Layer6/Light]"), "{text}");
+    assert!(
+        text.contains("left out: directional light strength x1"),
+        "{text}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run_cli(&["atmosphere", ORBITER, "--game", game, "--json"])).unwrap();
+    assert_eq!(json["suns"][0]["lumens"], 1200.0);
+    assert_eq!(json["gi"]["volumes"].as_array().unwrap().len(), 3);
+    assert_eq!(json["gi"]["volumes"][0]["indirectionSize"][0], 36);
+    assert_eq!(json["leftOut"][0]["what"], "directional light strength");
+}

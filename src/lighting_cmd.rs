@@ -52,6 +52,12 @@ pub fn probe_cmd(game: &Path, path: &str, out: Option<&Path>) -> Result<()> {
         let eq = out.join(format!("{name}_equirect.hdr"));
         fs::write(&eq, radiance_hdr(w, h, &p.to_equirect(w, h))?)?;
         println!("wrote {} ({w}x{h})", eq.display());
+        let br = out.join(format!("{name}_bridge_equirect.hdr"));
+        fs::write(&br, radiance_hdr(w, h, &p.to_bridge_equirect(w, h))?)?;
+        println!(
+            "wrote {} ({w}x{h}), rewrite-bridge's equirectangular convention (x mirrored)",
+            br.display()
+        );
         for (f, face) in p.faces.iter().enumerate() {
             let file = out.join(format!("{name}_{}.hdr", FACE_NAMES[f]));
             fs::write(&file, radiance_hdr(p.size, p.size, face)?)?;
@@ -297,6 +303,263 @@ pub fn palette_cmd(game: &Path, suit: &str) -> Result<()> {
 }
 
 /// Runs over every level: the lightmap pages and probes they name, and the typed settings.
+/// `wf-unpack atmosphere`: what a level says about its sky, sun, ambient light, fog and GI.
+pub fn atmosphere_cmd(game: &Path, path: &str, json: bool) -> Result<()> {
+    use wf_unpack::atmosphere::{Atmosphere, SunSource};
+    let d = load_description(game, path)?;
+    let a = Atmosphere::of(&d);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&a.to_json())?);
+        return Ok(());
+    }
+    println!("{path}");
+    let s = &a.sky;
+    println!(
+        "sky: skyLightColor {:?} ({}), globalCubeMap {:?}, iblCubeMap {:?}, iblImageFile {:?}, backdrop ids {:?}, {} backdrop zones",
+        s.sky_light_color,
+        if s.sky_light_color_set_by_level { "set by the level" } else { "from the type" },
+        s.global_cube_map,
+        s.ibl_cube_map,
+        s.ibl_image_file,
+        s.backdrop_ids,
+        s.backdrop_zones
+    );
+    for sun in &a.suns {
+        let src = match &sun.source {
+            SunSource::DirectionalLight(n) => format!("light {n}"),
+            SunSource::PostProcessInfo => "PostProcessInfo.sunPosition".to_string(),
+        };
+        println!(
+            "sun [{src}]: toward the sun (game) {:?}, (bridge, unit) {:?}, colour {:?}, brightness {:?}, lumens {:?}, sunColor {:?}",
+            sun.toward_sun_game, sun.toward_sun, sun.color, sun.brightness, sun.lumens, sun.sun_color
+        );
+    }
+    for k in &a.dynamic_skies {
+        println!(
+            "dynamic sky: time of day {:?}, rate {:?}, latitude {:?}, declination {:?}, explicit direction {:?} (used: {:?}), {} time-of-day keys, {} illumination keys",
+            k.time_of_day, k.time_rate, k.latitude, k.sun_declination, k.explicit_sun_direction,
+            k.use_explicit_sun_direction, k.keys.len(), k.illumination_keys.len()
+        );
+    }
+    println!("fog: {:?}", a.fog);
+    let ambient = a.zones.iter().filter(|z| z.ambient.is_some()).count();
+    let used = a
+        .zones
+        .iter()
+        .filter(|z| z.ambient.as_ref().is_some_and(|m| m.used == Some(true)))
+        .count();
+    println!(
+        "zones: {}, {ambient} with ambient colours ({used} used), {} with their own fog",
+        a.zones.len(),
+        a.zones.iter().filter(|z| z.fog.is_some()).count()
+    );
+    let g = &a.gi;
+    println!(
+        "GI: {} volumes, enabled {:?}, light probe data {:?}, env probe data {:?}, global probe {:?}, {} lightmapped instances",
+        g.volumes.len(), g.enabled, g.light_probe_data, g.env_probes_data, g.global_probe_position, g.lightmapped_instances
+    );
+    for v in &g.volumes {
+        println!(
+            "  volume at {:?} dimensions {:?} cell {:?} indirection {:?} textures {:?}",
+            v.position, v.dimensions, v.cell_size, v.indirection_size, v.textures
+        );
+    }
+    for l in a.left_out() {
+        println!("left out: {} x{}: {}", l.what, l.count, l.why);
+    }
+    Ok(())
+}
+
+/// `wf-unpack check-atmosphere`: the sky, sun, ambient, fog and GI data of every level.
+pub fn check_atmosphere_cmd(game: &Path) -> Result<()> {
+    use std::collections::BTreeSet;
+    use wf_unpack::atmosphere::{Atmosphere, SunSource};
+    use wf_unpack::cache::Package;
+
+    let started = std::time::Instant::now();
+    let mut head = Package::open(&game.join("H.AnimRetarget.toc"))?;
+    let mut body = Package::open(&game.join("B.AnimRetarget.toc"))?;
+    let levels: Vec<String> = head
+        .toc
+        .entries
+        .iter()
+        .filter(|e| e.path.ends_with(".level"))
+        .map(|e| e.path.clone())
+        .collect();
+    let lightmap = Package::open_in(game, "H.LightMap")?.context("no H.LightMap")?;
+    let misc = Package::open_in(game, "H.Misc")?.context("no H.Misc")?;
+    let bin = wf_unpack::packages::PackagesBin::load(game)?;
+    let mut types = wf_unpack::level::TypeResolver::new(&bin)?;
+
+    let mut failed = 0usize;
+    let mut levels_with = BTreeMap::<&str, usize>::new();
+    let mut count = BTreeMap::<&str, usize>::new();
+    let mut cubes: BTreeSet<(String, bool)> = BTreeSet::new();
+    let mut cube_levels = (0usize, 0usize); // naming a cube, of which the install has it
+    let (mut lpd, mut lpd_present) = (0usize, 0usize);
+    let (mut epd, mut epd_present) = (0usize, 0usize);
+    let (mut tex, mut tex_present) = (0usize, 0usize);
+    let (mut agree, mut compared, mut disagree_levels) = (0usize, 0usize, Vec::new());
+    let mut left: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for path in &levels {
+        let a = (|| -> Result<_> {
+            let h = head.read_path(path)?.unwrap_or_default();
+            let b = body.read_path(path)?.unwrap_or_default();
+            let raw = wf_unpack::level::RawLevel::parse(&h, &b)?;
+            let d = wf_unpack::level::LevelDescription::build(&raw, path, &mut types)?;
+            Ok(Atmosphere::of(&d))
+        })();
+        let Ok(a) = a else {
+            failed += 1;
+            continue;
+        };
+        let mut has = |k: &'static str, n: usize, c: &mut BTreeMap<&'static str, usize>| {
+            if n > 0 {
+                *levels_with.entry(k).or_default() += 1;
+                *c.entry(k).or_default() += n;
+            }
+        };
+        let lights = a
+            .suns
+            .iter()
+            .filter(|s| matches!(s.source, SunSource::DirectionalLight(_)))
+            .count();
+        let pp = a
+            .suns
+            .iter()
+            .filter(|s| s.source == SunSource::PostProcessInfo)
+            .count();
+        has("directional lights", lights, &mut count);
+        has("PostProcessInfo suns", pp, &mut count);
+        has("dynamic skies", a.dynamic_skies.len(), &mut count);
+        has(
+            "dynamic skies with an explicit sun direction",
+            a.dynamic_skies
+                .iter()
+                .filter(|s| s.use_explicit_sun_direction == Some(true))
+                .count(),
+            &mut count,
+        );
+        has(
+            "dynamic skies with time-of-day keys",
+            a.dynamic_skies
+                .iter()
+                .filter(|s| !s.keys.is_empty())
+                .count(),
+            &mut count,
+        );
+        has("GI volumes", a.gi.volumes.len(), &mut count);
+        has("fog", usize::from(a.fog.is_some()), &mut count);
+        has(
+            "zones with ambient colours",
+            a.zones.iter().filter(|z| z.ambient.is_some()).count(),
+            &mut count,
+        );
+        has(
+            "zones that use their ambient",
+            a.zones
+                .iter()
+                .filter(|z| z.ambient.as_ref().is_some_and(|m| m.used == Some(true)))
+                .count(),
+            &mut count,
+        );
+        has(
+            "zones with their own fog",
+            a.zones.iter().filter(|z| z.fog.is_some()).count(),
+            &mut count,
+        );
+        has("backdrop zones", a.sky.backdrop_zones, &mut count);
+        has(
+            "zones naming a backdrop id",
+            usize::from(!a.sky.backdrop_ids.is_empty()),
+            &mut count,
+        );
+        if let Some(c) = &a.sky.global_cube_map {
+            let present = lightmap.toc.get(c).is_some();
+            cubes.insert((c.clone(), present));
+            cube_levels.0 += 1;
+            cube_levels.1 += usize::from(present);
+        }
+        for v in &a.gi.volumes {
+            for t in v
+                .textures
+                .iter()
+                .chain(&v.indirection)
+                .chain(&v.fallback_band0)
+                .filter(|t| !t.is_empty())
+            {
+                tex += 1;
+                tex_present += usize::from(lightmap.toc.get(t).is_some());
+            }
+        }
+        for p in &a.gi.light_probe_data {
+            lpd += 1;
+            lpd_present += usize::from(misc.toc.get(p).is_some());
+        }
+        for p in &a.gi.env_probes_data {
+            epd += 1;
+            epd_present += usize::from(misc.toc.get(p).is_some());
+        }
+        // A PostProcessInfo sun and a directional light that point the same way
+        let pp_dir = a
+            .suns
+            .iter()
+            .find(|s| s.source == SunSource::PostProcessInfo)
+            .and_then(|s| s.toward_sun);
+        if let Some(p) = pp_dir {
+            let dirs: Vec<[f32; 3]> = a
+                .suns
+                .iter()
+                .filter(|s| matches!(s.source, SunSource::DirectionalLight(_)))
+                .filter_map(|s| s.toward_sun)
+                .collect();
+            if !dirs.is_empty() {
+                compared += 1;
+                let best = dirs
+                    .iter()
+                    .map(|d| d[0] * p[0] + d[1] * p[1] + d[2] * p[2])
+                    .fold(-1.0f32, f32::max);
+                if best > 0.99 {
+                    agree += 1;
+                } else if disagree_levels.len() < 5 {
+                    disagree_levels.push((path.clone(), best));
+                }
+            }
+        }
+        for l in a.left_out() {
+            let e = left.entry(l.what).or_default();
+            e.0 += 1;
+            e.1 += l.count;
+        }
+    }
+    println!("{} levels, {failed} failed to describe", levels.len());
+    for (k, n) in &levels_with {
+        println!("  {k}: {} objects in {n} levels", count[k]);
+    }
+    let present = cubes.iter().filter(|(_, p)| *p).count();
+    println!(
+        "global cube maps: {} levels name one ({} of those levels have it in the install); {} distinct pictures, {present} in H.LightMap",
+        cube_levels.0, cube_levels.1, cubes.len()
+    );
+    for (c, p) in &cubes {
+        println!("    {} {c}", if *p { "present" } else { "absent " });
+    }
+    println!("GI volume textures named: {tex}, in H.LightMap {tex_present}; .lpd named {lpd}, in H.Misc {lpd_present}; .epd named {epd}, in H.Misc {epd_present}");
+    println!(
+        "levels with both a PostProcessInfo sun and a directional light: {compared}; the sun position equals a light's direction (cosine above 0.99) in {agree}; others e.g. {disagree_levels:?}"
+    );
+    println!("left out (levels, items):");
+    for (k, (l, n)) in &left {
+        println!("    {k}: {n} in {l} levels");
+    }
+    println!(
+        "{:.1}s, peak memory {}",
+        started.elapsed().as_secs_f64(),
+        crate::level_cmd::peak_rss_text()
+    );
+    Ok(())
+}
+
 pub fn check_lighting_cmd(game: &Path) -> Result<()> {
     use std::collections::BTreeSet;
     use wf_unpack::cache::Package;

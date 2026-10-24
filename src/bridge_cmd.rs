@@ -8,7 +8,7 @@ use anyhow::Result;
 use rewrite_bridge::SceneModel;
 
 use wf_unpack::bridge::{animated_id, Warframe};
-use wf_unpack::bridge_scene::SceneOptions;
+use wf_unpack::bridge_scene::{EnvironmentSource, SceneOptions};
 use wf_unpack::cache::Package;
 use wf_unpack::groupkey::GroupKey;
 use wf_unpack::level::{LevelDescription, RawLevel, StaticLevel, TypeResolver, KIND_LEVEL};
@@ -132,6 +132,29 @@ pub fn bridge_scene_cmd(
         r.invalid_transforms,
         r.lights_left_out
     );
+    println!(
+        "environment from {:?}{}",
+        r.environment_source,
+        if r.environment_notes.is_empty() {
+            String::new()
+        } else {
+            format!("; not usable: {:?}", r.environment_notes)
+        }
+    );
+    let a = &built.atmosphere;
+    println!(
+        "beside the scene (atmosphere): {} suns, {} dynamic skies, fog {}, {} zones, {} GI volumes; left out: {}",
+        a.suns.len(),
+        a.dynamic_skies.len(),
+        a.fog.is_some(),
+        a.zones.len(),
+        a.gi.volumes.len(),
+        a.left_out()
+            .iter()
+            .map(|l| format!("{} x{}", l.what, l.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for (p, why) in r.model_failures.iter().chain(&r.collision_failures) {
         println!("  failed {p}: {why}");
     }
@@ -176,6 +199,9 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
     let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut model_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut left_out: BTreeMap<&'static str, usize> = BTreeMap::new();
+    // Where each scene's environment came from, and the sky pictures that could not be used
+    let mut env_sources: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut env_unusable: BTreeMap<String, usize> = BTreeMap::new();
     for (n, path) in levels.iter().enumerate() {
         if n > 0 && n % 250 == 0 {
             eprintln!(
@@ -216,6 +242,16 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
                 for (why, c) in &r.lights_left_out {
                     *left_out.entry(why).or_default() += c;
                 }
+                *env_sources
+                    .entry(match r.environment_source {
+                        EnvironmentSource::None => "none",
+                        EnvironmentSource::SkyLightColor => "sky light colour",
+                        EnvironmentSource::GlobalCubeMap { .. } => "global cube map",
+                    })
+                    .or_default() += 1;
+                for note in &r.environment_notes {
+                    *env_unusable.entry(note.clone()).or_default() += 1;
+                }
                 for (_, why) in r.model_failures.iter().chain(&r.collision_failures) {
                     let key: String = why.group_key();
                     *model_errors.entry(key).or_default() += 1;
@@ -237,6 +273,10 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
     println!(
         "left out: {lights_out} lights {left_out:?}; {failures_models} models failed ({lost} instances lost), {invalid} invalid transforms"
     );
+    println!("environments: {env_sources:?}");
+    for (note, n) in &env_unusable {
+        println!("  {n:>6} levels name a sky picture that cannot be used: {note}");
+    }
     for (why, n) in &model_errors {
         println!("  {n:>6} model failures: {why}");
     }

@@ -137,6 +137,26 @@ impl Probe {
         out
     }
 
+    /// An equirectangular picture in rewrite-bridge's convention (`Environment::Equirectangular`):
+    /// for a view direction `d` of the bridge's space (+Y up, right-handed, x the game's x
+    /// negated) the texel is at `u = 0.5 + atan2(d.x, -d.z) / 2 pi`, `v = 0.5 - asin(d.y) / pi`,
+    /// rows top to bottom. The cube is sampled in the game's space, so each texel's direction has
+    /// its x negated first.
+    pub fn to_bridge_equirect(&self, width: usize, height: usize) -> Vec<[f32; 3]> {
+        let mut out = Vec::with_capacity(width * height);
+        for y in 0..height {
+            let elevation = std::f32::consts::PI * (0.5 - (y as f32 + 0.5) / height as f32);
+            for x in 0..width {
+                let azimuth = std::f32::consts::TAU * ((x as f32 + 0.5) / width as f32 - 0.5);
+                let c = elevation.cos();
+                // The bridge direction is (c sin az, sin el, -c cos az)
+                let bridge = [c * azimuth.sin(), elevation.sin(), -c * azimuth.cos()];
+                out.push(self.sample([-bridge[0], bridge[1], bridge[2]]));
+            }
+        }
+        out
+    }
+
     /// Mean of all texels (linear) with each channel clamped to `limit`: a few
     /// texels of a lamp or sky are tens of thousands and would swamp a plain mean.
     pub fn mean_clamped(&self, limit: f32) -> [f32; 3] {
@@ -315,6 +335,30 @@ mod tests {
         // +X looks along +X with +Y at the top of the image
         assert_eq!(direction_to_face([1.0, 0.0, 0.0]).0, 0);
         assert_eq!(face_direction(0, 0.0, -1.0), [1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn the_bridge_equirect_looks_at_the_game_cube_with_x_negated() {
+        // One flat colour per face: the face index in the red channel
+        let probe = Probe {
+            size: 2,
+            faces: std::array::from_fn(|f| vec![[f as f32, 0.0, 0.0]; 4]),
+            mip_levels: 1,
+        };
+        let (w, h) = (8, 4);
+        let eq = probe.to_bridge_equirect(w, h);
+        let at = |u: f32, v: f32| eq[((v * h as f32) as usize) * w + (u * w as f32) as usize][0];
+        // The middle of the picture is the bridge's -Z, the game's -Z (face 5)
+        assert_eq!(at(0.5, 0.5), 5.0);
+        // Turning right (toward the bridge's +X) is toward the game's -X (face 1)
+        assert_eq!(at(0.75, 0.5), 1.0);
+        // And left is the game's +X (face 0)
+        assert_eq!(at(0.25, 0.5), 0.0);
+        // The edges of the picture are the bridge's +Z, the game's +Z (face 4)
+        assert_eq!(at(0.0, 0.5), 4.0);
+        // The top row is up (+Y, face 2), the bottom row down (-Y, face 3)
+        assert_eq!(at(0.5, 0.0), 2.0);
+        assert_eq!(at(0.5, 0.99), 3.0);
     }
 
     #[test]

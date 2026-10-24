@@ -419,6 +419,12 @@ pub fn level_cmd(
         for (p, e) in &r.probe_failures {
             println!("probe failed: {p}: {e}");
         }
+        if let Some(p) = &r.sky_written {
+            println!("sky: {p} written as sky_equirect.hdr");
+        }
+        if let Some((p, e)) = &r.sky_failure {
+            println!("sky failed: {p}: {e}");
+        }
         if r.hidden_skipped > 0 {
             println!(
                 "{} instances start hidden and were left out (--include-hidden)",

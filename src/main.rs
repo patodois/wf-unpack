@@ -316,6 +316,21 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Print a level's sky, suns, ambient light, fog and global illumination settings, and what is left out
+    Atmosphere {
+        /// Path inside the packages, e.g. /Lotus/Levels/TheNewWar2021/PlainsLandscapePostWar.level
+        path: String,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Check the sky, sun, ambient, fog and GI data of every level: which named files are in the install, how the suns agree
+    CheckAtmosphere {
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
     /// List the lightmaps a level uses and decode a few texels of each page
     Lightmaps {
         /// Path inside the packages, e.g. /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level
@@ -510,6 +525,12 @@ fn main() -> Result<()> {
         }
         Command::Postprocess { path, json, game } => {
             lighting_cmd::postprocess_cmd(&expand_home(&game), &path, json)
+        }
+        Command::Atmosphere { path, json, game } => {
+            lighting_cmd::atmosphere_cmd(&expand_home(&game), &path, json)
+        }
+        Command::CheckAtmosphere { game } => {
+            lighting_cmd::check_atmosphere_cmd(&expand_home(&game))
         }
         Command::Lightmaps { path, out, game } => {
             lighting_cmd::lightmaps_cmd(&expand_home(&game), &path, out.as_deref())

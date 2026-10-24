@@ -697,6 +697,156 @@ pub struct Portal {
     pub attributes: Vec<(String, String)>,
 }
 
+/// A global-illumination volume (`/EE/Types/Engine/GIVolume`): a box of baked light probes that
+/// lights the props and characters standing in it. The probes are stored as 3D textures (type 175,
+/// `H.LightMap`); this keeps what the object says about them and does not read the voxels.
+#[derive(Debug, Clone, Default)]
+pub struct GiVolume {
+    pub object: usize,
+    pub instance: u32,
+    pub scope: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    /// `Dimensions={x,y,z}`: the box, in metres (unit not stated by the data).
+    pub dimensions: Option<[f32; 3]>,
+    /// `CellSize`: the spacing of the probes.
+    pub cell_size: Option<f32>,
+    /// `GITextures`, absolute paths; an empty entry is an unused slot.
+    pub textures: Vec<String>,
+    /// `IndirectionTexture`, and its size in bricks (`IndirectionTextureSize{X,Y,Z}`).
+    pub indirection: Option<String>,
+    pub indirection_size: Option<[u32; 3]>,
+    /// `FallbackBand0`: the texture used outside the bricks.
+    pub fallback_band0: Option<String>,
+    /// `Band1NormalizationScale` / `Band1NormalizationOffset`: three RGBA rows each.
+    pub band1_scale: Vec<[f32; 4]>,
+    pub band1_offset: Vec<[f32; 4]>,
+    pub enabled: Option<bool>,
+    /// Every attribute as text.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// One keyframe of a [`DynamicSky`] (`TimeOfDayKeys`): the look at an hour of the day. Colours
+/// keep the units of the data (`sunColor`, `fogColor` ... are 0..255, alpha last).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimeOfDayKey {
+    pub time: Option<f32>,
+    pub blend_time: Option<f32>,
+    pub sun_color: Option<[f32; 4]>,
+    pub sun_brightness: Option<f32>,
+    pub sky_sun_brightness: Option<f32>,
+    pub sky_sun_saturation: Option<f32>,
+    pub exposure: Option<f32>,
+    /// `skyLight`: a spherical-harmonics file (`..._sh.hdr`), usually an editor path.
+    pub sky_light: Option<String>,
+    pub sky_light_attenuation: Option<f32>,
+    pub fog_color: Option<[f32; 4]>,
+    pub overcast_color: Option<[f32; 4]>,
+    pub atmosphere_color: Option<[f32; 4]>,
+    pub debug_name: Option<String>,
+    /// Every other field as text.
+    pub other: BTreeMap<String, String>,
+}
+
+/// A time-of-day sky (`/EE/Types/Effects/DynamicSky`, 44 objects in 28 levels): keyframes of
+/// the sun's colour and brightness, the fog and the sky light over a 24 hour day, and the
+/// numbers its script and shader turn into a sun position. The formulas are code, not data.
+#[derive(Debug, Clone, Default)]
+pub struct DynamicSky {
+    pub object: usize,
+    pub instance: u32,
+    pub scope: String,
+    pub time_of_day: Option<f32>,
+    /// `TimeRate`: hours of the day per second, as far as the values (0.0027 = 1/360, the
+    /// script's `_secondsPerHour=360`) show.
+    pub time_rate: Option<f32>,
+    pub latitude: Option<f32>,
+    pub sun_declination: Option<f32>,
+    pub lunar_declination: Option<f32>,
+    pub use_explicit_sun_direction: Option<bool>,
+    /// `ExplicitSunDirection`, in the game's space, not normalised.
+    pub explicit_sun_direction: Option<[f32; 3]>,
+    pub flip_sun_direction: Option<bool>,
+    pub keys: Vec<TimeOfDayKey>,
+    /// `IlluminationKeys`: (hour, illumination) pairs.
+    pub illumination_keys: Vec<(f32, f32)>,
+    pub sky_material: Option<String>,
+    /// `MaterialParams`: the constants of the sky material, by name (`A` to `I`, `Z` ... in the
+    /// levels: the coefficients of the sky's radiance formula, which is in the material's shader),
+    /// each with its `value`, `value1`, ... numbers.
+    pub material_params: Vec<(String, Vec<f32>)>,
+    /// Every attribute as text.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// The RGBA rows of a nested list (`{{r,g,b,a},{...}}`); rows that are not four numbers are dropped.
+fn rows4(v: Option<&Value>) -> Vec<[f32; 4]> {
+    v.map(|v| v.items().iter().filter_map(|r| vec4(r.floats())).collect())
+        .unwrap_or_default()
+}
+
+/// The constants of a `MaterialParams` list: `{{name=A\ntype=Float4\nslot=-1\nvalue=1\nvalue1=2\n},...}`.
+fn material_params(v: &Value) -> Vec<(String, Vec<f32>)> {
+    v.items()
+        .iter()
+        .filter_map(|p| {
+            let name = p.get("name")?.text()?.trim().to_string();
+            let numbers: Vec<f32> = ["value", "value1", "value2", "value3"]
+                .iter()
+                .filter_map(|k| p.get(k)?.float())
+                .collect();
+            Some((name, numbers))
+        })
+        .collect()
+}
+
+impl TimeOfDayKey {
+    fn from_value(v: &Value) -> Self {
+        let f = |k: &str| v.get(k).and_then(Value::float);
+        let c = |k: &str| vec4(v.get(k).and_then(Value::floats));
+        let t = |k: &str| v.get(k).and_then(Value::text).map(|s| s.trim().to_string());
+        let mut key = TimeOfDayKey {
+            time: f("time"),
+            blend_time: f("blendTime"),
+            sun_color: c("sunColor"),
+            sun_brightness: f("sunBrightness"),
+            sky_sun_brightness: f("skySunBrightness"),
+            sky_sun_saturation: f("skySunSaturation"),
+            exposure: f("exposure"),
+            sky_light: t("skyLight").filter(|s| !s.is_empty()),
+            sky_light_attenuation: f("skyLightAttenuation"),
+            fog_color: c("fogColor"),
+            overcast_color: c("overcastColor"),
+            atmosphere_color: c("atmosphereColor"),
+            debug_name: t("debugName"),
+            other: BTreeMap::new(),
+        };
+        const TYPED: [&str; 13] = [
+            "time",
+            "blendTime",
+            "sunColor",
+            "sunBrightness",
+            "skySunBrightness",
+            "skySunSaturation",
+            "exposure",
+            "skyLight",
+            "skyLightAttenuation",
+            "fogColor",
+            "overcastColor",
+            "atmosphereColor",
+            "debugName",
+        ];
+        if let Value::Table(items) = v {
+            for (k, x) in items {
+                if !TYPED.contains(&k.as_str()) {
+                    key.other.insert(k.clone(), x.to_string());
+                }
+            }
+        }
+        key
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvironmentKind {
     /// `LevelInfo`: settings of the whole level.
@@ -726,6 +876,16 @@ pub struct Environment {
     pub backdrop: Option<String>,
     /// Post-processing, exposure, baking and zone lighting settings, typed.
     pub lighting: EnvironmentLighting,
+    /// `LevelInfo.LightProbeData` (a `.lpd` file of baked light probes) and `EnvProbesData`
+    /// (an `.epd` file), absolute paths.
+    pub light_probe_data: Option<String>,
+    pub env_probes_data: Option<String>,
+    /// `LevelInfo.GlobalProbePosition`, in the game's space.
+    pub global_probe_position: Option<[f32; 3]>,
+    /// `LevelInfo.EnableGIVolumes`.
+    pub enable_gi_volumes: Option<bool>,
+    /// `LevelInfo.InitialTimeOfDay`, in hours.
+    pub initial_time_of_day: Option<f32>,
     /// Every attribute as text.
     pub attributes: Vec<(String, String)>,
 }
@@ -762,6 +922,10 @@ pub struct LevelDescription {
     pub spawns: Vec<Spawn>,
     pub environments: Vec<Environment>,
     pub portals: Vec<Portal>,
+    /// Global-illumination volumes (probe boxes), see [`GiVolume`].
+    pub gi_volumes: Vec<GiVolume>,
+    /// Time-of-day skies, see [`DynamicSky`].
+    pub dynamic_skies: Vec<DynamicSky>,
     /// Objects that were not turned into anything above, by reason or type.
     pub skipped: BTreeMap<String, usize>,
     /// `.static` files the level's zones refer to (`StaticLevel=`); their
@@ -777,6 +941,8 @@ pub struct LevelDescription {
 const CLASS_LIGHT: &str = "/EE/Types/Engine/Light";
 const CLASS_ZONE: &str = "/EE/Types/Engine/CsgZone";
 const CLASS_SHEET: &str = "/EE/Types/Alias/CsgSheet";
+const CLASS_GI_VOLUME: &str = "/EE/Types/Engine/GIVolume";
+const CLASS_DYNAMIC_SKY: &str = "/EE/Types/Effects/DynamicSky";
 const CLASS_HLOD: &str = "/EE/Types/Engine/HLODAggregateEntity";
 const CLASS_PORTAL: &str = "/EE/Types/Framework/LevelPortal";
 const CLASS_LEVEL_INFO: &str = "/EE/Types/Engine/LevelInfo";
@@ -1051,6 +1217,11 @@ impl LevelDescription {
                         reflection_map: r.path("ReflectionMap"),
                         backdrop: r.text("BackDropId").map(str::to_string),
                         lighting,
+                        light_probe_data: r.path("LightProbeData"),
+                        env_probes_data: r.path("EnvProbesData"),
+                        global_probe_position: vec3(r.floats("GlobalProbePosition")),
+                        enable_gi_volumes: r.flag("EnableGIVolumes"),
+                        initial_time_of_day: r.float("InitialTimeOfDay"),
                         attributes: r.all_text(),
                     });
                 }
@@ -1082,6 +1253,79 @@ impl LevelDescription {
                     height: r.float("Height"),
                     radius: r.float("Radius"),
                 }),
+                CLASS_GI_VOLUME => {
+                    let indirection_size = match (
+                        r.float("IndirectionTextureSizeX"),
+                        r.float("IndirectionTextureSizeY"),
+                        r.float("IndirectionTextureSizeZ"),
+                    ) {
+                        (Some(x), Some(y), Some(z)) => Some([x as u32, y as u32, z as u32]),
+                        _ => None,
+                    };
+                    d.gi_volumes.push(GiVolume {
+                        object: i,
+                        instance: o.instance,
+                        scope: o.scope.clone(),
+                        position: o.position,
+                        rotation: o.rotation,
+                        dimensions: vec3(r.floats("Dimensions")),
+                        cell_size: r.float("CellSize"),
+                        textures: r.paths("GITextures"),
+                        indirection: r.path("IndirectionTexture"),
+                        indirection_size,
+                        fallback_band0: r.path("FallbackBand0"),
+                        band1_scale: rows4(r.get("Band1NormalizationScale").map(|(v, _)| v)),
+                        band1_offset: rows4(r.get("Band1NormalizationOffset").map(|(v, _)| v)),
+                        enabled: r.flag("Enabled"),
+                        attributes: r.all_text(),
+                    });
+                }
+                CLASS_DYNAMIC_SKY => {
+                    let keys = r
+                        .get("TimeOfDayKeys")
+                        .map(|(v, _)| {
+                            v.items()
+                                .into_iter()
+                                .map(TimeOfDayKey::from_value)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let illumination_keys = r
+                        .get("IlluminationKeys")
+                        .map(|(v, _)| {
+                            v.items()
+                                .iter()
+                                .filter_map(|k| {
+                                    Some((
+                                        k.get("TimeOfDay")?.float()?,
+                                        k.get("Illumination")?.float()?,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    d.dynamic_skies.push(DynamicSky {
+                        object: i,
+                        instance: o.instance,
+                        scope: o.scope.clone(),
+                        time_of_day: r.float("TimeOfDay"),
+                        time_rate: r.float("TimeRate"),
+                        latitude: r.float("Latitude"),
+                        sun_declination: r.float("SunDeclination"),
+                        lunar_declination: r.float("LunarDeclination"),
+                        use_explicit_sun_direction: r.flag("UseExplicitSunDirection"),
+                        explicit_sun_direction: vec3(r.floats("ExplicitSunDirection")),
+                        flip_sun_direction: r.flag("FlipSunDirection"),
+                        keys,
+                        illumination_keys,
+                        sky_material: r.path("SkyMaterial"),
+                        material_params: r
+                            .get("MaterialParams")
+                            .map(|(v, _)| material_params(v))
+                            .unwrap_or_default(),
+                        attributes: r.all_text(),
+                    });
+                }
                 CLASS_HLOD => skip(
                     "HLOD aggregate (a low-detail stand-in; type 108 models are not read)"
                         .to_string(),
@@ -1365,6 +1609,120 @@ pub(crate) mod tests {
                 Some("Mesh=/Lotus/Other/Red.fbx\n"),
             ),
         ])
+    }
+
+    #[test]
+    fn reads_gi_volumes_dynamic_skies_and_the_level_info_extras() {
+        let id = [0.0, 0.0, 0.0, 1.0];
+        let (h, b) = build_level(&[
+            (
+                "/EE/Types/Engine/GIVolume",
+                [1.0, 2.0, 3.0],
+                [0.0, 1.0, 0.0, 0.0],
+                "/Layer2/",
+                "Dimensions={60.5,41.5,58.5}\nCellSize=1.5\nGITextures={0_v.raw,1_vrgb.raw,/L/2_vrgba.raw,\"\"}\n\
+                 IndirectionTexture=3_vi.raw\nIndirectionTextureSizeX=11\nIndirectionTextureSizeY=7\nIndirectionTextureSizeZ=10\n\
+                 FallbackBand0=4_vfb.raw\n\
+                 Band1NormalizationOffset={{0.1,0.2,0.3,0},{-0.5,0.07,-0.5,0},{0,0,0,0}}\n\
+                 Band1NormalizationScale={{0.47,0.42,0.48,0},{1,0.93,1.02,0.5},{0,0,0,0}}\nEnabled=1\n",
+            ),
+            (
+                "/EE/Types/Effects/DynamicSky",
+                [0.0; 3],
+                id,
+                "/Layer9/",
+                "TimeOfDay=23.5\nTimeRate=0.0026670001\nLatitude=-35\nSunDeclination=20\nUseExplicitSunDirection=1\n\
+                 ExplicitSunDirection={-0.2,0.6,1}\nFlipSunDirection=1\nSkyMaterial=/EE/Materials/Sky\n\
+                 MaterialParams={{name=A\ntype=Float4\nslot=-1\nvalue=-1.5\nvalue1=-1.25\nvalue2=-1\nvalue3=0\n},{name=B\ntype=Float\nslot=-1\nvalue=2\n}}\n\
+                 TimeOfDayKeys={{time=6\nblendTime=0\nsunColor={205,111,48,255}\nsunBrightness=0.3\nskyLight=/EE/Sky_sh.hdr\n\
+                 fogColor={112,112,112,255}\ndebugName=day\nwind={0,0}\n},{time=22\nsunBrightness=0.2\n}}\n\
+                 IlluminationKeys={{TimeOfDay=7\nIllumination=0\n},{TimeOfDay=10\nIllumination=1\n}}\n",
+            ),
+            (
+                "/EE/Types/Engine/LevelInfo",
+                [0.0; 3],
+                id,
+                "/",
+                "LightProbeData=0.lpd\nEnvProbesData=/Lotus/Levels/Y/0.epd\nGlobalProbePosition={1,2,3}\nEnableGIVolumes=1\nInitialTimeOfDay=15\n",
+            ),
+        ]);
+        let level = RawLevel::parse(&h, &b).unwrap();
+        let bin = PackagesBin::parse(&type_bin()).unwrap();
+        let mut types = TypeResolver::new(&bin).unwrap();
+        let d = LevelDescription::build(&level, "/Lotus/Levels/X.level", &mut types).unwrap();
+
+        assert_eq!(d.gi_volumes.len(), 1);
+        let v = &d.gi_volumes[0];
+        assert_eq!(v.position, [1.0, 2.0, 3.0]);
+        assert_eq!(v.scope, "/Layer2/");
+        assert_eq!(v.dimensions, Some([60.5, 41.5, 58.5]));
+        assert_eq!(v.cell_size, Some(1.5));
+        // Relative names resolve against the folder named after the level; an empty slot stays empty
+        assert_eq!(
+            v.textures,
+            [
+                "/Lotus/Levels/X/0_v.raw",
+                "/Lotus/Levels/X/1_vrgb.raw",
+                "/L/2_vrgba.raw",
+                ""
+            ]
+        );
+        assert_eq!(v.indirection.as_deref(), Some("/Lotus/Levels/X/3_vi.raw"));
+        assert_eq!(v.indirection_size, Some([11, 7, 10]));
+        assert_eq!(
+            v.fallback_band0.as_deref(),
+            Some("/Lotus/Levels/X/4_vfb.raw")
+        );
+        assert_eq!(v.band1_offset.len(), 3);
+        assert_eq!(v.band1_offset[1], [-0.5, 0.07, -0.5, 0.0]);
+        assert_eq!(v.band1_scale[1], [1.0, 0.93, 1.02, 0.5]);
+        assert_eq!(v.enabled, Some(true));
+        // GI volumes and skies are not "objects that became nothing"
+        assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+
+        assert_eq!(d.dynamic_skies.len(), 1);
+        let k = &d.dynamic_skies[0];
+        assert_eq!(k.time_of_day, Some(23.5));
+        assert_eq!(k.time_rate, Some(0.002667));
+        assert_eq!((k.latitude, k.sun_declination), (Some(-35.0), Some(20.0)));
+        assert_eq!(k.use_explicit_sun_direction, Some(true));
+        assert_eq!(k.explicit_sun_direction, Some([-0.2, 0.6, 1.0]));
+        assert_eq!(k.flip_sun_direction, Some(true));
+        assert_eq!(k.sky_material.as_deref(), Some("/EE/Materials/Sky"));
+        assert_eq!(
+            k.material_params,
+            [
+                ("A".to_string(), vec![-1.5, -1.25, -1.0, 0.0]),
+                ("B".to_string(), vec![2.0])
+            ]
+        );
+        assert_eq!(k.keys.len(), 2);
+        assert_eq!(k.keys[0].time, Some(6.0));
+        assert_eq!(k.keys[0].sun_color, Some([205.0, 111.0, 48.0, 255.0]));
+        assert_eq!(k.keys[0].sun_brightness, Some(0.3));
+        assert_eq!(k.keys[0].sky_light.as_deref(), Some("/EE/Sky_sh.hdr"));
+        assert_eq!(k.keys[0].debug_name.as_deref(), Some("day"));
+        // A field the key does not know stays as text; one it does not set stays None
+        assert_eq!(
+            k.keys[0].other.get("wind").map(String::as_str),
+            Some("{0,0}")
+        );
+        assert_eq!(k.keys[1].sun_color, None);
+        assert_eq!(k.keys[1].sun_brightness, Some(0.2));
+        assert_eq!(k.illumination_keys, [(7.0, 0.0), (10.0, 1.0)]);
+
+        let info = &d.environments[0];
+        assert_eq!(
+            info.light_probe_data.as_deref(),
+            Some("/Lotus/Levels/X/0.lpd")
+        );
+        assert_eq!(
+            info.env_probes_data.as_deref(),
+            Some("/Lotus/Levels/Y/0.epd")
+        );
+        assert_eq!(info.global_probe_position, Some([1.0, 2.0, 3.0]));
+        assert_eq!(info.enable_gi_volumes, Some(true));
+        assert_eq!(info.initial_time_of_day, Some(15.0));
     }
 
     #[test]

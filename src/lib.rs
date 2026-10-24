@@ -2,6 +2,7 @@
 
 pub mod animation;
 pub mod animtree;
+pub mod atmosphere;
 pub mod bc6h;
 #[cfg(feature = "bridge")]
 pub mod bridge;

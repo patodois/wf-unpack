@@ -15,7 +15,9 @@
 //!   Objects with `StartHidden=1` (a script shows them later) are left out; so are lights with
 //!   `On=0`. `SceneOptions::include_hidden` keeps both.
 //! - **Lights.** See [`convert_light`].
-//! - **Environment.** See [`environment`].
+//! - **Environment.** The sky picture the level names as its global cube map, else the level's flat
+//!   sky light colour; see [`scene_environment`]. Sun, ambient, fog and GI are in
+//!   [`WarframeScene::atmosphere`], see [`crate::atmosphere`].
 //! - **Collision.** As a scene of its own, see below.
 //!
 //! The scene is in metres, +Y up, right-handed (the game's left-handed space with x negated,
@@ -52,15 +54,17 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{ensure, Context, Result};
 use rewrite_bridge::{
-    Environment, Instance, Light, LightKind, Material, Mesh, Model, Node, Scene, SceneModel,
+    Environment, Image, Instance, Light, LightKind, Material, Mesh, Model, Node, Scene, SceneModel,
     Transform,
 };
 
+use crate::atmosphere::Atmosphere;
 use crate::bridge::{Warframe, COLLISION_SUFFIX};
 use crate::collision::shape_mesh;
 use crate::ee;
 use crate::level::{self, EnvironmentKind, LevelDescription};
-use crate::pbr::srgb_to_linear;
+use crate::pbr::{linear_to_srgb, srgb_to_linear};
+use crate::probe::Probe;
 
 /// What to build.
 #[derive(Debug, Clone)]
@@ -108,11 +112,31 @@ pub struct SceneReport {
     /// Lights in the scene, and the reasons for the ones left out, with their number.
     pub lights: usize,
     pub lights_left_out: BTreeMap<&'static str, usize>,
+    /// Where the scene's environment came from.
+    pub environment_source: EnvironmentSource,
+    /// What the level names as sky pictures that could not be used, with the reason.
+    pub environment_notes: Vec<String>,
     /// Collision: models, instances and shapes, and models whose shapes could not be read.
     pub collision_models: usize,
     pub collision_instances: usize,
     pub collision_shapes: usize,
     pub collision_failures: Vec<(String, String)>,
+}
+
+/// What a scene's [`Environment`] was made from.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum EnvironmentSource {
+    /// The level gives no sky: the scene has no environment.
+    #[default]
+    None,
+    /// `LightingParams.skyLightColor`, a flat colour.
+    SkyLightColor,
+    /// `LightingParams.globalCubeMap`, a cube map of the sky, as an equirectangular picture.
+    GlobalCubeMap {
+        path: String,
+        /// The picture's `intensity`: the cube map's largest texel (linear radiance).
+        intensity: f32,
+    },
 }
 
 /// The result of [`Warframe::scene`].
@@ -124,6 +148,10 @@ pub struct WarframeScene {
     /// Everything the level places, in the game's own left-handed space: spawn points, portals,
     /// blocking volumes, environment settings, and the objects that became nothing (`skipped`).
     pub description: LevelDescription,
+    /// What the level says about sun, sky, ambient light, fog and global illumination, beside the
+    /// scene (the bridge's `Scene` carries only a sky and point lights), with what was left out
+    /// and why.
+    pub atmosphere: Atmosphere,
     pub report: SceneReport,
 }
 
@@ -251,16 +279,11 @@ pub fn convert_light(l: &level::Light, include_hidden: bool) -> Result<Light, Le
     })
 }
 
-/// The scene's environment: the level's `LevelInfo` `LightingParams.skyLightColor`, a flat
-/// colour.
+/// The scene's flat environment: the level's own `LevelInfo` `LightingParams.skyLightColor`.
 ///
-/// The colour is read as sRGB (0..255, alpha last) and decoded to linear. It is the only
-/// sky-like value in the data that fits the bridge's flat colour: the pictures a level names
-/// (`ReflectionMap`, `BackDropId`) are not decoded, and fog and ambient light are not a sky. The
-/// dojo's is black. The level's fog (`PostProcessInfo.fogColor`, `distanceFogDensity`), each
-/// zone's `AmbientLight` and the rest stay in [`LevelDescription::environments`], in the game's
-/// units. `None` when the level has no `LightingParams.skyLightColor` (most levels do not: 10 of
-/// the first 150 set it).
+/// The colour is read as sRGB (0..255, alpha last) and decoded to linear. Only a colour the level
+/// sets itself counts (the type's black is no statement about the level). The dojo's is black.
+/// `None` when the level does not set one. See [`scene_environment`] for the sky picture.
 pub fn environment(d: &LevelDescription) -> Option<Environment> {
     let info = d
         .environments
@@ -275,6 +298,80 @@ pub fn environment(d: &LevelDescription) -> Option<Environment> {
     let c = params.get("skyLightColor")?.floats()?;
     (c.len() == 4 && c.iter().all(|v| v.is_finite() && (0.0..=255.0).contains(v)))
         .then(|| Environment::Color([0, 1, 2].map(|k| srgb_to_linear(c[k] / 255.0))))
+}
+
+/// A cube map of the sky as the bridge's equirectangular picture: 8-bit sRGB, four times the
+/// cube's face edge wide and half as high, with `intensity` the cube's largest texel, so that
+/// the picture's linear value times `intensity` is the cube's linear radiance within the 8-bit
+/// quantisation (nothing is clipped; the dark end loses the digits an 8-bit sRGB ramp cannot
+/// hold). `None` for a cube that is all black or has no finite texel.
+pub fn sky_picture(probe: &Probe) -> Option<Environment> {
+    let peak = probe.max_finite();
+    if !(peak.is_finite() && peak > 0.0) {
+        return None;
+    }
+    let (width, height) = (probe.size * 4, probe.size * 2);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for t in probe.to_bridge_equirect(width, height) {
+        for c in t {
+            rgba.push((linear_to_srgb(c / peak) * 255.0).round() as u8);
+        }
+        rgba.push(255);
+    }
+    Some(Environment::Equirectangular {
+        image: Image {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+        },
+        intensity: peak,
+    })
+}
+
+/// The scene's environment: the level's global cube map when the install has it, else its flat
+/// sky light colour, else none.
+///
+/// `LightingParams.globalCubeMap` is a BC6H cube map (type 183) of the sky the level was baked
+/// under: nebulae for the deep-space levels, a mountain sky for Duviri, Uranus and its rings for
+/// the Uranus backdrop. Its pixels are the data. That the game's own sky pass draws other
+/// geometry (the skybox meshes of a backdrop level, which the game's code chooses at run time)
+/// is not represented. 543 levels name a global cube map but only 4 of the 10 pictures are in
+/// the install (the rest are editor files that were not shipped), which serve 269 levels; the
+/// others are listed in [`SceneReport::environment_notes`] and fall back to the colour.
+///
+/// Orientation: the cube is in the game's space, so the picture is sampled with each bridge
+/// direction's x negated ([`Probe::to_bridge_equirect`]); checked against the geometry captured in
+/// the Uranus backdrop (see `docs/LIGHTING.md`).
+pub fn scene_environment(
+    wf: &Warframe,
+    d: &LevelDescription,
+    atmosphere: &Atmosphere,
+    report: &mut SceneReport,
+) -> Option<Environment> {
+    if let Some(path) = &atmosphere.sky.global_cube_map {
+        match wf.probe(path) {
+            Ok(probe) => match sky_picture(&probe) {
+                Some(env) => {
+                    if let Environment::Equirectangular { intensity, .. } = &env {
+                        report.environment_source = EnvironmentSource::GlobalCubeMap {
+                            path: path.clone(),
+                            intensity: *intensity,
+                        };
+                    }
+                    return Some(env);
+                }
+                None => report
+                    .environment_notes
+                    .push(format!("{path}: the cube map is black")),
+            },
+            Err(e) => report.environment_notes.push(format!("{path}: {e:#}")),
+        }
+    }
+    let colour = environment(d);
+    if colour.is_some() {
+        report.environment_source = EnvironmentSource::SkyLightColor;
+    }
+    colour
 }
 
 /// How a model fared when it was loaded.
@@ -294,6 +391,7 @@ fn stem(path: &str) -> &str {
 fn build_visuals(
     wf: &Warframe,
     d: &LevelDescription,
+    atmosphere: &Atmosphere,
     opts: &SceneOptions,
     report: &mut SceneReport,
 ) -> Result<Scene> {
@@ -385,7 +483,7 @@ fn build_visuals(
         }
     }
     report.lights = scene.lights.len();
-    scene.environment = environment(d);
+    scene.environment = scene_environment(wf, d, atmosphere, report);
     Ok(scene)
 }
 
@@ -493,8 +591,9 @@ impl Warframe {
             d.path
         );
         let mut report = SceneReport::default();
+        let atmosphere = Atmosphere::of(&d);
         let scene = if opts.visuals {
-            build_visuals(self, &d, opts, &mut report)?
+            build_visuals(self, &d, &atmosphere, opts, &mut report)?
         } else {
             Scene::default()
         };
@@ -513,6 +612,7 @@ impl Warframe {
             scene,
             collision,
             description: d,
+            atmosphere,
             report,
         })
     }
@@ -698,6 +798,11 @@ mod tests {
                 "{skyLightColor={255,128,0,255}}".into(),
             )],
             lighting: Default::default(),
+            light_probe_data: None,
+            env_probes_data: None,
+            global_probe_position: None,
+            enable_gi_volumes: None,
+            initial_time_of_day: None,
         });
         let Some(Environment::Color(c)) = environment(&d) else {
             panic!("no colour")
@@ -705,6 +810,48 @@ mod tests {
         assert_eq!(c[0], 1.0);
         assert!((c[1] - 0.2158).abs() < 1e-3);
         assert_eq!(c[2], 0.0);
+    }
+
+    #[test]
+    fn a_cube_map_becomes_an_equirectangular_picture_scaled_by_its_peak() {
+        // Face f holds 0.05 f on the red channel, and one texel holds the peak, 0.5
+        let mut faces: [Vec<[f32; 3]>; 6] =
+            std::array::from_fn(|f| vec![[0.05 * f as f32, 0.0, 0.0]; 4]);
+        faces[2][0] = [0.5, 0.25, 0.0];
+        let probe = Probe {
+            size: 2,
+            faces,
+            mip_levels: 1,
+        };
+        let Some(Environment::Equirectangular { image, intensity }) = sky_picture(&probe) else {
+            panic!("no picture")
+        };
+        assert_eq!(intensity, 0.5);
+        assert_eq!((image.width, image.height), (8, 4));
+        assert_eq!(image.rgba.len(), 8 * 4 * 4);
+        assert!(image.rgba.chunks(4).all(|p| p[3] == 255));
+        // Decoding the picture and scaling by the intensity gives the cube's radiance back
+        // within the 8-bit quantisation: the middle of the picture looks at the game's -Z (face 5)
+        let at = |x: usize, y: usize| &image.rgba[(y * 8 + x) * 4..][..3];
+        let p = at(4, 2);
+        let red = srgb_to_linear(f32::from(p[0]) / 255.0) * intensity;
+        assert!((red - 0.25).abs() < 0.003, "{red}");
+        // The picture is a valid environment of a valid scene
+        let scene = Scene {
+            environment: Some(Environment::Equirectangular { image, intensity }),
+            ..Scene::default()
+        };
+        scene.validate().unwrap();
+    }
+
+    #[test]
+    fn a_black_cube_map_has_no_picture() {
+        let probe = Probe {
+            size: 2,
+            faces: std::array::from_fn(|_| vec![[0.0; 3]; 4]),
+            mip_levels: 1,
+        };
+        assert!(sky_picture(&probe).is_none());
     }
 
     #[test]

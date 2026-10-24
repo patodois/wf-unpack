@@ -109,6 +109,7 @@ use crate::model::{self, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use crate::packages::PackagesBin;
 use crate::pbr::{self, Baked, MaterialBaker};
 use crate::scene::{self, Scene};
+use crate::texture::TexturePackages;
 use crate::toc::{clip_filter_matches, Entry};
 
 /// The suffix that asks for animation clips: `<model path>?animations=<filter>`.
@@ -158,6 +159,9 @@ pub struct Warframe {
     inner: Mutex<Inner>,
     /// The side table of [`Provider::load_animated`]: clip name to its extra data
     clips: Mutex<BTreeMap<String, ClipInfo>>,
+    /// The baked-lighting textures (`H./B./F.LightMap`), opened on the first scene that names a sky
+    /// picture and kept, so a sweep over levels does not open them for every level
+    lightmaps: Mutex<Option<TexturePackages>>,
 }
 
 struct Inner {
@@ -285,6 +289,7 @@ impl Warframe {
                 characters: HashSet::new(),
             }),
             clips: Mutex::new(BTreeMap::new()),
+            lightmaps: Mutex::new(None),
         })
     }
 
@@ -317,6 +322,20 @@ impl Warframe {
     /// The Warframe game folder.
     pub fn game_dir(&self) -> &Path {
         &self.game
+    }
+
+    /// Decodes a cube map of `H.LightMap` (a reflection probe or a global cube map), opening the
+    /// family's packages once.
+    pub fn probe(&self, path: &str) -> Result<crate::probe::Probe> {
+        let mut guard = self
+            .lightmaps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(TexturePackages::open_family(&self.game, "LightMap")?);
+        }
+        let pk = guard.as_mut().expect("opened above");
+        crate::probe::Probe::from_texture(&pk.load_cube(path)?)
     }
 
     /// The extra data (events, root motion, play rate, Packages.bin entity) of a clip loaded by

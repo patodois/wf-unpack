@@ -9,6 +9,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use crate::atmosphere::Atmosphere;
 use crate::cache::Package;
 use crate::gltf::{LevelWriter, ModelHandle};
 use crate::gltf::{Material as GltfMaterial, Slot};
@@ -75,6 +76,9 @@ pub struct ExportReport {
     pub lightmap_failures: Vec<(String, String)>,
     pub probes_written: usize,
     pub probe_failures: Vec<(String, String)>,
+    /// The global cube map written as `sky_equirect.hdr`, or why it was not.
+    pub sky_written: Option<String>,
+    pub sky_failure: Option<(String, String)>,
 }
 
 /// Halves an image until it fits `max` (a box filter over 2x2 blocks).
@@ -360,6 +364,42 @@ fn export_probes(
     out
 }
 
+/// Decodes the level's global cube map (`LightingParams.globalCubeMap`) to `sky_equirect.hdr` in
+/// the bridge's equirectangular convention, which is also the glTF's space (right-handed, x
+/// mirrored); returns its extras entry.
+fn export_sky(
+    game: &Path,
+    atmosphere: &Atmosphere,
+    out_dir: &Path,
+    report: &mut ExportReport,
+) -> Option<Value> {
+    let path = atmosphere.sky.global_cube_map.as_ref()?;
+    let result = Probe::load(game, path).and_then(|p| {
+        let (w, h) = (p.size * 4, p.size * 2);
+        let file = "sky_equirect.hdr".to_string();
+        fs::write(
+            out_dir.join(&file),
+            radiance_hdr(w, h, &p.to_bridge_equirect(w, h))?,
+        )?;
+        Ok(json!({
+            "path": path, "equirect": file, "faceSize": p.size, "maxFinite": p.max_finite(),
+            "convention": "rewrite-bridge Environment::Equirectangular: for a direction d of the glTF's space (+Y up, right-handed, \
+                           x mirrored from the game's) u = 0.5 + atan2(d.x, -d.z) / 2 pi, v = 0.5 - asin(d.y) / pi from the top; \
+                           linear radiance as stored",
+        }))
+    });
+    match result {
+        Ok(j) => {
+            report.sky_written = Some(path.clone());
+            Some(j)
+        }
+        Err(e) => {
+            report.sky_failure = Some((path.clone(), format!("{e:#}")));
+            None
+        }
+    }
+}
+
 /// What the glTF's `extras` say about the lightmap decode.
 fn lightmap_format_doc() -> Value {
     json!({
@@ -631,6 +671,12 @@ pub fn export_level(
     } else {
         Vec::new()
     };
+    let atmosphere = Atmosphere::of(d);
+    let sky = if opts.probes {
+        export_sky(game, &atmosphere, out_dir, &mut report)
+    } else {
+        None
+    };
     let mut page_list: Vec<&PageFiles> = lm_pages.values().collect();
     page_list.sort_by_key(|p| p.index);
     w.set_scene_extras(json!({
@@ -649,6 +695,8 @@ pub fn export_level(
         })).collect::<Vec<_>>(),
         "lightmapFormat": lightmap_format_doc(),
         "reflectionProbes": probes,
+        "sky": sky,
+        "atmosphere": atmosphere.to_json(),
     }));
     report.buffer_bytes = w.buffer_len();
     w.finish(name, out_dir)?;
