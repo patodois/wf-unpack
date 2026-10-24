@@ -1,5 +1,8 @@
 # wf-unpack
 
+[![rewrite-bridge on crates.io](https://img.shields.io/crates/v/rewrite-bridge.svg?label=rewrite-bridge)](https://crates.io/crates/rewrite-bridge)
+[![rewrite-bridge docs](https://img.shields.io/docsrs/rewrite-bridge?label=docs.rs)](https://docs.rs/rewrite-bridge)
+
 A Rust tool and library that reads Warframe's game data (Digital Extremes' Evolution Engine) from your own
 install, and turns it into things other software understands: glTF 2.0 models, PNG and DDS textures,
 animations, whole levels, and the numbers the Tenno moves with.
@@ -85,7 +88,7 @@ Without the `export` line, write `cargo run --release -- list ...` or `target/re
 instead of `wf-unpack list ...`.
 
 The commands that talk to rewrite-bridge (`check-bridge`, `bridge-anim`, `bridge-scene`, `check-bridge-scenes`,
-`check-conformance`) only exist when built with the `bridge` feature, which downloads rewrite-bridge:
+`check-conformance`) only exist when built with the `bridge` feature, which downloads [rewrite-bridge](https://crates.io/crates/rewrite-bridge) from crates.io:
 
 ```sh
 cargo build --release --features bridge
@@ -196,7 +199,7 @@ shown as `N`). They exit 0 either way. On the Steam build of 2026-10-22:
 | `check-lighting` | reflection probes 8,688 decoded, 22 failed (cubemaps of type 177, which are not probes) |
 | `check-anims` | 24,640 of 24,676 animation files decode; the 36 others are listed per message (see [docs/FORMATS.md](docs/FORMATS.md#animations)) |
 | `check-packages` | 467,795 of 467,795 entities decode |
-| `check-bridge` | the same models as `check-models`: type 102 33,132 of 33,689, type 281 9,013 of 9,057 |
+| `check-bridge` | the same models as `check-models`, except five type-281 skeletons whose rest pose has a NaN scale in the game data (rewrite-bridge 0.2's `Model::validate` rejects those): type 102 33,132 of 33,689, type 281 9,008 of 9,057 |
 | `check-levels` | all 4,601 `.level` and 411 `.static` files parse, 0 fail |
 
 If your numbers are far from these, the game has been updated; open an issue with the version.
@@ -210,9 +213,14 @@ The other game needs none of Warframe's formats. To use it:
 ```toml
 [dependencies]
 wf-unpack = { git = "https://github.com/patodois/wf-unpack", features = ["bridge"] }
-# every provider in one program must name the same rewrite-bridge tag
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
+# crates.io gives every crate in the build the same rewrite-bridge: all 0.2.x requirements share one copy
+rewrite-bridge = "0.2"
 ```
+
+Every crate in one build has to share one copy of rewrite-bridge, or `Warframe` implements a `Provider` that
+your code's `Provider` is not ("multiple different versions of crate `rewrite_bridge`"). From crates.io Cargo does
+that for you: this crate asks for `0.2.1`, your `"0.2"` accepts it, and both resolve to one 0.2.x release. Another
+minor line (`"0.3"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
 
 ```rust
 use rewrite_bridge::Provider;
