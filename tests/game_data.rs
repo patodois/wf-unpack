@@ -497,9 +497,7 @@ fn static_level_of_a_hub() {
 #[cfg(feature = "bridge")]
 mod bridge {
     use super::game_dir;
-    use rewrite_bridge::{
-        AssetKind, Environment, Interpolation, LightKind, Provider, SceneModel, Target,
-    };
+    use rewrite_bridge::{AssetKind, Interpolation, LightKind, Provider, SceneModel, Target};
     use wf_unpack::bridge::{animated_id, collision_id, Warframe};
     use wf_unpack::bridge_scene::SceneOptions;
 
@@ -682,8 +680,9 @@ mod bridge {
         };
         assert!((outer_cone_angle - 50f32.to_radians()).abs() < 1e-5);
         assert!((spot.intensity - 5000.0 / (4.0 * std::f32::consts::PI)).abs() < 0.01);
-        // The level's sky light colour is black
-        assert_eq!(scene.environment, Some(Environment::Color([0.0; 3])));
+        // No environment by default: the data does not say any sky setting is the drawn sky, and
+        // the dojo's black sky light colour is only the engine type's default
+        assert_eq!(scene.environment, None);
 
         // The collision scene: the zone's 5766-triangle mesh and the props' shapes, as models
         let c = wf.load_scene(&collision_id(DOJO)).unwrap();
@@ -1538,8 +1537,14 @@ fn the_orbiter_names_a_sky_a_sun_and_gi_volumes() {
     let d = wf_unpack::level::load_description(&dir, ORBITER).unwrap();
     let a = Atmosphere::of(&d);
     // The sky: the level's own grey sky light colour and a global cube map in the install
+    // The grey sky light colour is not in the level's own table: the level's `LevelInfo` type gives it
     assert_eq!(a.sky.sky_light_color, Some([128.0, 128.0, 128.0, 255.0]));
-    assert!(a.sky.sky_light_color_set_by_level);
+    assert!(!a.sky.sky_light_color_set_by_level);
+    assert_eq!(
+        a.sky.sky_light_color_from_type.as_deref(),
+        Some("/Lotus/Levels/Proc/PlayerShipLevelInfo")
+    );
+    assert_eq!(a.sky.gi_environment_intensity, Some(1.0));
     assert_eq!(
         a.sky.global_cube_map.as_deref(),
         Some("/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr")
@@ -1628,13 +1633,21 @@ mod sky {
     use wf_unpack::pbr::srgb_to_linear;
     use wf_unpack::probe::Probe;
 
-    fn scene(path: &str) -> wf_unpack::bridge_scene::WarframeScene {
+    const DEEP_SPACE: &str = "/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr";
+    const DOJO: &str = "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level";
+    const GATEWAY: &str = "/Lotus/Levels/Duviri/GatewayHandIsland.level";
+
+    fn scene_with(
+        path: &str,
+        lighting_environment: bool,
+    ) -> wf_unpack::bridge_scene::WarframeScene {
         let dir = game_dir().unwrap();
         let wf = Warframe::open(&dir).unwrap().with_textures(false);
         wf.scene(
             path,
             &SceneOptions {
                 collision: false,
+                lighting_environment,
                 ..SceneOptions::default()
             },
         )
@@ -1642,10 +1655,73 @@ mod sky {
     }
 
     #[test]
-    fn the_orbiters_environment_is_its_deep_space_cube_map() {
+    fn no_scene_has_an_environment_unless_asked_and_the_capture_is_beside_it() {
+        if game_dir().is_none() {
+            return;
+        }
+        // The Orbiter names a deep-space capture and a grey sky light colour, and its windows show
+        // a nebula: neither is claimed to be the sky
+        let built = scene_with(ORBITER, false);
+        assert_eq!(built.scene.environment, None);
+        assert_eq!(built.report.environment_source, EnvironmentSource::None);
+        assert_eq!(
+            built.atmosphere.sky.global_cube_map.as_deref(),
+            Some(DEEP_SPACE)
+        );
+        assert_eq!(built.atmosphere.sky.gi_environment_intensity, Some(1.0));
+        // Duviri's picture has weight 0 in the baker
+        let gateway = scene_with(GATEWAY, false);
+        assert_eq!(gateway.scene.environment, None);
+        assert_eq!(gateway.atmosphere.sky.gi_environment_intensity, Some(0.0));
+        assert!(gateway.atmosphere.sky.global_cube_map.is_some());
+    }
+
+    #[test]
+    fn an_inherited_black_sky_light_colour_is_no_environment() {
+        if game_dir().is_none() {
+            return;
+        }
+        // The dojo sets nothing in its own table: the black is the engine type's
+        let d = wf_unpack::level::load_description(&game_dir().unwrap(), DOJO).unwrap();
+        assert!(d
+            .environments
+            .iter()
+            .all(|e| e.sky_light_color_own.is_none()));
+        let a = wf_unpack::atmosphere::Atmosphere::of(&d);
+        assert_eq!(a.sky.sky_light_color, Some([0.0, 0.0, 0.0, 255.0]));
+        assert!(!a.sky.sky_light_color_set_by_level);
+        assert_eq!(a.sky.sky_light_color_from_type, None);
+        // Even when the lighting environment is asked for there is nothing to give
+        let built = scene_with(DOJO, true);
+        assert_eq!(built.scene.environment, None);
+        assert_eq!(built.report.environment_source, EnvironmentSource::None);
+        // No LevelInfo of the install sets a colour in its own table; 183 get one from a content type
+        let mastery = "/Lotus/Levels/Tenno/DojoFive.level";
+        let d = wf_unpack::level::load_description(&game_dir().unwrap(), mastery).unwrap();
+        let a = wf_unpack::atmosphere::Atmosphere::of(&d);
+        assert_eq!(a.sky.sky_light_color, Some([200.0, 200.0, 200.0, 255.0]));
+        assert!(!a.sky.sky_light_color_set_by_level);
+        assert_eq!(
+            a.sky.sky_light_color_from_type.as_deref(),
+            Some("/Lotus/Levels/Proc/MasteryTestLevelInfo")
+        );
+        // By default it is not an environment; asked for, it is that grey (sRGB 200 is 0.578 linear)
+        assert_eq!(scene_with(mastery, false).scene.environment, None);
+        let on = scene_with(mastery, true);
+        let Some(Environment::Color(c)) = on.scene.environment else {
+            panic!("{:?}", on.scene.environment)
+        };
+        assert!((c[0] - 0.578).abs() < 1e-3 && c[0] == c[1] && c[1] == c[2]);
+        assert_eq!(
+            on.report.environment_source,
+            EnvironmentSource::SkyLightColor
+        );
+    }
+
+    #[test]
+    fn on_request_the_orbiters_environment_is_its_deep_space_cube_map() {
         let Some(dir) = game_dir() else { return };
-        let built = scene(ORBITER);
-        let path = "/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr";
+        let built = scene_with(ORBITER, true);
         let Some(Environment::Equirectangular { image, intensity }) = &built.scene.environment
         else {
             panic!("{:?}", built.scene.environment)
@@ -1653,35 +1729,16 @@ mod sky {
         assert_eq!(
             built.report.environment_source,
             EnvironmentSource::GlobalCubeMap {
-                path: path.into(),
+                path: DEEP_SPACE.into(),
                 intensity: *intensity
             }
         );
         // 128 pixel faces make a 512 x 256 picture, scaled by the cube's largest texel (0.6142578)
         assert_eq!((image.width, image.height), (512, 256));
-        let probe = Probe::load(&dir, path).unwrap();
+        let probe = Probe::load(&dir, DEEP_SPACE).unwrap();
         assert_eq!(*intensity, probe.max_finite());
         assert!((*intensity - 0.6142578).abs() < 1e-6, "{intensity}");
-        // The picture is the cube within 8-bit sRGB quantisation: for texels above 5 % of the peak
-        // the mean relative error is under 2 %
-        let source = probe.to_bridge_equirect(512, 256);
-        let (mut err, mut n) = (0.0f64, 0usize);
-        for (px, want) in image.rgba.chunks(4).zip(&source) {
-            for k in 0..3 {
-                if want[k] > 0.05 * intensity {
-                    let got = srgb_to_linear(f32::from(px[k]) / 255.0) * intensity;
-                    err += f64::from(((got - want[k]) / want[k]).abs());
-                    n += 1;
-                }
-            }
-        }
-        assert!(n > 10_000, "{n}");
-        eprintln!(
-            "mean relative error of the 8-bit picture: {:.4} over {n} values",
-            err / n as f64
-        );
-        assert!(err / (n as f64) < 0.02, "{}", err / n as f64);
-        // The sun is beside the scene, not in it: no directional light in the scene
+        // The sun is beside the scene, not in it
         assert!(built
             .scene
             .lights
@@ -1692,22 +1749,12 @@ mod sky {
     }
 
     #[test]
-    fn a_level_with_no_picture_keeps_its_flat_sky_and_one_with_a_missing_picture_says_so() {
+    fn a_missing_picture_is_listed_when_the_environment_is_asked_for() {
         if game_dir().is_none() {
             return;
         }
-        // The dojo names no cube map: its (black) sky light colour is the environment
-        let dojo = scene("/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level");
-        assert_eq!(
-            dojo.report.environment_source,
-            EnvironmentSource::SkyLightColor
-        );
-        assert_eq!(dojo.scene.environment, Some(Environment::Color([0.0; 3])));
-        assert!(dojo.report.environment_notes.is_empty());
-        // A level whose cube map is an editor file the install does not have falls back to the
-        // flat colour (or to nothing) and lists the picture it could not use
         let missing = "/EE/Editor/Darkitect/Materials/IBL/ZarimanGlobalcubemap_cross.hdr";
-        let zariman = scene("/Lotus/Levels/Zariman/AOTZ/AOTZIntShuttleBay.level");
+        let zariman = scene_with("/Lotus/Levels/Zariman/AOTZ/AOTZIntShuttleBay.level", true);
         assert!(!matches!(
             zariman.report.environment_source,
             EnvironmentSource::GlobalCubeMap { .. }
@@ -1728,38 +1775,80 @@ mod sky {
     }
 
     #[test]
-    fn the_four_shipped_global_cube_maps_make_valid_pictures() {
+    fn decoded_cube_maps_are_cached_by_path_and_failures_too() {
         let Some(dir) = game_dir() else { return };
-        for (path, peak) in [
-            (
-                "/Lotus/Materials/Cubemaps/GlobalCubemaps/DeepSpaceGlobal_cross.hdr",
-                0.6142578,
-            ),
+        let wf = Warframe::open(&dir).unwrap().with_textures(false);
+        let a = wf.probe(DEEP_SPACE).unwrap();
+        let b = wf.probe(DEEP_SPACE).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let e1 = wf
+            .probe("/EE/Editor/nothing_cross.hdr")
+            .unwrap_err()
+            .to_string();
+        let e2 = wf
+            .probe("/EE/Editor/nothing_cross.hdr")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e1, e2);
+        assert!(e1.contains("is not in H.LightMap"), "{e1}");
+    }
+
+    /// The 8-bit picture against the float cube, over **all** texels (the mean of the relative
+    /// error of every channel where the cube is not black, and the share of those that come out 0).
+    #[test]
+    fn the_8_bit_picture_is_lossy_at_the_dark_end_and_by_how_much() {
+        let Some(dir) = game_dir() else { return };
+        let mut report = Vec::new();
+        for (path, peak, max_mean) in [
+            (DEEP_SPACE, 0.6142578, 0.05),
             (
                 "/EE/Editor/Darkitect/Materials/IBL/LandscapeC_cross.hdr",
                 1.125,
+                0.01,
             ),
             (
                 "/Lotus/Materials/Cubemaps/DeepSpaceRedGlobal_cross.hdr",
                 0.9472656,
+                0.12,
             ),
             (
                 "/Lotus/Levels/Backdrops/UranusRegion/1_cross.hdr",
                 0.2998047,
+                0.05,
             ),
         ] {
             let probe = Probe::load(&dir, path).unwrap();
             let env = wf_unpack::bridge_scene::sky_picture(&probe).unwrap();
-            let Environment::Equirectangular { intensity, .. } = &env else {
+            let Environment::Equirectangular { image, intensity } = &env else {
                 panic!()
             };
             assert!((intensity - peak).abs() < 1e-6, "{path}: {intensity}");
+            let source = probe.to_bridge_equirect(image.width as usize, image.height as usize);
+            let (mut err, mut n, mut zeroed) = (0.0f64, 0usize, 0usize);
+            for (px, want) in image.rgba.chunks(4).zip(&source) {
+                for k in 0..3 {
+                    if want[k] > 0.0 {
+                        let got = srgb_to_linear(f32::from(px[k]) / 255.0) * intensity;
+                        err += f64::from(((got - want[k]) / want[k]).abs());
+                        zeroed += usize::from(px[k] == 0);
+                        n += 1;
+                    }
+                }
+            }
+            let (mean, zero) = (err / n as f64, zeroed as f64 / n as f64);
+            report.push(format!(
+                "{path}: mean {:.1} %, black {:.1} %",
+                mean * 100.0,
+                zero * 100.0
+            ));
+            assert!(mean < max_mean, "{path}: {mean}");
             let scene = rewrite_bridge::Scene {
                 environment: Some(env),
                 ..Default::default()
             };
             scene.validate().unwrap();
         }
+        eprintln!("{}", report.join("\n"));
     }
 }
 

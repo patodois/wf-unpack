@@ -190,6 +190,10 @@ enum Command {
         /// Also place objects that start hidden, and lights that start off
         #[arg(long)]
         include_hidden: bool,
+        /// Put the level's lighting capture (global cube map, else its own sky light colour) in
+        /// the scene's environment; it is not the sky the game draws
+        #[arg(long)]
+        lighting_environment: bool,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -223,6 +227,9 @@ enum Command {
         /// Stop after this many levels
         #[arg(long)]
         limit: Option<usize>,
+        /// Build each scene with its lighting environment (the global cube map decoded to a picture)
+        #[arg(long)]
+        lighting_environment: bool,
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
@@ -424,6 +431,7 @@ fn main() -> Result<()> {
             no_textures,
             max_texture,
             include_hidden,
+            lighting_environment,
             game,
         } => bridge_cmd::bridge_scene_cmd(
             &expand_home(&game),
@@ -431,6 +439,7 @@ fn main() -> Result<()> {
             !no_textures,
             max_texture,
             include_hidden,
+            lighting_environment,
         ),
         #[cfg(feature = "bridge")]
         Command::CheckConformance {
@@ -453,8 +462,14 @@ fn main() -> Result<()> {
         Command::CheckBridgeScenes {
             filter,
             limit,
+            lighting_environment,
             game,
-        } => bridge_cmd::check_bridge_scenes_cmd(&expand_home(&game), &filter, limit),
+        } => bridge_cmd::check_bridge_scenes_cmd(
+            &expand_home(&game),
+            &filter,
+            limit,
+            lighting_environment,
+        ),
         Command::CheckMaterials { game, survey } => {
             check_materials_cmd(&expand_home(&game), survey)
         }

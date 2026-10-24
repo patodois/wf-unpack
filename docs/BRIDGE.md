@@ -79,7 +79,7 @@ cargo build --release --features bridge
 wf-unpack check-bridge --game $C              # load and validate every model (heavy: see the README)
 wf-unpack check-bridge --game $C --textures   # the same, baking every material
 wf-unpack bridge-anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --animations /Tenno/Movement/MeleeWeapon/Sword/
-wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures]
+wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures] [--lighting-environment]
 wf-unpack check-bridge-scenes --game $C       # build and validate the scenes of every level (no textures)
 wf-unpack player                              # the movement values with units and sources
 wf-unpack check-conformance --id /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx   # check the provider's output against the bridge's conventions
@@ -99,13 +99,13 @@ are not applied to the emissive images.
 
 `check-bridge-scenes` builds the visible and collision scenes of all 4,601 levels without textures and validates
 them: all pass (2,721,966 instances, 27,392 lights, 971,406 collision shapes) in 13 minutes at a peak of
-1.16 GB (the same sweep without the sky pictures peaks at 0.93 GB on the same machine: the extra is
-allocator behaviour around decoding 543 cube maps between large scenes, not a leak, a scene of its own is no larger). 12,747 model loads fail, 11,822 of them for model types the reader does not handle (HLOD and others,
+0.79 GB (with `--lighting-environment`, which decodes the cube map of 543 levels: 12 minutes, 0.83 GB; the
+pictures are cached by path and the packages are opened only on a miss). 12,747 model loads fail, 11,822 of them for model types the reader does not handle (HLOD and others,
 see [LEVELS.md](LEVELS.md)) and the rest for morph targets and a few size mismatches; that drops 55,774 instances, 2 % of
 the total. Of the 39,413 lights, 12,021 are left out: 8,073 switched off at the start, 552 directional, 2,599
-without `Lumens` and 797 without `Color`. Environments: 269 levels get a sky picture (the global cube
-map), 3,418 the flat sky light colour (almost all black) and 914 none; 274 levels name a cube map the install
-does not have (`environments` in the command's output).
+without `Lumens` and 797 without `Color`. By default no scene has an environment; with
+`--lighting-environment` 269 levels get the cube map picture, 41 the grey a content type gives and 4,291
+none, and 274 levels name a cube map the install does not have (`environments` in the command's output).
 
 **Conventions** (the bridge's, which Warframe's data is converted to): metres, +Y up, right-handed, a
 model's front faces +Z. Warframe's space is left-handed with the same up and front; negating x converts
@@ -181,21 +181,23 @@ rotation and `MeshScale` turned right-handed. The dojo is 499 instances of 39 mo
   lights without `Lumens` or `Color`, and directional lights (`Directional=1`; the data gives lumens, the
   bridge wants lux; their direction and colour are in `WarframeScene::atmosphere`). Area-light boxes (`Length`, `Width`, `Height`), projection textures, `.ies` profiles and
   falloff are not represented.
-- **Environment.** The level's `LightingParams.globalCubeMap`, when the install has the picture, becomes
-  `Environment::Equirectangular`: the cube's six faces resampled to a picture four times the face edge wide
-  (512 x 256 for the 128 px cube maps), 8-bit sRGB in the bridge's convention (x mirrored, the middle column
-  is -Z), with `intensity` the cube's largest texel, so that the linear picture times `intensity` is the
-  game's radiance without clipping (relative, like emissive values: 1.0 is the game's 1.0). That picture is
-  the level's environment capture, which the baker weights by `giEnvironmentIntensity` (0.2 or 0 on most `LevelInfo` objects
-  whose picture is in the install, 1.0 on 26), not necessarily everything the game draws behind
-  it (skybox meshes of a backdrop level are separate levels the game code chooses; Duviri's panorama is a
-  stock one whose sun is not the level's, see [LIGHTING.md](LIGHTING.md)); the weight is in
-  `Atmosphere::sky`, not applied. 543 levels name a global cube map; 4 of
-  the 10 pictures are in the install (Duviri's mountain sky, two deep-space nebulae, Uranus), which serve
-  269 levels. The others fall back to `Environment::Color`, the level's own `LightingParams.skyLightColor`
-  (decoded from sRGB; black in the dojo; only a colour the level sets itself counts, the type's black does
-  not), else `None`. `SceneReport::environment_source` says which, and `environment_notes` lists a named
-  picture that could not be used and why (`check-bridge-scenes` counts them).
+- **Environment.** None by default. The level's `LightingParams.globalCubeMap` and `skyLightColor` are
+  lighting inputs of the baker (`giEnvironmentIntensity` weights the picture: 0 in all of Duviri's levels, 0.2
+  or 1.0 for the deep-space ones), the data does not say either is the sky the game draws, and the bridge's
+  `Environment` becomes a skybox and scene lighting in a host, so the scene does not claim it. 4,647 of the
+  4,830 `LevelInfo` objects carry only the engine type's black (it is no statement of the level; none sets
+  `skyLightColor` in its own table and 183 get one from a content type). The capture and the colour are in
+  `WarframeScene::atmosphere` (`Atmosphere::sky`, with `giEnvironmentIntensity`); the float picture is
+  `Warframe::probe(path)` (decoded once per path and cached; the packages are opened on a miss and
+  dropped), the glTF export's `sky_equirect.hdr`. On request, `SceneOptions::lighting_environment`
+  (`--lighting-environment`) puts the lighting capture in `Scene::environment`: the cube map as
+  `Environment::Equirectangular` (512 x 256 for the 128 px cubes, 8-bit sRGB in the bridge's convention,
+  x mirrored, the middle column -Z), `intensity` the cube's largest texel (the scale of the coding, not
+  a sky brightness; mean relative error over all texels 1.0 %, 0.9 %, 8.7 % and 1.7 % for the four
+  pictures in the install, [LIGHTING.md](LIGHTING.md)), else the colour a content type or the level gives,
+  else none; `SceneReport::environment_source` says which and `environment_notes` lists a named picture
+  that could not be used. 543 levels name a global cube map, 4 of the 10 pictures are in the install and
+  serve 269 levels.
 - **Sun, ambient light, fog and global illumination are beside the scene**, in
   `WarframeScene::atmosphere` ([`Atmosphere`](LIGHTING.md), `wf_unpack::atmosphere`): the suns with
   direction (the vector as stored, and unit length in the bridge's space), colour, `Brightness` and `Lumens`;

@@ -60,7 +60,7 @@ pub fn write(scene: &Scene, name: &str, materials: &[Material], out_dir: &Path) 
     write_animated(scene, name, materials, &[], out_dir)
 }
 
-/// Like [`write`], plus glTF animations driving the skeleton's bones.
+/// Like [`write()`], plus glTF animations driving the skeleton's bones.
 pub fn write_animated(
     scene: &Scene,
     name: &str,

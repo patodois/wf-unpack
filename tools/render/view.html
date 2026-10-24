@@ -33,7 +33,7 @@
 //   lscale   multiplies those lights (default 1)
 //   m2 m2c   a second glTF drawn as wireframe (collision shapes)
 //   sky      1: draw the level's global cube map (sky_equirect.hdr, rewrite-bridge's equirectangular convention) behind
-//            the level, with a bright disc at the direction of its first directional light (the sun's direction only: the
+//            the level; it is the level's lighting capture, not shown to be the sky the game draws, with a bright disc at the direction of its first directional light (the sun's direction only: the
 //            data gives no strength, so the disc's brightness is not data); skyexp scales the picture (default 1)
 //   skylight 1: with sky=1, also light the level from the sky picture (image-based lighting; the strength is the picture's
 //            own radiance times env, an assumption of this viewer)

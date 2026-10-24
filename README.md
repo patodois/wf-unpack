@@ -172,7 +172,7 @@ wf-unpack check-levels --deep --game $C   # + descriptions, level geometry and P
 
 # Sky, sun, ambient light, fog and GI of a level, with what the data does not say (--json for the glTF extras' form)
 wf-unpack atmosphere /Lotus/Levels/Hub/PlayerShipInteriorOrbiter.level [--json]
-wf-unpack check-atmosphere --game $C      # every level: named files in the install, how the suns agree; 10 s and 0.45 GB
+wf-unpack check-atmosphere --game $C      # every level: named files in the install, how the suns agree; 9 s and 0.5 GB
 
 # Lighting: reflection probe (type 183) to HDR files, post-process settings, lightmap pages, Warframe default colours
 wf-unpack probe /Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr -o out/
@@ -247,8 +247,8 @@ The commands that exercise the provider (build with `--features bridge`):
 wf-unpack check-bridge --game $C              # HEAVY: load and validate every model (42,746); 45 s, 0.3 GB
 wf-unpack check-bridge --game $C --textures   # the same, baking every material: about an hour, 1 GB (1,000 models took 90 s)
 wf-unpack bridge-anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --animations /Tenno/Movement/MeleeWeapon/Sword/
-wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures]
-wf-unpack check-bridge-scenes --game $C       # HEAVY: build and validate the scenes of every level (no textures): 13 minutes, 1.2 GB
+wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures] [--lighting-environment]
+wf-unpack check-bridge-scenes --game $C       # HEAVY: build and validate the scenes of every level (no textures): 13 minutes, 0.8 GB
 wf-unpack player                              # the movement values with units and sources
 ```
 

@@ -82,6 +82,7 @@ pub fn bridge_scene_cmd(
     textures: bool,
     max_texture: Option<u32>,
     include_hidden: bool,
+    lighting_environment: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let wf = Warframe::open(game)?
@@ -91,6 +92,7 @@ pub fn bridge_scene_cmd(
         level,
         &SceneOptions {
             include_hidden,
+            lighting_environment,
             ..SceneOptions::default()
         },
     )?;
@@ -177,7 +179,12 @@ pub fn bridge_scene_cmd(
 
 /// Builds the visible and collision scenes of every level (without textures) and counts what
 /// passes validation.
-pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) -> Result<()> {
+pub fn check_bridge_scenes_cmd(
+    game: &Path,
+    filter: &str,
+    limit: Option<usize>,
+    lighting_environment: bool,
+) -> Result<()> {
     let started = Instant::now();
     let wf = Warframe::open(game)?.with_textures(false);
     let mut levels: Vec<String> = wf
@@ -225,7 +232,13 @@ pub fn check_bridge_scenes_cmd(game: &Path, filter: &str, limit: Option<usize>) 
                 let sl = StaticLevel::parse(&h.unwrap_or_default(), &b.unwrap_or_default())?;
                 d.add_static_level(&s, &sl);
             }
-            wf.scene_of(d, &SceneOptions::default())
+            wf.scene_of(
+                d,
+                &SceneOptions {
+                    lighting_environment,
+                    ..SceneOptions::default()
+                },
+            )
         })();
         match built {
             Ok(w) => {

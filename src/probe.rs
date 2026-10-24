@@ -25,7 +25,7 @@
 //! half float maximum (65,504). Decoders that saturate the wrong endpoint value
 //! (`texture2ddecoder` 0.1.2 does) show such texels, see `bc6h.rs`.
 //!
-//! An equirectangular version is produced by [`CubeTexture::to_equirect`]
+//! An equirectangular version is produced by [`Probe::to_equirect`]
 //! (azimuth from the +Z axis towards +X, polar angle from +Y), and
 //! [`radiance_hdr`] writes it, or any float image, as a Radiance `.hdr` file.
 
@@ -35,6 +35,11 @@ use anyhow::{ensure, Result};
 
 use crate::bc6h::decode_bc6h;
 use crate::texture::{CubeTexture, Format, TexturePackages};
+
+/// The largest face edge [`Probe::from_texture`] decodes. The install's probes are 128 pixels
+/// (8,304) or 256 (384); the limit keeps a damaged or crafted header from asking for gigabytes of
+/// floats (six faces of 12 bytes a texel, and an equirectangular picture eight times that).
+pub const MAX_FACE_SIZE: usize = 512;
 
 /// A decoded probe: linear RGB floats per face.
 #[derive(Debug, Clone)]
@@ -92,6 +97,11 @@ impl Probe {
             t.format
         );
         let size = t.size as usize;
+        ensure!(
+            (1..=MAX_FACE_SIZE).contains(&size),
+            "a probe face of {size} pixels is outside 1..={MAX_FACE_SIZE}"
+        );
+        ensure!(!t.mips.is_empty(), "the cube map has no mip levels");
         let top = &t.mips[0];
         let mut faces: [Vec<[f32; 3]>; 6] = Default::default();
         for (f, data) in top.iter().enumerate() {
@@ -359,6 +369,27 @@ mod tests {
         // The top row is up (+Y, face 2), the bottom row down (-Y, face 3)
         assert_eq!(at(0.5, 0.0), 2.0);
         assert_eq!(at(0.5, 0.99), 3.0);
+    }
+
+    #[test]
+    fn a_huge_face_size_is_refused_before_anything_is_allocated() {
+        use crate::header::tests::build;
+        use crate::texture::TextureHeader;
+        let mut raw = build(&["/Lotus/p.hdr"], "", 183);
+        raw.extend([1, 0, 1, 35]);
+        raw.extend(0u32.to_le_bytes());
+        raw.extend(8u16.to_le_bytes());
+        raw.extend(8u16.to_le_bytes());
+        raw.extend([0, 0, 0, 0]);
+        let header = TextureHeader::parse(&raw).unwrap();
+        let body = vec![0u8; 6 * 64];
+        let mut t = CubeTexture::from_parts(header, &body, &[]).unwrap();
+        assert!(Probe::from_texture(&t).is_ok());
+        t.size = 60_000;
+        let e = Probe::from_texture(&t).unwrap_err().to_string();
+        assert!(e.contains("outside 1..=512"), "{e}");
+        t.size = 0;
+        assert!(Probe::from_texture(&t).is_err());
     }
 
     #[test]

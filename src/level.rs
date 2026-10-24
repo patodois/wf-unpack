@@ -876,6 +876,9 @@ pub struct Environment {
     pub backdrop: Option<String>,
     /// Post-processing, exposure, baking and zone lighting settings, typed.
     pub lighting: EnvironmentLighting,
+    /// `skyLightColor` of the `LightingParams` table in the object's **own** text, 0..255 alpha
+    /// last; `None` when the level does not set it (the type's black is in `lighting`).
+    pub sky_light_color_own: Option<[f32; 4]>,
     /// `LevelInfo.LightProbeData` (a `.lpd` file of baked light probes) and `EnvProbesData`
     /// (an `.epd` file), absolute paths.
     pub light_probe_data: Option<String>,
@@ -1217,6 +1220,11 @@ impl LevelDescription {
                         reflection_map: r.path("ReflectionMap"),
                         backdrop: r.text("BackDropId").map(str::to_string),
                         lighting,
+                        sky_light_color_own: vec4(
+                            own.get("LightingParams")
+                                .and_then(|t| t.get("skyLightColor"))
+                                .and_then(Value::floats),
+                        ),
                         light_probe_data: r.path("LightProbeData"),
                         env_probes_data: r.path("EnvProbesData"),
                         global_probe_position: vec3(r.floats("GlobalProbePosition")),
@@ -1643,8 +1651,11 @@ pub(crate) mod tests {
                 [0.0; 3],
                 id,
                 "/",
-                "LightProbeData=0.lpd\nEnvProbesData=/Lotus/Levels/Y/0.epd\nGlobalProbePosition={1,2,3}\nEnableGIVolumes=1\nInitialTimeOfDay=15\n",
+                "LightProbeData=0.lpd\nEnvProbesData=/Lotus/Levels/Y/0.epd\nGlobalProbePosition={1,2,3}\nEnableGIVolumes=1\nInitialTimeOfDay=15\n\
+                 LightingParams={skyLightColor={69,84,86,255}\nglobalCubeMap=g.hdr\n}\n",
             ),
+            // A LevelInfo whose own text has no LightingParams: nothing is the level's own
+            ("/EE/Types/Engine/LevelInfo", [0.0; 3], id, "/Layer4/", "Instance=1\n"),
         ]);
         let level = RawLevel::parse(&h, &b).unwrap();
         let bin = PackagesBin::parse(&type_bin()).unwrap();
@@ -1723,6 +1734,8 @@ pub(crate) mod tests {
         assert_eq!(info.global_probe_position, Some([1.0, 2.0, 3.0]));
         assert_eq!(info.enable_gi_volumes, Some(true));
         assert_eq!(info.initial_time_of_day, Some(15.0));
+        assert_eq!(info.sky_light_color_own, Some([69.0, 84.0, 86.0, 255.0]));
+        assert_eq!(d.environments[1].sky_light_color_own, None);
     }
 
     #[test]

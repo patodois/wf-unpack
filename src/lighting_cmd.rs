@@ -392,6 +392,8 @@ pub fn check_atmosphere_cmd(game: &Path) -> Result<()> {
     let mut types = wf_unpack::level::TypeResolver::new(&bin)?;
 
     let mut failed = 0usize;
+    let mut sky_origin = [0usize; 4];
+    let mut sky_examples: Vec<String> = Vec::new();
     let mut levels_with = BTreeMap::<&str, usize>::new();
     let mut count = BTreeMap::<&str, usize>::new();
     let mut cubes: BTreeSet<(String, bool)> = BTreeSet::new();
@@ -407,6 +409,31 @@ pub fn check_atmosphere_cmd(game: &Path) -> Result<()> {
             let b = body.read_path(path)?.unwrap_or_default();
             let raw = wf_unpack::level::RawLevel::parse(&h, &b)?;
             let d = wf_unpack::level::LevelDescription::build(&raw, path, &mut types)?;
+            // Where each LevelInfo's skyLightColor comes from: its own table, a content type,
+            // or only the engine type's black
+            let mut origin = [0usize; 4];
+            for e in d
+                .environments
+                .iter()
+                .filter(|e| e.kind == wf_unpack::level::EnvironmentKind::Level)
+            {
+                let typed = e
+                    .lighting
+                    .lighting_params
+                    .as_ref()
+                    .and_then(|l| l.sky_light_color);
+                match (e.sky_light_color_own, typed) {
+                    (Some(c), _) if !wf_unpack::atmosphere::is_engine_default(c) => origin[0] += 1,
+                    (Some(_), _) => origin[1] += 1,
+                    (None, Some(c)) if !wf_unpack::atmosphere::is_engine_default(c) => {
+                        origin[2] += 1
+                    }
+                    _ => origin[3] += 1,
+                }
+            }
+            for (o, n) in sky_origin.iter_mut().zip(origin) {
+                *o += n;
+            }
             Ok(Atmosphere::of(&d))
         })();
         let Ok(a) = a else {
@@ -526,6 +553,16 @@ pub fn check_atmosphere_cmd(game: &Path) -> Result<()> {
                 }
             }
         }
+        if a.sky.sky_light_color_from_type.is_some()
+            && a.sky.global_cube_map.is_none()
+            && sky_examples.len() < 3
+        {
+            sky_examples.push(format!(
+                "{path} ({:?} from {})",
+                a.sky.sky_light_color.unwrap_or_default(),
+                a.sky.sky_light_color_from_type.clone().unwrap_or_default()
+            ));
+        }
         for l in a.left_out() {
             let e = left.entry(l.what).or_default();
             e.0 += 1;
@@ -536,6 +573,15 @@ pub fn check_atmosphere_cmd(game: &Path) -> Result<()> {
     for (k, n) in &levels_with {
         println!("  {k}: {} objects in {n} levels", count[k]);
     }
+    println!(
+        "skyLightColor of the {} LevelInfo objects: {} set a colour of their own (not black), {} set black themselves, {} get one from a content type, {} only the engine type's black",
+        sky_origin.iter().sum::<usize>(),
+        sky_origin[0],
+        sky_origin[1],
+        sky_origin[2],
+        sky_origin[3]
+    );
+    println!("  e.g. a colour from a type and no cube map: {sky_examples:?}");
     let present = cubes.iter().filter(|(_, p)| *p).count();
     println!(
         "global cube maps: {} levels name one ({} of those levels have it in the install); {} distinct pictures, {present} in H.LightMap",

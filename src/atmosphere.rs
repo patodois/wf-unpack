@@ -9,8 +9,8 @@
 //!
 //! | what | where | stored as |
 //! |---|---|---|
-//! | the sky picture | `LevelInfo.LightingParams.globalCubeMap` (619 levels name one, 4 pictures are in the install) | a BC6H cube map (type 183), linear radiance, 128 px faces |
-//! | a flat sky colour | `LightingParams.skyLightColor` | 0..255, alpha last (black unless a level sets it) |
+//! | a lighting capture | `LevelInfo.LightingParams.globalCubeMap` (543 levels name one, 4 of 10 pictures are in the install) | a BC6H cube map (type 183), linear radiance, 128 px faces; a capture the baker lights with (weight `giEnvironmentIntensity`), not shown to be the sky the game draws |
+//! | a sky light colour | `LightingParams.skyLightColor`, beside the baking options | 0..255, alpha last; the type gives black, only a level's own value is a statement of the level |
 //! | a sun | a `Light` with `Directional=1` and `DirectionalLightDir` (566 lights in 434 levels), and `PostProcessInfo.sunPosition` / `sunColor` (635 / 588) | see [`Sun`] |
 //! | a sun that moves | `DynamicSky` (44 objects in 28 levels): keyframes of colour and brightness per hour | [`crate::level::DynamicSky`], kept as stored |
 //! | ambient light | `ZoneAttribs.AmbientLight{,Mid,Low}`, used when `ZoneUsesAmbient=1` (26 of 11,664 zones) | three 0..255 colours |
@@ -20,7 +20,7 @@
 //! # Conventions
 //!
 //! Directions are converted to the bridge's space (metres, +Y up, right-handed: the game's x is
-//! negated) and normalised, the way [`crate::bridge_scene`] converts instances. Positions stay in
+//! negated) and normalised, the way `crate::bridge_scene` (with the `bridge` feature) converts instances. Positions stay in
 //! the game's left-handed space, like [`LevelDescription`]. Colours keep the units of the data
 //! (0..255, alpha last) unless the field says linear.
 //!
@@ -34,7 +34,7 @@
 //!   that has both) and a colour, but no lux and no exposure; how the engine turns them into
 //!   radiance is code. So the sun is a direction and a colour, and its strength stays in the game's
 //!   own numbers.
-//! - **The sun of a time-of-day sky.** A [`DynamicSky`](crate::level::DynamicSky) gets its sun
+//! - **The sun of a time-of-day sky.** A [`DynamicSky`] gets its sun
 //!   position from `Latitude`, `SunDeclination`, the time and the solar offsets in script and
 //!   shader code; the keyframes (colour, brightness, fog per hour) and the sky material's constants (`A` to `I`, `Z`:
 //!   the coefficients of its radiance formula, in the material's shader, which is not decoded) are kept as stored.
@@ -57,6 +57,11 @@ pub fn direction_to_bridge(d: [f32; 3]) -> Option<[f32; 3]> {
     (n.is_finite() && n > 1e-6).then(|| v.map(|c| c / n))
 }
 
+/// The `skyLightColor` that `/EE/Types/Engine/LevelInfo` gives every level.
+pub fn is_engine_default(sky_light_color: [f32; 4]) -> bool {
+    sky_light_color == [0.0, 0.0, 0.0, 255.0]
+}
+
 fn linear(c: [f32; 4]) -> [f32; 3] {
     [0, 1, 2].map(|k| srgb_to_linear((c[k] / 255.0).clamp(0.0, 1.0)))
 }
@@ -75,15 +80,18 @@ pub enum SunSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sun {
     pub source: SunSource,
-    /// The vector as stored, in the game's space. For a light it is `DirectionalLightDir`, which
-    /// is read as pointing **toward** the sun, because its y is positive in 557 of the 566
-    /// directional lights, and because `PostProcessInfo.sunPosition` is a position of the sun
-    /// (RailjackInteriorV2's is (0, 28.7, 95.8), 100 m from the origin, like `DynamicSky`'s
-    /// `SkyboxSunDistance=100`) and agrees with the light's direction within 8 degrees in 148 of
-    /// the 348 levels that set both (the others differ by more, Cetus's by 145 degrees; those
-    /// levels have a moving sun). The data does not say it in words. Not normalised in 171 lights.
+    /// The vector as stored, in the game's space. For a light it is `DirectionalLightDir`, **read
+    /// as pointing toward the sun**: that is an inference, the data does not say it in words. Its
+    /// support: y is positive in 557 of the 566 directional lights, and
+    /// `PostProcessInfo.sunPosition` is a position of the sun (RailjackInteriorV2's is
+    /// (0, 28.7, 95.8), 100 m from the origin, like `DynamicSky`'s `SkyboxSunDistance=100`),
+    /// which agrees with the light's direction within 8 degrees in 148 of the 348 levels that set
+    /// both. In the other 200 the two stored suns disagree (Cetus's by 145 degrees); both are
+    /// listed and the data does not say which the game draws. The length differs from 1 by more
+    /// than 0.01 in 171 lights.
     pub toward_sun_game: Option<[f32; 3]>,
-    /// The same direction, normalised, in the bridge's space. `None` for a zero vector.
+    /// The same vector, normalised, in the bridge's space (x negated). `None` for a zero vector.
+    /// Still the reading "toward the sun" of [`Sun::toward_sun_game`], not a stated fact.
     pub toward_sun: Option<[f32; 3]>,
     /// A light's `Color` as stored: 0..255 sRGB-coded, alpha last.
     pub color: Option<[f32; 4]>,
@@ -99,16 +107,25 @@ pub struct Sun {
     pub on: Option<bool>,
 }
 
-/// Sky light settings of the level (`LevelInfo.LightingParams`, `ZoneAttribs.BackDropId`).
+/// The sky-related settings of the level (`LevelInfo.LightingParams`, `ZoneAttribs.BackDropId`).
+///
+/// `LightingParams` holds the baking parameters (beside `bakingOptions:*`): what these are is a
+/// lighting input, not shown to be the sky the game draws behind the level. The bridge scene
+/// therefore leaves them out of `Scene::environment` unless asked.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sky {
-    /// `skyLightColor`, 0..255, alpha last. The type's value is black; levels that set it: see
-    /// [`Sky::sky_light_color_set_by_level`].
+    /// `skyLightColor`, 0..255, alpha last: the level's own value if it sets one, else the
+    /// type's (black). See [`Sky::sky_light_color_set_by_level`].
     pub sky_light_color: Option<[f32; 4]>,
+    /// The level set `skyLightColor` in its own `LightingParams` (not inherited from a type).
     pub sky_light_color_set_by_level: bool,
-    /// `globalCubeMap`, `iblCubeMap`, `iblImageFile`: pictures of the sky, by path; empty strings
-    /// are dropped. Most are editor files that are not in the install; the bridge scene says which
-    /// it could read.
+    /// The `LevelInfo` type that gives a colour other than the engine default black, when the
+    /// level does not set one itself (the Orbiter's `/Lotus/Levels/Proc/PlayerShipLevelInfo`
+    /// gives grey 128): a value some content type states, not the engine's.
+    pub sky_light_color_from_type: Option<String>,
+    /// `globalCubeMap`, `iblCubeMap`, `iblImageFile`: pictures the baker lights with, by path;
+    /// empty strings are dropped. Most are editor files that are not in the install. The
+    /// `globalCubeMap` is weighted by [`Sky::gi_environment_intensity`] (0 in Duviri's levels).
     pub global_cube_map: Option<String>,
     pub ibl_cube_map: Option<String>,
     pub ibl_image_file: Option<String>,
@@ -241,13 +258,20 @@ impl Atmosphere {
                 EnvironmentKind::Level => {
                     if let Some(lp) = &e.lighting.lighting_params {
                         let s = &mut a.sky;
-                        if s.sky_light_color.is_none() {
-                            s.sky_light_color = lp.sky_light_color;
-                            s.sky_light_color_set_by_level = e
-                                .attributes
-                                .iter()
-                                .find(|(k, _)| k == "LightingParams")
-                                .is_some_and(|(_, t)| t.contains("skyLightColor"));
+                        // A colour a level sets in its own table wins over the type's
+                        match e.sky_light_color_own {
+                            Some(own) if !s.sky_light_color_set_by_level => {
+                                s.sky_light_color = Some(own);
+                                s.sky_light_color_set_by_level = true;
+                                s.sky_light_color_from_type = None;
+                            }
+                            _ if s.sky_light_color.is_none() => {
+                                s.sky_light_color = lp.sky_light_color;
+                                if lp.sky_light_color.is_some_and(|c| !is_engine_default(c)) {
+                                    s.sky_light_color_from_type = Some(e.type_path.clone());
+                                }
+                            }
+                            _ => {}
                         }
                         s.global_cube_map =
                             s.global_cube_map.take().or(non_empty(&lp.global_cube_map));
@@ -444,10 +468,12 @@ impl Atmosphere {
             })
         };
         json!({
-            "units": "colours 0..255 sRGB-coded, alpha last, unless named linear; directions: towardSun is unit length in the bridge's space (x negated), towardSunGame is as stored; densities are the game's own numbers",
+            "units": "colours 0..255 sRGB-coded, alpha last, unless named linear; directions: towardSunGame is the vector as stored and towardSun the same, unit length, in the bridge's space (x negated); both read DirectionalLightDir as pointing toward the sun, which is an inference (see Sun::toward_sun_game), not stated by the data; densities and Brightness/Lumens are the game's own numbers",
             "sky": {
                 "skyLightColor": opt4(self.sky.sky_light_color),
                 "skyLightColorSetByLevel": self.sky.sky_light_color_set_by_level,
+                "skyLightColorFromType": self.sky.sky_light_color_from_type,
+                "giEnvironmentIntensity": self.sky.gi_environment_intensity.map(num),
                 "globalCubeMap": self.sky.global_cube_map, "iblCubeMap": self.sky.ibl_cube_map,
                 "iblImageFile": self.sky.ibl_image_file, "skyIsSphere": self.sky.sky_is_sphere,
                 "backdropIds": self.sky.backdrop_ids, "backdropZones": self.sky.backdrop_zones,
@@ -527,6 +553,7 @@ mod tests {
             reflection_map: None,
             backdrop: None,
             lighting,
+            sky_light_color_own: None,
             light_probe_data: Some("/L/0.lpd".into()),
             env_probes_data: Some("/L/0.epd".into()),
             global_probe_position: Some([1.0, 2.0, 3.0]),
@@ -605,10 +632,12 @@ mod tests {
             ..EnvironmentLighting::default()
         };
         let mut d = LevelDescription::default();
-        d.environments.push(level_env(
+        let mut e = level_env(
             lighting,
             &[("LightingParams", "{skyLightColor={1,2,3,255}}")],
-        ));
+        );
+        e.sky_light_color_own = Some([1.0, 2.0, 3.0, 255.0]);
+        d.environments.push(e);
         let a = Atmosphere::of(&d);
         assert_eq!(a.sky.sky_light_color, Some([1.0, 2.0, 3.0, 255.0]));
         assert!(a.sky.sky_light_color_set_by_level);
@@ -646,10 +675,73 @@ mod tests {
             ..EnvironmentLighting::default()
         };
         let mut d = LevelDescription::default();
-        d.environments.push(level_env(lighting, &[]));
+        // The merged text of the object carries the type's `skyLightColor` too: that must not
+        // count as the level's own
+        d.environments.push(level_env(
+            lighting.clone(),
+            &[("LightingParams", "{skyLightColor={0,0,0,255}}")],
+        ));
         let a = Atmosphere::of(&d);
         assert_eq!(a.sky.sky_light_color, Some([0.0, 0.0, 0.0, 255.0]));
         assert!(!a.sky.sky_light_color_set_by_level);
+        // The same colour in the level's own table is a statement of the level
+        let mut own = level_env(lighting, &[]);
+        own.sky_light_color_own = Some([0.0, 0.0, 0.0, 255.0]);
+        let mut d = LevelDescription::default();
+        d.environments.push(own);
+        assert!(Atmosphere::of(&d).sky.sky_light_color_set_by_level);
+    }
+
+    #[test]
+    fn a_colour_a_content_type_gives_is_named_but_is_not_the_levels_own() {
+        let lighting = EnvironmentLighting {
+            lighting_params: Some(LightingParams {
+                sky_light_color: Some([128.0, 128.0, 128.0, 255.0]),
+                ..LightingParams::default()
+            }),
+            ..EnvironmentLighting::default()
+        };
+        let mut e = level_env(lighting, &[]);
+        e.type_path = "/Lotus/Levels/Proc/PlayerShipLevelInfo".into();
+        let mut d = LevelDescription::default();
+        d.environments.push(e);
+        let a = Atmosphere::of(&d);
+        assert_eq!(
+            a.sky.sky_light_color,
+            Some(
+                [128.0; 3]
+                    .into_iter()
+                    .chain([255.0])
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert!(!a.sky.sky_light_color_set_by_level);
+        assert_eq!(
+            a.sky.sky_light_color_from_type.as_deref(),
+            Some("/Lotus/Levels/Proc/PlayerShipLevelInfo")
+        );
+    }
+
+    #[test]
+    fn a_colour_the_level_sets_wins_over_an_earlier_level_info_that_does_not() {
+        let typed = |c: [f32; 4]| EnvironmentLighting {
+            lighting_params: Some(LightingParams {
+                sky_light_color: Some(c),
+                ..LightingParams::default()
+            }),
+            ..EnvironmentLighting::default()
+        };
+        let mut d = LevelDescription::default();
+        d.environments
+            .push(level_env(typed([0.0, 0.0, 0.0, 255.0]), &[]));
+        let mut second = level_env(typed([69.0, 84.0, 86.0, 255.0]), &[]);
+        second.sky_light_color_own = Some([69.0, 84.0, 86.0, 255.0]);
+        d.environments.push(second);
+        let a = Atmosphere::of(&d);
+        assert_eq!(a.sky.sky_light_color, Some([69.0, 84.0, 86.0, 255.0]));
+        assert!(a.sky.sky_light_color_set_by_level);
     }
 
     #[test]

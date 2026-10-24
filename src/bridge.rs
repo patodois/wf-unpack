@@ -91,7 +91,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{bail, ensure, Context, Result};
 use rewrite_bridge::{
@@ -108,6 +108,7 @@ use crate::level::TypeResolver;
 use crate::model::{self, ModelHeader, KIND_SKINNED, KIND_STATIC};
 use crate::packages::PackagesBin;
 use crate::pbr::{self, Baked, MaterialBaker};
+use crate::probe::Probe;
 use crate::scene::{self, Scene};
 use crate::texture::TexturePackages;
 use crate::toc::{clip_filter_matches, Entry};
@@ -159,9 +160,11 @@ pub struct Warframe {
     inner: Mutex<Inner>,
     /// The side table of [`Provider::load_animated`]: clip name to its extra data
     clips: Mutex<BTreeMap<String, ClipInfo>>,
-    /// The baked-lighting textures (`H./B./F.LightMap`), opened on the first scene that names a sky
-    /// picture and kept, so a sweep over levels does not open them for every level
-    lightmaps: Mutex<Option<TexturePackages>>,
+    /// The cube maps of `H.LightMap` decoded so far, by path (a failure is kept as its message).
+    /// The install has about ten global cube maps, so the cache stays small, and the packages are
+    /// opened only on a miss and dropped at once: holding their tables open cost 0.2 GB in a
+    /// sweep over all levels.
+    cubes: Mutex<HashMap<String, std::result::Result<Arc<Probe>, String>>>,
 }
 
 struct Inner {
@@ -289,7 +292,7 @@ impl Warframe {
                 characters: HashSet::new(),
             }),
             clips: Mutex::new(BTreeMap::new()),
-            lightmaps: Mutex::new(None),
+            cubes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -324,18 +327,24 @@ impl Warframe {
         &self.game
     }
 
-    /// Decodes a cube map of `H.LightMap` (a reflection probe or a global cube map), opening the
-    /// family's packages once.
-    pub fn probe(&self, path: &str) -> Result<crate::probe::Probe> {
-        let mut guard = self
-            .lightmaps
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(TexturePackages::open_family(&self.game, "LightMap")?);
+    /// A cube map of `H.LightMap` (a reflection probe, or a level's global cube map) decoded to
+    /// linear float faces, cached by path. This is the float side of
+    /// [`crate::bridge_scene::sky_picture`]: nothing is lost to 8 bits.
+    pub fn probe(&self, path: &str) -> Result<Arc<Probe>> {
+        let mut cubes = self.cubes.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cubes.get(path) {
+            return hit.clone().map_err(|e| anyhow::anyhow!(e));
         }
-        let pk = guard.as_mut().expect("opened above");
-        crate::probe::Probe::from_texture(&pk.load_cube(path)?)
+        let decoded = (|| -> Result<Probe> {
+            let mut pk = TexturePackages::open_family(&self.game, "LightMap")?;
+            let cube = pk.load_cube(path)?;
+            // `pk` goes out of scope here, with the tables of the three packages
+            Probe::from_texture(&cube)
+        })()
+        .map(Arc::new)
+        .map_err(|e| format!("{e:#}"));
+        cubes.insert(path.to_string(), decoded.clone());
+        decoded.map_err(|e| anyhow::anyhow!(e))
     }
 
     /// The extra data (events, root motion, play rate, Packages.bin entity) of a clip loaded by
