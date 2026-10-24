@@ -32,6 +32,14 @@
 //            colour = linear(Color) * Brightness, w = 1/Radius^2, k = PhysicalFalloff (the CPU-side mapping is an assumption)
 //   lscale   multiplies those lights (default 1)
 //   m2 m2c   a second glTF drawn as wireframe (collision shapes)
+//   sky      1: draw the level's global cube map (sky_equirect.hdr, rewrite-bridge's equirectangular convention) behind
+//            the level, with a bright disc at the direction of its first directional light (the sun's direction only: the
+//            data gives no strength, so the disc's brightness is not data); skyexp scales the picture (default 1)
+//   skylight 1: with sky=1, also light the level from the sky picture (image-based lighting; the strength is the picture's
+//            own radiance times env, an assumption of this viewer)
+//   hide     names (comma-separated substrings) of nodes to leave out
+//   unlit    1: draw every material as its base colour texture alone (no lighting)
+//   pano     1: render a 360 degree view from `pos` (equirectangular, rewrite-bridge's convention) instead of a perspective one
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
@@ -211,9 +219,11 @@ new GLTFLoader().load(q.get('m'), async (gltf) => {
     if (o.isMesh) {
       meshes++; tris += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
       const mats = Array.isArray(o.material) ? o.material : [o.material];
+      if (q.get('unlit') === '1') o.material = Array.isArray(o.material) ? mats.map((m) => new THREE.MeshBasicMaterial({ map: m.map, color: m.color, side: THREE.DoubleSide, transparent: m.transparent, alphaTest: m.alphaTest })) : new THREE.MeshBasicMaterial({ map: mats[0].map, color: mats[0].color, side: THREE.DoubleSide, transparent: mats[0].transparent, alphaTest: mats[0].alphaTest });
       for (const m of mats) { m.side = THREE.DoubleSide; if (q.get('nometal') === '1') { m.metalness = 0; } if (q.has('emis')) { m.emissiveIntensity = num('emis', 1); } }
     }
   });
+  if (q.get('hide')) { const h = q.get('hide').split(','); root.traverse((o) => { if (h.some((x) => o.name.includes(x))) o.visible = false; }); }
   for (const l of lights) l.parent.remove(l);
   const sc = gltf.scenes[0].userData || {};
   const base = q.get('m').replace(/[^/]*$/, '');
@@ -255,6 +265,32 @@ new GLTFLoader().load(q.get('m'), async (gltf) => {
       lit++;
     }
   }
+  if (q.get('sky') === '1' && sc.sky && sc.sky.equirect) {
+    const skyTex = await new RGBELoader().loadAsync(base + sc.sky.equirect);
+    skyTex.minFilter = THREE.LinearFilter; skyTex.magFilter = THREE.LinearFilter; skyTex.generateMipmaps = false;
+    const sun = ((sc.atmosphere || {}).suns || []).find((x) => x.source.startsWith('light') && x.towardSun);
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(1000, 64, 32), new THREE.ShaderMaterial({
+      uniforms: { tex: { value: skyTex }, k: { value: num('skyexp', 1) }, sunDir: { value: new THREE.Vector3(...(sun ? sun.towardSun : [0, 1, 0])) },
+                  sunCol: { value: new THREE.Vector3(...(sun && sun.colorLinear ? sun.colorLinear.map((c) => c * 30) : [30, 30, 30])) }, hasSun: { value: sun ? 1 : 0 } },
+      vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); gl_Position.z = gl_Position.w; }',
+      fragmentShader: `varying vec3 vDir; uniform sampler2D tex; uniform float k; uniform vec3 sunDir; uniform vec3 sunCol; uniform float hasSun;
+        void main(){
+          vec3 d = normalize(vDir);
+          float u = 0.5 + atan(d.x, -d.z) / 6.2831853, v = 0.5 - asin(clamp(d.y, -1., 1.)) / 3.1415927;   // v from the top
+          vec3 c = texture2D(tex, vec2(u, 1. - v)).rgb * k;
+          if (hasSun > 0.5 && dot(d, sunDir) > cos(0.03)) c = sunCol;
+          gl_FragColor = vec4(c, 1.);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`,
+      side: THREE.BackSide, depthWrite: false }));
+    dome.renderOrder = -1; dome.frustumCulled = false; dome.position.set(...pos);
+    scene.add(dome);
+    if (q.get('skylight') === '1') {
+      const skyScene = new THREE.Scene(); const d2 = dome.clone(); d2.position.set(0, 0, 0); skyScene.add(d2);
+      scene.environment = pmrem.fromScene(skyScene, 0.02).texture;
+    }
+  }
   if (q.get('probe') === '1' && (sc.reflectionProbes || []).length) {
     scene.environment = await probeEnvironment(base + sc.reflectionProbes[0].equirect);
   }
@@ -280,6 +316,25 @@ new GLTFLoader().load(q.get('m'), async (gltf) => {
   window.result = { tris, meshes, lightmapped: lit, box: [box.min.toArray(), box.max.toArray()] };
   if (q.get('post') === 'game') {
     window.result.exposure = await gamePost(sc);
+    window.done = true;
+    return;
+  }
+  if (q.get('pano') === '1') {
+    const rt = new THREE.WebGLCubeRenderTarget(1024, { type: THREE.HalfFloatType });
+    const cc = new THREE.CubeCamera(0.05, 2000, rt); cc.position.set(...pos); scene.add(cc); cc.update(renderer, scene);
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+      uniforms: { cube: { value: rt.texture } },
+      vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+      fragmentShader: `varying vec2 vUv; uniform samplerCube cube;
+        void main(){
+          float az = (vUv.x - 0.5) * 6.2831853, el = (vUv.y - 0.5) * 3.1415927;   // vUv.y 1 is the top
+          vec3 d = vec3(cos(el) * sin(az), sin(el), -cos(el) * cos(az));
+          gl_FragColor = vec4(textureCube(cube, d).rgb, 1.);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`, depthTest: false, depthWrite: false }));
+    const s2 = new THREE.Scene(); s2.add(quad);
+    renderer.render(s2, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
     window.done = true;
     return;
   }

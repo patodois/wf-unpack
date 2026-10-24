@@ -110,17 +110,68 @@ type 177 cube textures, not read; 4,830 `PostProcessInfo` tables read with
 own lights (the others name lights of prefabs or sub-levels, which a level
 description does not contain).
 
-**Not done:** the directional term's scale `S`, light probes (`.lpd`),
-`FillLightingBuffer` (global illumination volumes, sky and directional light,
-`AmbientLight*`), the lights' CPU-side colour mapping, `TM_ACES_REF` and the
-other tone maps, bloom, the lightmap `LightMapTint` / `lightMapBoost` scaling
-(applied outside the pixel shaders), and the clustered (non-indexed) lights.
-Because of the first four, a level cannot be lit as in the game from the
-files alone: rendered with everything that is decoded (`tools/render`), the
-dojo's lightmaps and indexed lights leave most surfaces dark.
+**Sky, sun, ambient light, fog and global illumination** (`src/atmosphere.rs`,
+`wfu atmosphere <level> [--json]`, `check-atmosphere`). `Atmosphere::of(&description)` collects what a
+level says about them, with the unit and the source of every value and a list of what it leaves out;
+the glTF export puts the same in the scene `extras` (`atmosphere`, `sky`) and the bridge provider
+returns it beside the scene (`WarframeScene::atmosphere`, see [BRIDGE.md](BRIDGE.md)). What the data
+holds, over the 4,601 levels of the build of 2026-10-22 (`check-atmosphere`, 10 s, 0.45 GB):
+
+| | where | what the data defines | what it does not |
+|---|---|---|---|
+| sky picture | `LightingParams.globalCubeMap`: 543 levels name one, 10 distinct pictures, 4 are in the install (`H.LightMap`, 128 px BC6H cube maps, linear radiance, the largest texel 0.30 to 1.125), 269 of the 543 levels get one | the picture, exactly; its orientation was checked against the geometry that was captured (below) | 6 pictures are editor files or not shipped (`ZarimanGlobalcubemap`, `1999WinterIBL`, `GrineerForestDayGlobalR`, `SentientDevourer/0_pcube0.png` ...), `iblImageFile` (114 uses name a picture) and `iblCubeMap` (4) are never in the install; a time-of-day sky's `skyLight` is an editor `_sh.hdr` path |
+| flat sky colour | `LightingParams.skyLightColor`, 0..255 alpha last | the colour; black unless a level sets it (183 of 4,830 `LevelInfo` objects do: grey 69/84/86, 200 and 128) | |
+| sun direction and colour | a `Light` with `Directional=1`: `DirectionalLightDir`, `Color`, `Brightness`, `Lumens` (566 lights, 434 levels); `PostProcessInfo.sunPosition` and `sunColor` (635 and 588 objects) | the vector, the colour, `Brightness` and `Lumens` | the strength in lux or radiance (code), whether the vector points to or from the sun (read as toward, below) |
+| a sun over the day | `DynamicSky` (44 objects, 28 levels): `TimeOfDayKeys` (hour, `sunColor`, `sunBrightness`, `fogColor`, `skyLight`, `exposure` ...), `IlluminationKeys`, `Latitude`, `SunDeclination`, `TimeRate`, `ExplicitSunDirection` (4 sky objects use it) | the keyframes and the sky material's constants (`MaterialParams`, the names `A` to `I` and `Z`, 3 or 4 numbers each), as stored (`level::DynamicSky`) | the sun's position at an hour, how the keys blend, and the sky's radiance formula the constants go into (script and shader code; the formula's shader is `/EE/Materials/Defaults/DynamicSkyboxMaterial`); Cetus's explicit direction points the other way from its directional light, with `FlipSunDirection=1`; the sky material's `SunDir` constant is a snapshot of a value that code overwrites (7 distinct vectors over the 44 skies, one of them in 22 skies, another in 13, at different hours of day) |
+| ambient light | `ZoneAttribs.AmbientLight`, `AmbientLightMid`, `AmbientLightLow`, `ZoneUsesAmbient` (1,945 zones in 1,128 levels carry colours; 26 of 11,664 zones set `ZoneUsesAmbient=1`, 14 with colours) | three colours per zone, and whether the zone uses them | the blend between the three (shader code); the other 11,638 zones do not use them |
+| fog | `PostProcessInfo.fogColor`, `distanceFogDensity`, `heightFog*`, `linearFogDensity`, `horizonFog`, `extinction`, `fogTexture` (2,403 levels), and a zone's own (`OverrideLevelFog`, 6,756 zones) | the settings, as stored | the unit of the densities and the attenuation law (shader code) |
+| GI volumes | `GIVolume` objects: 1,350 in 857 levels (`EnableGIVolumes`), a box of probes (`Dimensions`, `CellSize`), 5,794 textures named (type 175 volume textures, all in `H.LightMap`), an indirection texture and its size in bricks, `FallbackBand0`, `Band1NormalizationScale/Offset` | placement, size, spacing and every parameter | the voxels: packed spherical-harmonic bands whose reconstruction is shader code |
+| probes | `LevelInfo.LightProbeData` (`.lpd`, 2,032) and `EnvProbesData` (`.epd`, 3,585), all in `H.Misc`; `GlobalProbePosition`; a zone's `ReflectionSH1` (four numbers) | the file names and the position | the payload of the files |
+
+*The sun's direction.* `DirectionalLightDir` is read as pointing **toward** the sun: its y is positive in
+557 of the 566 directional lights; `PostProcessInfo.sunPosition` is a position of the sun in the sky
+(RailjackInteriorV2's is (0, 28.7, 95.8), 100 m out, like `DynamicSky.SkyboxSunDistance=100`), and
+in the 348 levels that set both, the light's direction and that position agree within 8 degrees in
+148 (the others, such as Cetus, whose sun moves, differ by more). The data does not say it in words.
+The length of the vector is not 1 in 171 lights (a direction, not a place).
+
+*The sky picture's orientation.* The cube is in the game's space (see `probe.rs`). Checked on the one
+case where the geometry that was captured is in the install: `/Lotus/Levels/Backdrops/UranusRegion.level`
+places the planet, its rings and the nebulae around the zone that `1_cross.hdr` was baked at. Rendering
+those meshes from that point in a 360 degree view and the sky picture side by side, in the bridge's
+convention, put the planet at the same azimuth and height (at the picture's edge, about 20 degrees up in both), and
+the rings, which extend to one side of the planet only, run the same way in both (to u = 0.36 in the
+picture and 0.39 in the render; compared by eye, the renderer's own mapping having been checked on five
+coloured spheres first): a mirrored picture would put them on the other side.
+
+*What the global cube map is.* The level's environment capture: `LightingParams` pairs it with
+`giEnvironmentIntensity`, the weight the baker gave it as a light (on `LevelInfo` objects: 0.2 with the deep-space
+nebula in 130 and 1.0 in 26, 0.2 with the Uranus picture in 16, 0 with Duviri's `LandscapeC` in 50), and
+`skyIsSphere=1` in 535 levels. It is not a statement that the game draws exactly this behind the level:
+Duviri's `LandscapeC` is a stock mountain panorama whose brightest region (azimuth -101 degrees, 32 degrees
+up in the bridge's convention) is 121 degrees away from the sun of the level that names it (TownA's
+directional light: azimuth +20, 32 up), and the baker gave it no weight there. The bridge scene still
+carries it, because it is the one sky-like picture the level names and the contract's `Environment` is
+"the sky behind everything"; the report says where it came from so a host can decide.
+
+*What the bridge gets* (`bridge_scene::scene_environment`): the picture, 8-bit sRGB in the bridge's
+equirectangular convention, four times the face edge wide, with `intensity` the cube's largest texel, so
+that nothing clips (the mean relative error of the texels above 5 % of the peak is 0.6 % on the Orbiter's
+picture, from the 8-bit coding); else the flat colour; else nothing. Values are the game's own relative radiance.
+
+**Not done:** the directional term's scale `S`, the voxels of the GI volumes and the payload of `.lpd` /
+`.epd` files, `FillLightingBuffer`'s shader (the reconstruction of probe light, the sky and directional
+light in it, the three-colour ambient blend), the strength of a directional light in lux, a time-of-day
+sun's position and key blending, the fog law, the lights' CPU-side colour mapping, `TM_ACES_REF` and the
+other tone maps, bloom, the lightmap `LightMapTint` / `lightMapBoost` scaling (applied outside the pixel
+shaders), and the clustered (non-indexed) lights. Because of the first of these and the probe
+reconstruction, a level cannot be lit as in the game from the files alone: rendered with everything that
+is decoded (`tools/render`), the dojo's lightmaps and indexed lights leave most surfaces dark.
 
 `tools/render` is a headless three.js/Playwright renderer for the glTF files
 (`npm install` there, then `node shot.cjs out.png level.gltf "pos=..&tgt=..&game=1"`);
 `game=1` lights level meshes with the lightmaps by the formula above, `lights=assumed`
 adds the indexed lights, `post=game` exposes and tone maps as the game's final
-pass does. Parameters are documented at the top of `view.html`.
+pass does, `sky=1` draws the level's global cube map behind it (with a disc where its first
+directional light is, the direction only) and `skylight=1` lights it from that picture, `pano=1`
+renders a 360 degree view from a point and `unlit=1` draws base colours alone. Parameters are documented at the top of `view.html`.

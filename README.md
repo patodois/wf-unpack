@@ -23,7 +23,8 @@ What it reads:
   animations on a model's skeleton
 - animation state machines (`.animfsm`) and trees (`.animtree`): which clip plays when, with the blend times
 - levels (`.level`, `.static`): the objects a level places, its geometry (types 105/109), PhysX collision
-  shapes, lights, spawn points and portals, exported to glTF with each model stored once and instanced
+  shapes, lights, spawn points and portals, exported to glTF with each model stored once and instanced; and
+  what they say about their sky, sun, ambient light, fog and baked global illumination
 - the Tenno's movement values (gravity, speeds, jump, camera, crouch rule), read from Packages.bin with the
   entity and key of each
 
@@ -169,6 +170,10 @@ wf-unpack level /Lotus/Levels/Hub/PlayerShipInteriorOrbiter.level -o out/ --max-
 wf-unpack check-levels --game $C          # every level and static level parses (streaming); 12 s, 0.1 GB
 wf-unpack check-levels --deep --game $C   # + descriptions, level geometry and PhysX of every model they place; 35 s, 0.6 GB
 
+# Sky, sun, ambient light, fog and GI of a level, with what the data does not say (--json for the glTF extras' form)
+wf-unpack atmosphere /Lotus/Levels/Hub/PlayerShipInteriorOrbiter.level [--json]
+wf-unpack check-atmosphere --game $C      # every level: named files in the install, how the suns agree; 10 s and 0.45 GB
+
 # Lighting: reflection probe (type 183) to HDR files, post-process settings, lightmap pages, Warframe default colours
 wf-unpack probe /Lotus/Levels/ClanDojo/ClanObstacleCourseA/0_cross.hdr -o out/
 wf-unpack postprocess /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--json]
@@ -201,6 +206,7 @@ shown as `N`). They exit 0 either way. On the Steam build of 2026-10-22:
 | `check-packages` | 467,795 of 467,795 entities decode |
 | `check-bridge` | the same models as `check-models`, except five type-281 skeletons whose rest pose has a NaN scale in the game data (rewrite-bridge 0.2's `Model::validate` rejects those): type 102 33,132 of 33,689, type 281 9,008 of 9,057 |
 | `check-levels` | all 4,601 `.level` and 411 `.static` files parse, 0 fail |
+| `check-atmosphere` | 4,601 levels, 0 fail: 566 directional lights in 434 levels, 635 `sunPosition` in 634, 1,350 GI volumes in 857 levels (5,794 textures, 2,032 `.lpd`, 3,585 `.epd` named, all in the install), 44 dynamic skies in 28; 543 levels name a global cube map, 10 distinct, 4 in the install (269 levels) |
 
 If your numbers are far from these, the game has been updated; open an issue with the version.
 
@@ -242,7 +248,7 @@ wf-unpack check-bridge --game $C              # HEAVY: load and validate every m
 wf-unpack check-bridge --game $C --textures   # the same, baking every material: about an hour, 1 GB (1,000 models took 90 s)
 wf-unpack bridge-anim /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx --animations /Tenno/Movement/MeleeWeapon/Sword/
 wf-unpack bridge-scene /Lotus/Levels/ClanDojo/ClanObstacleCourseA.level [--max-texture 512 | --no-textures]
-wf-unpack check-bridge-scenes --game $C       # HEAVY: build and validate the scenes of every level (no textures): 16 minutes, 0.74 GB
+wf-unpack check-bridge-scenes --game $C       # HEAVY: build and validate the scenes of every level (no textures): 13 minutes, 1.2 GB
 wf-unpack player                              # the movement values with units and sources
 ```
 

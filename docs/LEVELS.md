@@ -73,9 +73,14 @@ Where things are:
   listed and put in `extras`, not drawn (their axes are not verified).
 - **Spawn points** are `PlayerSpawn` and `NpcSpawnPoint` objects.
 - **Environment.** `LevelInfo` (`PostProcessInfo.fogColor`,
-  `distanceFogDensity`) and `ZoneAttribs` (`AmbientLight`, `FogColor`,
+  `distanceFogDensity`, `LightingParams.globalCubeMap`) and `ZoneAttribs` (`AmbientLight`, `FogColor`,
   `ReflectionMap`, `BackDropId`) are kept as environment settings and stored in
-  the glTF scene's `extras`.
+  the glTF scene's `extras`; [LIGHTING.md](LIGHTING.md) says what each holds. Also read: `GIVolume`
+  boxes of probes (`LevelDescription::gi_volumes`) and time-of-day skies (`DynamicSky`, `dynamic_skies`),
+  which are not "objects that became nothing"; `LevelInfo` names the `.lpd` / `.epd` probe files,
+  `GlobalProbePosition`, `EnableGIVolumes` and `InitialTimeOfDay`. A zone's `BackDropId` is a tag that the
+  game's code matches with a backdrop level (`/Lotus/Levels/Backdrops/*.level`, scaled by
+  `ActualScale`) at run time; the choice is not in the level.
 - **Tiles.** The connection points of a tile are `LevelPortal` objects
   (`Width`, `Height`); the description lists them. A procedural mission
   (`ProceduralLevel*` entities, types 234 to 288) holds the pool of tiles
@@ -95,8 +100,8 @@ Not read, or not applied (the glTF and the description leave these out):
 
 - Baked lighting is decoded and written (see [LIGHTING.md](LIGHTING.md)) but only its
   non-directional part is exact: the directional gain scale, the indexed
-  light maps (`_I_l1`), light probes and the lights' own contribution are
-  not decoded.
+  light maps (`_I_l1`), light probes (`.lpd`, `.epd`), the voxels of GI volumes and the lights' own
+  contribution are not decoded.
 - Per-instance `MaterialParams` (tint and other overrides), attachments
   (`AttachParent`, `LocalPosition`), movers and their keys (instances are at rest),
   animations, particle effects, sounds, scripts and triggers. Skinned models
