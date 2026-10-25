@@ -452,38 +452,29 @@ impl Texture {
     pub fn to_rgba(&self) -> Result<Vec<u8>> {
         let (w, h) = (self.width as usize, self.height as usize);
         let top = &self.mips[0];
-        type Decoder = fn(&[u8], usize, usize, &mut [u32]) -> Result<(), &'static str>;
-        let decoder: Option<Decoder> = match self.format {
-            Format::Bc1 => Some(texture2ddecoder::decode_bc1),
-            Format::Bc2 => Some(texture2ddecoder::decode_bc2),
-            Format::Bc3 => Some(texture2ddecoder::decode_bc3),
-            Format::Bc4 => Some(texture2ddecoder::decode_bc4),
-            Format::Bc5 => Some(texture2ddecoder::decode_bc5),
-            Format::Bc6h => Some(texture2ddecoder::decode_bc6_unsigned),
-            Format::Bc7 => Some(texture2ddecoder::decode_bc7),
+        let block_format = match self.format {
+            Format::Bc1 => Some(bcn_decode::Format::Bc1),
+            Format::Bc2 => Some(bcn_decode::Format::Bc2),
+            Format::Bc3 => Some(bcn_decode::Format::Bc3),
+            Format::Bc4 => Some(bcn_decode::Format::Bc4),
+            Format::Bc5 => Some(bcn_decode::Format::Bc5),
+            Format::Bc6h => Some(bcn_decode::Format::Bc6hUf16),
+            Format::Bc7 => Some(bcn_decode::Format::Bc7),
             _ => None,
         };
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        if let Some(decode) = decoder {
-            // The decoder works on whole blocks; pad to a multiple of 4 and crop
-            let (bw, bh) = (w.div_ceil(4) * 4, h.div_ceil(4) * 4);
-            let mut pixels = vec![0u32; bw * bh];
-            decode(top, bw, bh, &mut pixels)
+        if let Some(format) = block_format {
+            // Edge blocks of sizes that are not multiples of 4 are cropped by the decoder
+            let mut pixels = bcn_decode::decode_rgba8_to_vec(format, top, w, h)
                 .map_err(|e| anyhow::anyhow!("texture decoding: {e}"))?;
-            for row in pixels.chunks_exact(bw).take(h) {
-                for p in &row[..w] {
-                    // The decoder yields BGRA in little-endian order
-                    let [b, g, r, a] = p.to_le_bytes();
-                    if self.format == Format::Bc4 {
-                        // One channel: show it as grey
-                        rgba.extend_from_slice(&[r, r, r, 255]);
-                    } else {
-                        rgba.extend_from_slice(&[r, g, b, a]);
-                    }
+            if self.format == Format::Bc4 {
+                // One channel: show it as grey
+                for px in pixels.as_chunks_mut::<4>().0 {
+                    *px = [px[0], px[0], px[0], 255];
                 }
             }
-            return Ok(rgba);
+            return Ok(pixels);
         }
+        let mut rgba = Vec::with_capacity(w * h * 4);
         match self.format {
             Format::Bgra8 => {
                 for px in top.as_chunks::<4>().0 {

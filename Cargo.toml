@@ -9,10 +9,11 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Block-compression texture decoder (BC1 to BC7), written from the public specifications
+bcn-decode = { path = "../bcn-decode" }
 oozextract = "0.5.6"
 png = "0.18.1"
 serde_json = { version = "1", features = ["preserve_order"] }
-texture2ddecoder = "0.1.2"
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
 # Shared model types for crossovers with other game rewrites

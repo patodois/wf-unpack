@@ -1,18 +1,19 @@
 //! BC6H block decoder that keeps the half-float range.
 //!
-//! `texture2ddecoder` decodes BC6H to 8-bit colours and so clamps everything
-//! above 1.0, which loses the HDR data of reflection probes. This module is
-//! that crate's BC6H decoder (MIT OR Apache-2.0, (c) Rudolf Kolbe) with some
-//! changes: pixels come out as `f32` instead of `u8`, the bit reader and the
+//! Decoders that produce 8-bit colours clamp everything above 1.0, which loses
+//! the HDR data of reflection probes. This module is the BC6H decoder
+//! of the `texture2ddecoder` crate (MIT OR Apache-2.0, (c) Rudolf Kolbe) with
+//! some changes: pixels come out as `f32` instead of `u8`, the bit reader and the
 //! three BPTC tables it needs are included here, and the unquantizing,
 //! interpolation and signed handling follow bcdec (iOrange/bcdec, MIT or
-//! Unlicense) instead. The crate's unquantizing treats the half-way value
+//! Unlicense) instead. That crate's unquantizing treats the half-way value
 //! (`1 << (bits - 1)`) as the saturated endpoint instead of the all-ones one,
 //! and its signed path mixes sign-magnitude and two's complement; this module
 //! keeps endpoints as signed integers throughout. The mode table and the
 //! field order per mode follow the Direct3D 11 BC6H specification. The unit
 //! tests compare the unquantizing and the blending against a port of bcdec's
-//! and, where the two decoders agree, the output against texture2ddecoder.
+//! and the whole output against `bcn-decode`, the decoder written from the
+//! specifications alone, which agrees with it on every block.
 
 struct Bc6hModeInfo {
     transformed: bool,
@@ -292,7 +293,7 @@ fn extend_sign(val: i32, bits: usize) -> i32 {
 /// Undoes the delta transform: a delta is added to the base endpoint modulo `2^bits`.
 fn transform_inverse(val: i32, base: i32, bits: usize, signed: bool) -> i32 {
     // Mode 15 has 16-bit endpoints: the mask is 0xFFFF there (a `1u16 << 16` would be a zero mask,
-    // which texture2ddecoder 0.1.2 still has)
+    // which texture2ddecoder 0.1.2 has)
     let val = (val + base) & ((1 << bits) - 1);
     if signed {
         extend_sign(val, bits)
@@ -1229,59 +1230,29 @@ mod tests {
     }
 
     #[test]
-    // texture2ddecoder overflows on some invalid random blocks in debug builds, so the comparison
-    // runs in release (`cargo test --release`); `random_blocks_decode_in_debug` covers this crate
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "the reference decoder overflows in debug builds"
-    )]
-    fn clamped_output_matches_texture2ddecoder_where_it_is_right() {
-        // texture2ddecoder 0.1.2 differs from the format in two ways: it masks the endpoints of
-        // the 16-bit transformed mode to zero, and it saturates an unquantized endpoint at the
-        // half-way value instead of the all-ones one. Blocks with the first are switched to a
-        // two-bit mode here and blocks with an endpoint at either of the two values are left out
-        let mut data = blocks(4096);
-        for block in data.chunks_mut(16) {
-            let mode = if block[0] & 2 != 0 {
-                block[0] & 0x1F
+    fn output_matches_bcn_decode() {
+        // bcn-decode (our decoder written from the specifications) and this module agree on every
+        // random block, valid or not: exactly in floating point, and after clamping to 8 bits
+        for signed in [false, true] {
+            let data = blocks(4096);
+            let (w, h) = (4 * 64, 4 * 64);
+            let mine = decode_bc6h(&data, w, h, signed).unwrap();
+            let format = if signed {
+                bcn_decode::Format::Bc6hSf16
             } else {
-                block[0] & 3
+                bcn_decode::Format::Bc6hUf16
             };
-            let mi = &S_BC6H_MODE_INFO[mode as usize];
-            if mi.transformed && mi.endpoint_bits == 16 {
-                block[0] &= !2;
-            }
-        }
-        let (w, h) = (4 * 64, 4 * 64);
-        let mut reference = vec![0u32; w * h];
-        texture2ddecoder::decode_bc6_unsigned(&data, w, h, &mut reference).unwrap();
-        let mine = decode_bc6h(&data, w, h, false).unwrap();
-        let mut compared_blocks = 0;
-        for (n, block) in data.chunks(16).enumerate() {
-            if let Some(e) = read_endpoints(block, false) {
-                let bits = e.mi.endpoint_bits;
-                let n_ep = if e.mi.partition_bits != 0 { 4 } else { 2 };
-                let disputed = bits < 15
-                    && e.ep.iter().any(|ch| {
-                        ch[..n_ep]
-                            .iter()
-                            .any(|&v| v == 1 << (bits - 1) || v == (1 << bits) - 1)
-                    });
-                if disputed {
-                    continue;
+            let exact = bcn_decode::decode_rgba_f32_to_vec(format, &data, w, h).unwrap();
+            let clamped = bcn_decode::decode_rgba8_to_vec(format, &data, w, h).unwrap();
+            for (i, px) in mine.iter().enumerate() {
+                for c in 0..3 {
+                    assert_eq!(px[c], exact[i * 4 + c], "texel {i}, signed {signed}");
+                    // 8-bit output of bcn-decode: clamp to [0, 1], multiply by 255, round down
+                    let q = (px[c] * 255.0).clamp(0.0, 255.0) as u8;
+                    assert_eq!(q, clamped[i * 4 + c], "texel {i}, signed {signed}");
                 }
             }
-            compared_blocks += 1;
-            let (bx, by) = (n % (w / 4), n / (w / 4));
-            for i in 0..16 {
-                let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
-                let [bl, g, r, _] = reference[y * w + x].to_le_bytes();
-                let b = mine[y * w + x];
-                let q = |v: f32| (v * 255.0).clamp(0.0, 255.0) as u8;
-                assert_eq!([r, g, bl], [q(b[0]), q(b[1]), q(b[2])], "block {n}");
-            }
         }
-        assert!(compared_blocks > 3800, "{compared_blocks} of 4096 compared");
     }
 
     #[test]
@@ -1289,7 +1260,7 @@ mod tests {
         // The 16-bit transformed mode with every other bit set: the base endpoint is 0xFFFF and
         // each 4-bit delta is -1, so the second endpoint is 0xFFFE and the texels that use it (all
         // indices are 15 apart from the anchor) are as bright as the base. A zero mask (the old
-        // overflow, still in texture2ddecoder 0.1.2) turns that endpoint into 0.
+        // overflow in texture2ddecoder 0.1.2) turns that endpoint into 0.
         let mode = (0..32u8)
             .find(|&m| {
                 let mi = &S_BC6H_MODE_INFO[m as usize];

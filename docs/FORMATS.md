@@ -15,7 +15,7 @@ quaternion packing); no code was copied. Warframe's public
 [texturing guide](https://www.warframe.com/steamworkshop/texturing-guide)
 describes the tint mask layering. Oodle streams are decoded with the pure-Rust
 [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
-with [texture2ddecoder](https://crates.io/crates/texture2ddecoder).
+with bcn-decode, our own decoder written from the public specifications.
 
 Tested against the Steam (Windows) build of 2026-10-22: `check` decodes all
 1,090,424 entries of the 95 packages (132.7 GB once decompressed) with no
