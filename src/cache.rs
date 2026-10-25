@@ -180,10 +180,9 @@ fn decompress_block(block: &[u8], out: &mut [u8]) -> Result<()> {
     if block.len() == out.len() {
         out.copy_from_slice(block);
     } else if block.first() == Some(&OODLE_MAGIC) {
-        let n = oozextract::Extractor::new()
-            .read_from_slice(block, out)
-            .map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
-        ensure!(n == out.len(), "Oodle produced {n} bytes");
+        // lztans fills the whole of `out` or fails, and does not panic on malformed input; it returns the
+        // number of input bytes it used, so the output length is the length of `out`
+        lztans::decode(block, out).map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
     } else {
         lzf_decompress(block, out)?;
     }

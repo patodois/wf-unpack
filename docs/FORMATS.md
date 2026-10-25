@@ -13,13 +13,22 @@ for levels, static levels and level geometry, the `dev` branch's Packages.bin
 reader and the `animation2` branch's outline of the animation header, body and
 quaternion packing); no code was copied. Warframe's public
 [texturing guide](https://www.warframe.com/steamworkshop/texturing-guide)
-describes the tint mask layering. Oodle streams are decoded with the pure-Rust
-[oozextract](https://github.com/lvlvllvlvllvlvl/oozextract) and BCn blocks
-with bcn-decode, our own decoder written from the public specifications.
+describes the tint mask layering. Oodle streams are decoded with
+[lztans](https://github.com/patodois/lztans), our own pure-Rust decoder, written in a clean room (from a prose
+specification of the format, by an implementer who read no existing decoder), and BCn blocks with
+[bcn-decode](https://github.com/patodois/bcn-decode), our own decoder written from the public specifications.
 
 Tested against the Steam (Windows) build of 2026-10-22: `check` decodes all
 1,090,424 entries of the 95 packages (132.7 GB once decompressed) with no
 failures in about five minutes.
+
+With lztans and bcn-decode from crates.io (25 October 2026) the decompressed bytes of all 1,090,424 entries are the
+ones oozextract gave. Textures differ from the output of texture2ddecoder, which this tool used before, only where
+bcn-decode follows the specification: BC2 and BC3 colour blocks with `color0 <= color1` are decoded in four-colour
+mode, as Khronos' Data Format Specification says (11,341 of the 39,346 BC3 textures of `H.Texture` and 7,549 of the
+17,554 BC3 lightmap pages change in their top level, each in the blocks that use colour code 2 or 3), and 49 BC6H blocks
+of eight `LASxParallaxEnd*_d` textures differ in the unquantizing of an endpoint. BC1, BC4, BC5, BC7, BGRA8 and A8
+textures and the 12,408 reflection probes are identical.
 
 What this version learned beyond those sources:
 

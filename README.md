@@ -316,6 +316,26 @@ WF_GAME_DIR=~/Games/Warframe/Cache.Windows cargo test --release --features bridg
 - [rewrite-bridge](https://github.com/patodois/rewrite-bridge): the shared types and the conformance checker;
   its `docs/WRITING_A_PROVIDER.md` explains the concepts above from the other side
 
+## Dependencies and credit
+
+The build has no git dependency; everything comes from [crates.io](https://crates.io).
+
+- The Oodle decoder is [lztans](https://crates.io/crates/lztans) (ours), pure Rust and written in a clean room:
+  from a prose specification of the format, by an implementer who read no existing decoder. The earlier build
+  used oozextract, which is no longer a dependency.
+- Block-compressed textures (BC1 to BC7) are decoded by [bcn-decode](https://crates.io/crates/bcn-decode) (ours),
+  written from the public specifications.
+- zstd, for the property texts of `Packages.bin`, is the C library through the [zstd](https://crates.io/crates/zstd)
+  crate: those frames have no magic number, which the pure-Rust ruzstd does not read.
+- Starting points for the file formats were [LotusLib](https://github.com/Puxtril/LotusLib) and
+  [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by Puxtril; no code was copied (see
+  [docs/FORMATS.md](docs/FORMATS.md)). The optional `bridge` feature adds [rewrite-bridge](https://crates.io/crates/rewrite-bridge);
+  the viewer is built on [Bevy](https://bevyengine.org).
+
+## License
+
+Licensed under either of MIT or Apache-2.0, at your option.
+
 ## Glossary
 
 - **Game rewrite**: a new engine that loads an old game's original assets. A **mash-up** loads assets of
