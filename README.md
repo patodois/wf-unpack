@@ -332,8 +332,11 @@ WF_GAME_DIR=~/Games/Warframe/Cache.Windows cargo test --release --features bridg
 The build has no git dependency; everything comes from [crates.io](https://crates.io).
 
 - The Oodle decoder is [lztans](https://crates.io/crates/lztans) (ours), pure Rust and written in a clean room:
-  from a prose specification of the format, by an implementer who read no existing decoder. The earlier build
-  used oozextract, which is no longer a dependency.
+  from a prose specification of the format, by an implementer who read no existing decoder.
+- Releases v0.1.0 and v0.2.0 (source and binaries) used [oozextract](https://crates.io/crates/oozextract) 0.5
+  for Oodle. Its license field says MIT, but its code appears to be a port of [ooz](https://github.com/powzix/ooz),
+  which is GPL-3.0, so those two releases may carry GPL-3.0 obligations. v0.3.0 and later contain none of that
+  code: use them.
 - Block-compressed textures (BC1 to BC7) are decoded by [bcn-decode](https://crates.io/crates/bcn-decode) (ours),
   written from the public specifications.
 - zstd, for the property texts of `Packages.bin`, is the C library through the [zstd](https://crates.io/crates/zstd)
