@@ -12,7 +12,7 @@ own probes could reproduce on the branch as it stands.
 ## Blockers
 
 ### B1. Unframed Oodle limit `0xFF_FFFF` is not justified by the docs and can reject valid entries
-`src/cache.rs:146-148` (`MAX_BLOCK_LEN`) and `src/cache.rs:166-169` (the `limit`).
+`src/cache.rs:147` (`MAX_BLOCK_LEN`) and `src/cache.rs:169-178` (the `limit` and its `ensure!`).
 
 - The module doc (`src/cache.rs:9-11`) says an entry whose first eight bytes are not a block header is "a single
   unframed block spanning the whole entry". It states no maximum. The 24-bit field belongs to the *block
@@ -32,30 +32,30 @@ own probes could reproduce on the branch as it stands.
   docs first; the reviewer could not derive one.
 
 ### B2. The `w <= 0xFFFF` check in `read_radiance_hdr` is not tested (mutation P1 survives)
-`src/probe.rs:285-289`, tests `tests/hardening.rs:229-250` (`radiance_*`).
+`src/probe.rs:285-289`, tests `tests/hardening.rs:199-250` (`mod probe`).
 
 - With the check removed (`true || w <= 0xFFFF`) every test passes. The existing test dies earlier (the size line
   is followed by text, not a `02 02 hh ll` marker), so it never reaches the code that the check protects.
 - The check does matter: the marker comparison truncates `w` with `as u8`, so `w = 4294967304` (`0x1_0000_0008`) matches the
   marker `02 02 00 08`, and `vec![[0u8; 4]; w]` then asks for 17 GB. I confirmed this on the mutated copy: the process aborts with
-  `memory allocation of 17179869216 bytes failed` from a 40-byte input. On the branch as it stands the check turns it into an `Err`.
+  `memory allocation of 17179869216 bytes failed` from a 34-byte input. On the branch as it stands the check turns it into an `Err`.
 - Minimal fix (test): add
   `b"\n\n-Y 1 +X 4294967304\n\x02\x02\x00\x08"` followed by 8 bytes, assert `is_err()` and that `largest_allocation` is below `SMALL`.
 
 ### B3. Other fix lines whose removal no test notices (the "every new test fails without its fix" check)
 Mutations that survived (details in the table below):
 
-- `src/probe.rs:306-312`/`:314-316` (P4): the literal-run check `c <= w - x`. Without it a literal longer than the scanline
+- `src/probe.rs:318` (P4): the literal-run check `c <= w - x`. Without it a literal longer than the scanline
   indexes `scan[x + i]` out of bounds and panics. The test inputs for literals are all shorter than the data that follows
   (`[9,1,2,3]`, `[4,1,2]`, `[100]`), so they fail in `get(pos..pos+c)` first. Needed: scanline `w=4` and a literal of 100 followed by 100 bytes.
-- `src/probe.rs:314-318` (P6): the `get(pos..pos + c)` bound, restored to a padded read. No test needs it.
-- `src/cache.rs:187-190` (C1): `dec <= len - written`. With `dec <= len` a second block can push the output past `len`
+- `src/probe.rs:319-321` (P6): the `get(pos..pos + c)` bound, restored to a padded read. No test needs it.
+- `src/cache.rs:188` (C1): `dec <= len - written`. With `dec <= len` a second block can push the output past `len`
   and `decompress` returns more than `len` bytes without an error. Needed: two blocks whose sizes add up to more than `len`, assert `Err`.
-- `src/cache.rs:150` and the "best ratio" test (C2): `lzf_at_its_best_ratio_is_still_accepted` uses 5 input bytes for 265 output bytes
+- `src/cache.rs:151` and the "best ratio" test (C2): `lzf_at_its_best_ratio_is_still_accepted` uses 5 input bytes for 265 output bytes
   (ratio 53), so `LZF_MAX_RATIO = 87` also passes. The bound is exactly right (a 264-byte copy takes 3 bytes, see the
   module doc of `lzf_decompress`), but the test does not pin it. Needed: one literal plus 100 copies of `[7<<5, 255, 0]` (300002 bytes in, 26 400 001 out;
   I ran it on the branch: accepted in 71 ms) and the same with one input byte removed.
-- `src/cache.rs:146` (C7) and `src/toc.rs:35` (T2, T4): boundary values (`0xFF_FFFF` accepted / `0x100_0000` rejected; a path of exactly 4096
+- `src/cache.rs:147` (C7) and `src/toc.rs:101` (T2, T4): boundary values (`0xFF_FFFF` accepted / `0x100_0000` rejected; a path of exactly 4096
   bytes accepted / 4097 rejected; the limit applied to files as well as directories) have no test.
 - Why this is a blocker and not a note: the task requires each new test to fail without its fix, and the CLOUD-REPORT says every test was checked.
   Fix B2 and the C1/P4 cases at least; the boundary tests (C2, C7, T2, T4) are cheap and should go in the same commit.
@@ -128,7 +128,7 @@ Inaccurate or missing:
 | C6 | `Vec::new()` back to `vec![0; len]` | caught (declared_size test) |
 | C7 | `MAX_BLOCK_LEN` `0xFF_FFFF` to `0x100_0000` | **survived** |
 | P1 | `w <= 0xFFFF` disabled | **survived** (confirmed 17 GB abort with a crafted 40-byte input, B2) |
-| P2 | `with_capacity(w * h)` back | caught (process aborted: allocation of the test input's capacity) |
+| P2 | `with_capacity(w * h)` back | caught (the test process died, so no test name is printed) |
 | P3 | repeat-run check `run <= w - x` disabled | caught (`radiance_malformed_runs_are_errors`) |
 | P4 | literal-run check `c <= w - x` disabled | **survived** |
 | P5 | `data[pos]` unchecked again | caught (`radiance_malformed_runs_are_errors`) |
@@ -148,20 +148,20 @@ The G mutations are caught by the existing unit test `toc::tests::globs`, not on
 ## Tests, fuzzing, coverage (items 3, 4, 5)
 
 - Branch checked out in a scratch worktree. `cargo build -p wf-unpack --release`, `cargo test -p wf-unpack` (138 + 26 + 9 tests, no failures),
-  `cargo test -p wf-unpack --features bridge` (159 + 39 + ...), `cargo test -p wf-unpack --release --lib bc6h`, `cargo fmt --all -- --check` and
+  `cargo test -p wf-unpack --features bridge` (159 + 39 + 9 tests, no failures), `cargo test -p wf-unpack --release --lib bc6h`, `cargo fmt --all -- --check` and
   `python3 tools/check_public_tree.py --range origin/main..HEAD` all pass. `cargo clippy -p wf-unpack --all-targets`: the one `player.rs:680` warning, also on `main`.
   `cargo build -p wf-viewer` (macOS job) was not run: the container is Linux.
 - Fuzzing: nightly, ASan (cargo-fuzz default), overflow checks and debug assertions (the fuzz crate's release profile),
   `-max_total_time=600 -rss_limit_mb=2048 -timeout=10 -max_len=8192`, four targets at a time on 4 cores, starting from a copy of the committed corpus.
   All 18 targets exited 0 after 600 s with no crash, timeout or OOM (runs per target between 0.2 M and 17.5 M).
-  I did not run longer inputs (`-max_len` above 8192) or UBSan separately (Rust has no UB sanitizer beyond ASan on safe code; the library has one `unsafe` block, the macOS `fcntl`).
+  I did not run longer inputs (`-max_len` above 8192) or any sanitizer besides ASan; the library has one `unsafe` block (the macOS `fcntl`, not built here).
 - Coverage of the committed corpus (`cargo +nightly fuzz coverage`, line coverage by function): `cache::decompress` 35/35, `lzf_decompress` 32/32, `read_radiance_hdr` 59/59,
   `glob_match` 29/29, `clip_filter_matches` 3/3, `Toc::parse` 51/51, `RawLevel::parse` 62/62, `StaticLevel::parse` 55/78, `ModelHeader::parse` 168/169, `Model::from_parts` 97/100,
   `AnimHeader::parse` 90/90, `animation::decode` 119/137, `TextureHeader::parse` 33/33, `parse_triangle_mesh` 29/29, `PackagesBin::parse` 84/85, `TextReader::text` 21/22,
   `Attributes::parse` 7/7, `CommonHeader::parse` 24/24, `decode_bc6h_block` 8/8, `parse_properties` 16/16, the three vertex decoders 11/11, 15/15, 17/18.
   The harnesses reach the parsers.
 - Extra hostile-input probes (release, scratch test file, not committed): glob 64 KB x 64 KB 2.8 s; 1000 framed 16 MiB headers 11 ms; 200 000 empty blocks 1.6 ms;
-  unframed Oodle of 5 bytes declaring 16 MiB 13 ms; maximum-ratio LZF 71 ms; 17 GB radiance width (only with P1) aborts.
+  unframed Oodle of 5 bytes declaring 16 MiB 13 ms; maximum-ratio LZF 71 ms; 17 GB radiance width (only with P1) aborts the process.
 
 ## Commands run
 
