@@ -282,8 +282,14 @@ pub fn read_radiance_hdr(data: &[u8]) -> Result<(usize, usize, Vec<[f32; 3]>)> {
         "unsupported orientation {size}"
     );
     let (h, w): (usize, usize) = (parts[1].parse()?, parts[3].parse()?);
+    // The scanline marker holds the width in 16 bits
+    ensure!(
+        w <= 0xFFFF,
+        "scanline width {w} does not fit the run-length marker"
+    );
     let mut pos = end + nl + 1;
-    let mut out = Vec::with_capacity(w * h);
+    // Grown scanline by scanline: the height in the file says nothing about how much data follows
+    let mut out = Vec::new();
     for _ in 0..h {
         ensure!(
             data.get(pos..pos + 4) == Some(&[2, 2, (w >> 8) as u8, (w & 255) as u8][..]),
@@ -297,15 +303,24 @@ pub fn read_radiance_hdr(data: &[u8]) -> Result<(usize, usize, Vec<[f32; 3]>)> {
                 let c = *data.get(pos).ok_or_else(|| anyhow::anyhow!("truncated"))? as usize;
                 pos += 1;
                 if c > 128 {
-                    let v = data[pos];
+                    let v = *data.get(pos).ok_or_else(|| anyhow::anyhow!("truncated"))?;
                     pos += 1;
-                    for i in 0..c - 128 {
+                    let run = c - 128;
+                    ensure!(
+                        run <= w - x,
+                        "run of {run} pixels past the end of the scanline"
+                    );
+                    for i in 0..run {
                         scan[x + i][ch] = v;
                     }
-                    x += c - 128;
+                    x += run;
                 } else {
-                    for i in 0..c {
-                        scan[x + i][ch] = data[pos + i];
+                    ensure!(c <= w - x, "run of {c} pixels past the end of the scanline");
+                    let literal = data
+                        .get(pos..pos + c)
+                        .ok_or_else(|| anyhow::anyhow!("truncated"))?;
+                    for (i, &v) in literal.iter().enumerate() {
+                        scan[x + i][ch] = v;
                     }
                     pos += c;
                     x += c;

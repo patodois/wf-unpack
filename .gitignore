@@ -1,3 +1,6 @@
 /target
 tools/render/node_modules
 /dist
+/fuzz/target
+/fuzz/artifacts
+/fuzz/coverage
