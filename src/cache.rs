@@ -143,29 +143,54 @@ pub fn block_header(h: &[u8]) -> Option<(usize, usize)> {
     ))
 }
 
+/// Largest decompressed size a block header can express (its 24-bit field).
+const MAX_BLOCK_LEN: usize = 0xFF_FFFF;
+
+/// Most bytes one LZF stream can produce per input byte: a back-reference of up to 264 bytes
+/// (`7 + 255 + 2`) takes three input bytes (control, extra length, distance).
+const LZF_MAX_RATIO: usize = 88;
+
 /// Decompresses an entry's data to `len` bytes.
+///
+/// `len` comes from the `.toc` and is not trusted: the output grows block by block, so memory use is
+/// bounded by what the blocks actually decode to (and, for an unframed entry, by what the input can
+/// produce) and never by the declared size alone.
 pub fn decompress(data: &[u8], len: usize) -> Result<Vec<u8>> {
     if data.len() == len {
         return Ok(data.to_vec());
     }
-    let mut out = vec![0u8; len];
+    let mut out: Vec<u8> = Vec::new();
     let mut pos = 0;
-    let mut written = 0;
-    while written < len {
+    while out.len() < len {
         let (comp, dec, start) = match block_header(&data[pos..]) {
             Some((comp, dec)) => (comp, dec, pos + 8),
-            None if pos == 0 => (data.len(), len, 0),
+            None if pos == 0 => {
+                // Unframed: one block over the whole entry, so its size must be one the input can make
+                let limit = if data.first() == Some(&OODLE_MAGIC) {
+                    MAX_BLOCK_LEN
+                } else {
+                    data.len().saturating_mul(LZF_MAX_RATIO)
+                };
+                ensure!(
+                    len <= limit,
+                    "{len} bytes cannot come out of an unframed block of {} bytes",
+                    data.len()
+                );
+                (data.len(), len, 0)
+            }
             None => bail!("bad block header at offset {pos}"),
         };
         let block = data
             .get(start..start + comp)
             .with_context(|| format!("block at offset {pos} is truncated"))?;
-        let dest = out.get_mut(written..written + dec).with_context(|| {
-            format!("block at offset {pos} decompresses past the entry size {len}")
-        })?;
-        decompress_block(block, dest)
+        let written = out.len();
+        ensure!(
+            dec <= len - written,
+            "block at offset {pos} decompresses past the entry size {len}"
+        );
+        out.resize(written + dec, 0);
+        decompress_block(block, &mut out[written..])
             .with_context(|| format!("block at offset {pos} ({comp} -> {dec} bytes)"))?;
-        written += dec;
         pos = start + comp;
     }
     ensure!(

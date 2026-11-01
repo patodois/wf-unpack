@@ -1,0 +1,148 @@
+[package]
+name = "wf-unpack-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "cargo-fuzz targets for wf-unpack (nightly only; not part of the workspace, the package or CI)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wf-unpack = { path = ".." }
+
+# Not a member of the root workspace: the root build, the published package and CI never see this crate
+[workspace]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "animation"
+path = "fuzz_targets/animation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "animtree"
+path = "fuzz_targets/animtree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bc6h"
+path = "fuzz_targets/bc6h.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_decompress"
+path = "fuzz_targets/cache_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "common_header"
+path = "fuzz_targets/common_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ee_attributes"
+path = "fuzz_targets/ee_attributes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob"
+path = "fuzz_targets/glob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level"
+path = "fuzz_targets/level.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lzf"
+path = "fuzz_targets/lzf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "material_text"
+path = "fuzz_targets/material_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model"
+path = "fuzz_targets/model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_vertex"
+path = "fuzz_targets/model_vertex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packages_bin"
+path = "fuzz_targets/packages_bin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "physx"
+path = "fuzz_targets/physx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "radiance_hdr"
+path = "fuzz_targets/radiance_hdr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "texture"
+path = "fuzz_targets/texture.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toc_parse"
+path = "fuzz_targets/toc_parse.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "entity_text"
+path = "fuzz_targets/entity_text.rs"
+test = false
+doc = false
+bench = false
