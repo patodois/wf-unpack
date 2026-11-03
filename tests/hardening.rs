@@ -5,29 +5,56 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-/// Records the largest single allocation made by the current thread.
+/// Records, per thread, what the allocator is asked for.
 struct Tracking;
 
-thread_local! {
-    static LARGEST: Cell<usize> = const { Cell::new(0) };
+/// What the allocator saw while a closure ran on the current thread.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    /// The largest single allocation.
+    largest: usize,
+    /// All bytes asked for, counting a resize as a new allocation of its full size.
+    total: usize,
+    /// The most bytes alive at once, taking a resize as the worst case (the new block exists while
+    /// the old one is still there).
+    peak: usize,
 }
 
-// SAFETY: forwards every call to the system allocator; the bookkeeping only touches a const-initialised
-// thread-local cell, which does not allocate.
+thread_local! {
+    static STATS: Cell<Stats> = const { Cell::new(Stats { largest: 0, total: 0, peak: 0 }) };
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+}
+
+fn grow(size: usize, replaced: usize) {
+    let _ = LIVE.try_with(|live| {
+        let _ = STATS.try_with(|s| {
+            let mut st = s.get();
+            st.largest = st.largest.max(size);
+            st.total += size;
+            st.peak = st.peak.max(live.get() + size);
+            s.set(st);
+        });
+        live.set(live.get().saturating_sub(replaced) + size);
+    });
+}
+
+// SAFETY: forwards every call to the system allocator; the bookkeeping only touches const-initialised
+// thread-local cells, which do not allocate.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = LARGEST.try_with(|l| l.set(l.get().max(layout.size())));
+        grow(layout.size(), 0);
         System.alloc(layout)
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let _ = LARGEST.try_with(|l| l.set(l.get().max(layout.size())));
+        grow(layout.size(), 0);
         System.alloc_zeroed(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
         System.dealloc(ptr, layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let _ = LARGEST.try_with(|l| l.set(l.get().max(new_size)));
+        grow(new_size, layout.size());
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -35,11 +62,18 @@ unsafe impl GlobalAlloc for Tracking {
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
 
+/// Runs `f` and returns its result with what the allocator saw. Memory alive before the call does not count.
+fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
+    STATS.with(|s| s.set(Stats::default()));
+    LIVE.with(|l| l.set(0));
+    let out = f();
+    (out, STATS.with(Cell::get))
+}
+
 /// Runs `f` and returns its result with the largest single allocation it made.
 fn largest_allocation<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    LARGEST.with(|l| l.set(0));
-    let out = f();
-    (out, LARGEST.with(Cell::get))
+    let (out, stats) = measure(f);
+    (out, stats.largest)
 }
 
 /// Allocations of a reader over a few bytes of input must stay far below this.
@@ -111,6 +145,117 @@ mod cache {
         // and an entry that ends inside a block
         let out = decompress(&oodle_fill_blocks(3), 2 * 262_144 + 7).unwrap();
         assert_eq!((out.len(), out[2 * 262_144 + 6]), (2 * 262_144 + 7, 2));
+    }
+
+    /// The buffer of an unframed Oodle stream doubles. If it grew by one block per step, every step would
+    /// decode the stream again from its start and the work would be quadratic: the bytes allocated
+    /// along the way (one buffer per step) are the measure, since the buffers are what is decoded into.
+    #[test]
+    fn unframed_oodle_buffer_doubles() {
+        let blocks = 70;
+        let len = blocks * 262_144;
+        let data = oodle_fill_blocks(blocks);
+        let (r, stats) = measure(|| decompress(&data, len));
+        assert_eq!(r.unwrap().len(), len);
+        // 256 KiB, 512 KiB, ... up to the size: about twice `len` in all (one block at a time: 35 times)
+        assert!(
+            stats.total <= 4 * len,
+            "allocated {} bytes for {len}",
+            stats.total
+        );
+        assert!(stats.peak <= len + SMALL, "peak {} bytes", stats.peak);
+    }
+
+    /// The first buffer is one block (262,144 bytes) and each next one twice the last. A stream that ends
+    /// early shows the sequence in what it allocates: the sizes up to the first one past its end.
+    #[test]
+    fn unframed_oodle_buffer_starts_at_one_block_and_doubles() {
+        let band = |blocks: usize, sizes: &[usize]| {
+            let data = oodle_fill_blocks(blocks);
+            let (r, stats) = measure(|| decompress(&data, MAX_ENTRY));
+            assert!(r.is_err());
+            let expect: usize = sizes.iter().sum();
+            assert!(
+                (expect..expect + 65_536).contains(&stats.total),
+                "{blocks} blocks: allocated {} bytes, expected {expect}",
+                stats.total
+            );
+            // never more than twice what the stream produced
+            assert!(stats.largest <= 2 * blocks * 262_144);
+        };
+        let k = 262_144;
+        band(1, &[k, 2 * k]);
+        band(3, &[k, 2 * k, 4 * k]);
+        band(4, &[k, 2 * k, 4 * k, 8 * k]);
+    }
+
+    /// An Oodle block of 262,144 bytes whose payload is two sub-chunks of 131,072: the first stored, the
+    /// second an RLE array with a one-byte body (`lztans` decodes both; this is the only way to put a block
+    /// that is not a fill block in a few bytes). Output: `0..` pattern, then 131,072 times `fill`.
+    fn oodle_two_subchunk_block(fill: u8) -> (Vec<u8>, Vec<u8>) {
+        let raw: Vec<u8> = (0..131_072u32).map(|i| (i % 251) as u8).collect();
+        let mut payload = vec![0x82, 0x00, 0x00];
+        payload.extend(&raw);
+        payload.extend([0x37, 0xFF, 0xFC, 0x00, 0x01, fill]);
+        let size = payload.len() - 1;
+        let mut data = vec![
+            0x8C,
+            0x06,
+            (size >> 16) as u8,
+            (size >> 8) as u8,
+            size as u8,
+        ];
+        data.extend(&payload);
+        let mut out = raw;
+        out.extend(vec![fill; 131_072]);
+        (data, out)
+    }
+
+    /// Prefixes of the output are decoded in whole blocks of 262,144 bytes: a block that is not a fill
+    /// block cannot be decoded as two halves, so a buffer of 131,072 bytes would fail.
+    #[test]
+    fn unframed_oodle_prefixes_are_whole_blocks() {
+        let (mut data, mut expect) = oodle_two_subchunk_block(0x5A);
+        assert_eq!(expect.len(), 262_144);
+        // a second block, so the entry is longer than one block and the first size tried is a prefix
+        data.extend([0x8C, 0x06, 0x07, 0xFF, 0xFF, 9]);
+        expect.extend(vec![9u8; 262_144]);
+        assert_eq!(decompress(&data, expect.len()).unwrap(), expect);
+        assert_eq!(
+            decompress(&data, 262_144 + 5).unwrap(),
+            expect[..262_144 + 5]
+        );
+        // and the block on its own
+        let (one, expect) = oodle_two_subchunk_block(0x11);
+        assert_eq!(decompress(&one, 262_144).unwrap(), expect);
+    }
+
+    /// A framed entry takes one buffer of what its blocks add up to: growing the output by reallocation
+    /// held up to three times the entry at once (106 MB over it for an entry of 100 MB).
+    #[test]
+    fn framed_entry_peak_is_one_times_its_size() {
+        let (blocks, block) = (8usize, 1 << 20);
+        let len = blocks * block;
+        let mut data = Vec::new();
+        for i in 0..blocks {
+            data.extend(block_header(block as u32, block as u32));
+            data.extend(vec![i as u8; block]);
+        }
+        let (r, stats) = measure(|| decompress(&data, len));
+        let out = r.unwrap();
+        assert!(out
+            .chunks(block)
+            .enumerate()
+            .all(|(i, c)| c.iter().all(|&b| b == i as u8)));
+        assert!(stats.peak <= len + 4096, "peak {} for {len}", stats.peak);
+        // a `.toc` that claims more than the blocks hold reserves what the blocks hold
+        let (r, stats) = measure(|| decompress(&data, MAX_ENTRY));
+        assert!(r.is_err());
+        assert!(stats.largest <= len + 4096, "allocated {}", stats.largest);
+        // and one that claims less, no more than it claims
+        let (r, stats) = measure(|| decompress(&data, block));
+        assert!(r.is_err());
+        assert!(stats.largest <= block + 4096, "allocated {}", stats.largest);
     }
 
     /// `decompress` is public and `Package::read` is not the only way in: the largest entry applies to it too.
