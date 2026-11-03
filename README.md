@@ -50,7 +50,7 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
 
 ```sh
-sh tools/verify-release.sh wf-unpack v0.3.0 path/to/folder
+sh tools/verify-release.sh wf-unpack v0.3.1 path/to/folder
 ```
 
 The signed text is `osp release patodois/wf-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
