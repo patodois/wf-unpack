@@ -27,6 +27,20 @@ jobs:
       # The BC6H comparison against bcn-decode also in release
       - run: cargo test -p wf-unpack --release --lib bc6h
 
+  # The fuzz targets are a separate crate (they run on nightly, but they also compile on stable): this
+  # keeps them from rotting when the library changes. It does not run them.
+  fuzz-targets:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo check --locked
+        working-directory: fuzz
+
   viewer:
     name: Viewer (macOS)
     runs-on: macos-latest

@@ -1,8 +1,9 @@
 # Fuzzing wf-unpack
 
 Coverage-guided fuzz targets (cargo-fuzz / libFuzzer) for every reader that takes untrusted bytes or
-text. This crate needs a nightly toolchain and is **not** part of the workspace, the published package
-or CI (`[workspace]` in `Cargo.toml`, `exclude` in the root `Cargo.toml`).
+text. This crate needs a nightly toolchain to fuzz and is **not** part of the workspace or the published
+package (`[workspace]` in `Cargo.toml`, `exclude` in the root `Cargo.toml`). CI only compiles it
+(`cargo check --locked`); it does not run the targets.
 
 ```sh
 cargo install cargo-fuzz
@@ -36,7 +37,9 @@ cargo +nightly fuzz list
 Targets that read several parts of an asset (`H.`, `B.`, `F.`) split their input with
 `wf_unpack_fuzz::split`: the first `2 * (parts - 1)` bytes are little-endian `u16` lengths.
 
-`corpus/` holds a minimised corpus (made with `-merge=1`) seeded with synthetic inputs: `gen_seeds.py`
-builds them from the layouts documented in `docs/` and in the module docs, plus the byte strings the unit
-tests build. The `crash-*` files are the inputs that once made a reader fail; each has a regular test in
-`tests/hardening.rs`. No game data is used anywhere.
+`corpus/` holds only the seeds and the regression inputs, about 130 small files: `gen_seeds.py` builds
+the seeds from the layouts documented in `docs/` and in the module docs, plus the byte strings the unit
+tests build (the files named `<module>.<builder>.<hash>`). The `crash-*` files are the inputs that once
+made a reader fail; each has a regular test in `tests/hardening.rs`. What a fuzz run adds (files named
+by their SHA-1) is git-ignored: each run grows its own corpus from the seeds, and `cargo fuzz cmin <target>`
+shrinks it. No game data is used anywhere.

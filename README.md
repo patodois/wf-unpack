@@ -87,6 +87,10 @@ To build it yourself instead, see [Build](#build).
   `mkdir -p ~/Games/Warframe && ln -s "<your Cache.Windows>" ~/Games/Warframe/Cache.Windows`.
 - **Memory and disk.** Most commands need well under 1 GB of RAM. The exceptions are said next to the command
   below. Output is small except for level exports with full-size textures.
+- **Limits.** These are resource caps, not facts of the formats; the readers refuse input past them with an
+  error. A decompressed `.cache` entry is at most 1 GiB (`MAX_ENTRY_LEN`). A full path in a `.toc` is at most
+  4096 bytes, because every directory keeps its full path and a crafted chain of nested directories would
+  otherwise take memory quadratic in the file size (the longest path in the author's install is 158 bytes).
 
 ## Build
 

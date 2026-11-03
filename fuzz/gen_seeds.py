@@ -51,6 +51,11 @@ put("cache_decompress", "crash-declared-size", u32(3372932899) + bytes([2, 97, 9
 put("cache_decompress", "stored", u32(5) + b"hello")
 put("cache_decompress", "unframed_lzf", u32(9) + lzf)
 put("cache_decompress", "framed", u32(13) + block(4, 4) + b"wxyz" + block(len(lzf), 9) + lzf)
+# Unframed Oodle: fill blocks of 262,144 bytes, six bytes each (block header, quantum header, fill byte)
+oodle_fill = b"".join(bytes([0x8C, 0x06, 0x07, 0xFF, 0xFF, i]) for i in range(3))
+put("cache_decompress", "unframed_oodle_fill", u32(3 * 262144 - 5) + oodle_fill)
+# the same stream under an entry that claims 1 GiB (its buffers must follow the stream, not the claim)
+put("cache_decompress", "crash-unframed-oodle-claimed-size", u32(1 << 30) + oodle_fill)
 put("cache_decompress", "oodle_garbage", u32(64) + block(6, 64) + bytes([0x8C, 6, 255, 255, 255, 255]))
 
 # --- toc ----------------------------------------------------------------------------------------
@@ -121,6 +126,9 @@ put("texture", "probe", parts(texture(10, 2, 2, kind=183, body_mips=1), b"\3" * 
 put("bc6h", "zero", b"\0" * 16)
 put("bc6h", "mode1", bytes([0x01]) + bytes(range(15)))
 put("bc6h", "ones", b"\xff" * 16)
+# 4294967304 is 0x1_0000_0008: it matches the marker 02 02 00 08 once truncated to 16 bits
+put("radiance_hdr", "crash-width-truncated-marker", b"\n\n-Y 1 +X 4294967304\n\x02\x02\x00\x08" + bytes([136, 1] * 4))
+put("radiance_hdr", "literal_longer_than_scanline", b"\n\n-Y 1 +X 4\n\x02\x02\x00\x04" + bytes([100]) + b"\x07" * 100)
 put("radiance_hdr", "tiny", b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 2 +X 2\n" + bytes([128, 128, 128, 129] * 4))
 put("model_vertex", "zero", b"\0" * 32)
 put("model_vertex", "ones", b"\xff" * 32)
