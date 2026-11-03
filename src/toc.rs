@@ -32,9 +32,11 @@ pub const MAGIC: u32 = 0x1867_C64E;
 pub const VERSION: u32 = 20;
 const HEADER_SIZE: usize = 8;
 const ENTRY_SIZE: usize = 96;
-/// Longest full path accepted. Every directory keeps its full path, so a chain of nested directories
-/// would otherwise take memory quadratic in the size of the file; the readers of the other formats
-/// cap their path strings at the same length.
+/// Longest full path accepted: a resource cap, not a fact of the format (a name is at most 64 bytes, and
+/// the format says nothing about how deep directories nest). Every directory keeps its full path, so a
+/// chain of nested directories would otherwise take memory quadratic in the size of the file. The
+/// readers of the other formats cap their path strings at the same length, and the longest path in the
+/// author's install is 158 bytes. The README lists it among the limits.
 const MAX_PATH_LEN: usize = 4096;
 
 pub struct Toc {
