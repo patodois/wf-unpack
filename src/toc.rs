@@ -32,6 +32,12 @@ pub const MAGIC: u32 = 0x1867_C64E;
 pub const VERSION: u32 = 20;
 const HEADER_SIZE: usize = 8;
 const ENTRY_SIZE: usize = 96;
+/// Longest full path accepted: a resource cap, not a fact of the format (a name is at most 64 bytes, and
+/// the format says nothing about how deep directories nest). Every directory keeps its full path, so a
+/// chain of nested directories would otherwise take memory quadratic in the size of the file. The
+/// readers of the other formats cap their path strings at the same length, and the longest path in the
+/// author's install is 158 bytes. The README lists it among the limits.
+const MAX_PATH_LEN: usize = 4096;
 
 pub struct Toc {
     /// Files in .toc order (directories are folded into the paths).
@@ -93,6 +99,10 @@ impl Toc {
                 .with_context(|| {
                     format!("entry {i} ({name}) has unknown parent directory {parent}")
                 })?;
+            ensure!(
+                parent_path.len() + 1 + name.len() <= MAX_PATH_LEN,
+                "entry {i} ({name}) has a path over {MAX_PATH_LEN} bytes"
+            );
             let path = format!("{parent_path}/{name}");
             if offset < 0 {
                 dirs.push(path);
@@ -129,20 +139,49 @@ impl Toc {
 
 /// Matches a path against a glob: `?` is one character, `*` any run of
 /// characters within one path segment and `**` any run including `/`.
+///
+/// The pattern is matched token by token over the set of path positions still reachable, so the time
+/// is the pattern length times the path length however many wildcards the pattern has.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
-    fn go(p: &[u8], s: &[u8]) -> bool {
-        match p {
-            [] => s.is_empty(),
-            [b'*', b'*', rest @ ..] => (0..=s.len()).any(|i| go(rest, &s[i..])),
-            [b'*', rest @ ..] => {
-                let segment = s.iter().position(|&c| c == b'/').unwrap_or(s.len());
-                (0..=segment).any(|i| go(rest, &s[i..]))
+    let (p, s) = (pattern.as_bytes(), path.as_bytes());
+    // reach[j]: the pattern read so far can match s[..j]
+    let mut reach = vec![false; s.len() + 1];
+    reach[0] = true;
+    let mut next = vec![false; s.len() + 1];
+    let mut i = 0;
+    while i < p.len() {
+        next.fill(false);
+        match p[i] {
+            b'*' if p.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                let mut any = false;
+                for (n, &r) in next.iter_mut().zip(&reach) {
+                    any |= r;
+                    *n = any;
+                }
             }
-            [b'?', rest @ ..] => !s.is_empty() && s[0] != b'/' && go(rest, &s[1..]),
-            [c, rest @ ..] => s.first() == Some(c) && go(rest, &s[1..]),
+            b'*' => {
+                i += 1;
+                // Positions reachable from an earlier one without stepping over a `/`
+                let mut any = false;
+                for j in 0..=s.len() {
+                    any |= reach[j];
+                    next[j] = any;
+                    if s.get(j) == Some(&b'/') {
+                        any = false;
+                    }
+                }
+            }
+            c => {
+                i += 1;
+                for j in 0..s.len() {
+                    next[j + 1] = reach[j] && if c == b'?' { s[j] != b'/' } else { s[j] == c };
+                }
+            }
         }
+        std::mem::swap(&mut reach, &mut next);
     }
-    go(pattern.as_bytes(), path.as_bytes())
+    reach[s.len()]
 }
 
 /// Whether `path` matches an animation filter: `|` separates alternatives; each one is a

@@ -1,3 +1,9 @@
 /target
 tools/render/node_modules
 /dist
+/fuzz/target
+/fuzz/artifacts
+/fuzz/coverage
+# Inputs libFuzzer adds to fuzz/corpus (named by their SHA-1) stay local; the committed ones are the
+# named seeds and crash-* regression inputs
+/fuzz/corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

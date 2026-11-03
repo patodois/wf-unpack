@@ -143,29 +143,64 @@ pub fn block_header(h: &[u8]) -> Option<(usize, usize)> {
     ))
 }
 
+/// Output bytes per block of an Oodle stream. `lztans` documents it: the blocks depend only on earlier ones,
+/// so a buffer of a whole number of them decodes the start of the output on its own.
+const OODLE_BLOCK_LEN: usize = 262_144;
+
+/// Most bytes one LZF stream can produce per input byte: a back-reference of up to 264 bytes
+/// (`7 + 255 + 2`) takes three input bytes (control, extra length, distance).
+const LZF_MAX_RATIO: usize = 88;
+
 /// Decompresses an entry's data to `len` bytes.
+///
+/// `len` comes from the `.toc` and is not trusted, so it never sizes an allocation by itself:
+/// - A framed entry reserves, once, what its block headers add up to, at most `len`. The reservation is
+///   address space: only the blocks that really decode are zeroed and written, so a header that lies
+///   costs no more than the memory of the blocks before the first bad one. One reservation, because
+///   growing the output by reallocation takes up to three times the entry size at the peak.
+/// - An unframed LZF entry is at most what the input can produce.
+/// - An unframed Oodle stream is decoded in buffers that double until `len`, so it never holds more than
+///   twice what the stream has really produced.
+///
+/// `len` itself is capped at [`MAX_ENTRY_LEN`].
 pub fn decompress(data: &[u8], len: usize) -> Result<Vec<u8>> {
+    ensure!(
+        len <= MAX_ENTRY_LEN as usize,
+        "{len} bytes is over the largest entry size ({MAX_ENTRY_LEN})"
+    );
     if data.len() == len {
         return Ok(data.to_vec());
     }
-    let mut out = vec![0u8; len];
+    let mut out: Vec<u8> = Vec::with_capacity(framed_len(data).min(len));
     let mut pos = 0;
-    let mut written = 0;
-    while written < len {
+    while out.len() < len {
         let (comp, dec, start) = match block_header(&data[pos..]) {
             Some((comp, dec)) => (comp, dec, pos + 8),
-            None if pos == 0 => (data.len(), len, 0),
+            None if pos == 0 && data.first() == Some(&OODLE_MAGIC) => {
+                return decompress_unframed_oodle(data, len);
+            }
+            None if pos == 0 => {
+                // Unframed LZF: one block over the whole entry, so its size must be one the input can make
+                ensure!(
+                    len <= data.len().saturating_mul(LZF_MAX_RATIO),
+                    "{len} bytes cannot come out of an unframed block of {} bytes",
+                    data.len()
+                );
+                (data.len(), len, 0)
+            }
             None => bail!("bad block header at offset {pos}"),
         };
         let block = data
             .get(start..start + comp)
             .with_context(|| format!("block at offset {pos} is truncated"))?;
-        let dest = out.get_mut(written..written + dec).with_context(|| {
-            format!("block at offset {pos} decompresses past the entry size {len}")
-        })?;
-        decompress_block(block, dest)
+        let written = out.len();
+        ensure!(
+            dec <= len - written,
+            "block at offset {pos} decompresses past the entry size {len}"
+        );
+        out.resize(written + dec, 0);
+        decompress_block(block, &mut out[written..])
             .with_context(|| format!("block at offset {pos} ({comp} -> {dec} bytes)"))?;
-        written += dec;
         pos = start + comp;
     }
     ensure!(
@@ -174,6 +209,39 @@ pub fn decompress(data: &[u8], len: usize) -> Result<Vec<u8>> {
         data.len() - pos
     );
     Ok(out)
+}
+
+/// What the block headers of a framed entry say its blocks decompress to, in all: the sum over the blocks
+/// up to the first one whose header is bad or whose payload is cut off. Zero for an unframed entry.
+fn framed_len(data: &[u8]) -> usize {
+    let (mut pos, mut total) = (0usize, 0usize);
+    while let Some((comp, dec)) = data.get(pos..).and_then(block_header) {
+        let end = pos + 8 + comp;
+        if end > data.len() {
+            break;
+        }
+        total = total.saturating_add(dec);
+        pos = end;
+    }
+    total
+}
+
+/// An Oodle stream that spans the whole entry. It carries no size, and `lztans` needs a buffer of
+/// exactly the output size, so the buffer starts at one block and doubles until it reaches `len`: each
+/// size below `len` is a whole number of blocks, so the call decodes that prefix of the output (see
+/// `lztans::decode`). A stream that ends before `len` fails at the first size past its end, so memory
+/// follows what the input produces and not the size the `.toc` claims.
+fn decompress_unframed_oodle(data: &[u8], len: usize) -> Result<Vec<u8>> {
+    let mut size = len.min(OODLE_BLOCK_LEN);
+    loop {
+        let mut out = vec![0u8; size];
+        lztans::decode(data, &mut out)
+            .map_err(|e| anyhow::anyhow!("Oodle: {e:?} ({size} of {len} bytes)"))?;
+        if size == len {
+            return Ok(out);
+        }
+        size = size.saturating_mul(2).min(len);
+    }
 }
 
 fn decompress_block(block: &[u8], out: &mut [u8]) -> Result<()> {
