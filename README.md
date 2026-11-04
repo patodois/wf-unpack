@@ -12,6 +12,8 @@ rewrite**: a new engine for an old game that loads the original's assets, possib
 (a mash-up). For the second kind, wf-unpack is a *provider* for [rewrite-bridge](https://github.com/patodois/rewrite-bridge),
 a small crate of model, animation and scene types that rewrites share (see [Using it from another game](#using-it-from-another-game)).
 
+**Adding this to a game.** Read the [guide to adding a game](https://github.com/patodois/rewrite-bridge/blob/main/docs/INTEGRATING.md) first. Here: build with the `bridge` feature and open the provider with `wf_unpack::bridge::Warframe::open(cache_windows)`; you pass the `Cache.Windows` folder, nothing searches for it.
+
 What it reads:
 
 - `.toc` / `.cache` package pairs in `Cache.Windows/` (stored, Oodle and LZF blocks)
