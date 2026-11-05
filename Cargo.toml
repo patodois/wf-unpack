@@ -9,7 +9,6 @@ readme = "README.md"
 exclude = ["/fuzz", "/CLOUD-REPORT.md", "/docs/reviews"]
 
 [dependencies]
-cap-std = "3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Block-compression texture decoder (BC1 to BC7), written from the public specifications

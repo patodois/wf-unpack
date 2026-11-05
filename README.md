@@ -381,3 +381,5 @@ Licensed under either of MIT or Apache-2.0, at your option.
 - **glTF**: the open 3D file format the exports use (`.gltf` + `.bin` + PNGs). **PBR**: physically based
   materials (base colour, metal and roughness, normal map).
 - **RSS**: resident set size, the memory a process holds in RAM. **Footprint** is macOS's stricter count.
+
+Extraction rejects a symlink at the final output file and reports failure; ancestor symlinks are allowed as user-configured output locations.

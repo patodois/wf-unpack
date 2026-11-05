@@ -651,24 +651,30 @@ fn extract(path: &Path, pattern: &str, out: &Path) -> Result<()> {
         .cloned()
         .collect();
     fs::create_dir_all(out)?;
-    let output = cap_std::fs::Dir::open_ambient_dir(out, cap_std::ambient_authority())?;
     let (mut written, mut failed) = (0, 0);
     for e in &selected {
         let Some(dest) = safe_join(out, &e.path) else {
             eprintln!("skipping unsafe path {:?}", e.path);
             continue;
         };
-        match pkg.read(e) {
-            Ok(data) => {
-                let relative = dest.strip_prefix(out)?;
-                if let Some(parent) = relative.parent() {
-                    output.create_dir_all(parent)?;
-                }
-                output
-                    .write(relative, &data)
-                    .with_context(|| format!("writing {}", dest.display()))?;
-                written += 1;
+        // Ancestor symlinks are user configuration; refuse only a symlink at the final file.
+        let result = (|| -> Result<()> {
+            if let Ok(meta) = fs::symlink_metadata(&dest) {
+                anyhow::ensure!(
+                    !meta.file_type().is_symlink(),
+                    "refusing final symlink {}",
+                    dest.display()
+                );
             }
+            let data = pkg.read(e)?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&dest, data).with_context(|| format!("writing {}", dest.display()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => written += 1,
             Err(err) => {
                 eprintln!("{}: {err:#}", e.path);
                 failed += 1;
