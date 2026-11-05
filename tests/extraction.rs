@@ -67,3 +67,15 @@ fn extraction_does_not_follow_existing_symlinks_outside_output() {
         assert!(!result.status.success());
     }
 }
+
+#[test]
+fn incomplete_extraction_returns_failure() {
+    let (r, o) = fixture("short", 5, "file.txt");
+    let result = extract(&r, &o);
+    assert!(
+        !result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!o.join("file.txt").exists());
+}

@@ -679,6 +679,7 @@ fn extract(path: &Path, pattern: &str, out: &Path) -> Result<()> {
         "wrote {written} files to {} ({failed} failed)",
         out.display()
     );
+    anyhow::ensure!(failed == 0, "failed to extract {failed} selected files");
     Ok(())
 }
 
