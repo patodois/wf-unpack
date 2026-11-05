@@ -236,14 +236,14 @@ The other game needs none of Warframe's formats. To use it:
 ```toml
 [dependencies]
 wf-unpack = { git = "https://github.com/patodois/wf-unpack", features = ["bridge"] }
-# crates.io gives every crate in the build the same rewrite-bridge: all 0.2.x requirements share one copy
-rewrite-bridge = "0.2"
+# crates.io gives every crate in the build the same rewrite-bridge: all 0.3.x requirements share one copy
+rewrite-bridge = "0.3"
 ```
 
 Every crate in one build has to share one copy of rewrite-bridge, or `Warframe` implements a `Provider` that
 your code's `Provider` is not ("multiple different versions of crate `rewrite_bridge`"). From crates.io Cargo does
-that for you: this crate asks for `0.2.1`, your `"0.2"` accepts it, and both resolve to one 0.2.x release. Another
-minor line (`"0.3"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
+that for you: this crate asks for `0.3.1`, your `"0.3"` accepts it, and both resolve to one 0.3.x release. Another
+minor line (`"0.2"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
 
 ```rust
 use rewrite_bridge::Provider;
