@@ -124,7 +124,12 @@ impl Atlas {
                 f.powi(3) / 6.0,
             ]
         };
-        let (x, y) = (u * self.width as f32 - 0.5, v * self.height as f32 - 0.5);
+        // Preserve the full edge filter footprint, but clamp before multiplication and integer casts.
+        let finite_uv = |t: f32| if t.is_nan() { 0.0 } else { t.clamp(-1.0, 2.0) };
+        let (x, y) = (
+            finite_uv(u) * self.width as f32 - 0.5,
+            finite_uv(v) * self.height as f32 - 0.5,
+        );
         let (wx, wy) = (weights(x), weights(y));
         let (ix, iy) = (x.floor() as i64, y.floor() as i64);
         let mut out = [0.0f32; 4];
@@ -355,5 +360,24 @@ mod tests {
             atlas_uv([0.25, 0.5, 0.125, 0.25], [1.0, 0.5]),
             [0.375, 0.625]
         );
+    }
+}
+#[cfg(test)]
+mod coordinate_regression {
+    use super::*;
+    #[test]
+    fn extreme_finite_uv_is_finite_and_clamped() {
+        let a = Atlas {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 110, 120, 130, 255],
+        };
+        for u in [f32::MAX, -f32::MAX] {
+            let actual = a.bspline(u, u);
+            let expected = a.bspline(if u > 0.0 { 2.0 } else { -2.0 }, 0.5);
+            for i in 0..4 {
+                assert!(actual[i].is_finite() && (actual[i] - expected[i]).abs() < 1e-5);
+            }
+        }
     }
 }
