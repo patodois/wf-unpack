@@ -1814,19 +1814,26 @@ impl Tree {
                     Node::Select { var, .. } | Node::SingleAxis { var, .. } => Some(*var),
                     _ => None,
                 };
+                let kind = self.graph.type_name(node);
+                let cost = std::mem::size_of::<Selection>() + kind.len();
+                remaining = remaining
+                    .checked_sub(cost)
+                    .context("traversal path exceeds the aggregate byte budget")?;
                 path.push(Selection {
                     node,
-                    kind: self.graph.type_name(node).to_string(),
+                    kind: kind.to_string(),
                     var,
                     slot: next,
                 });
-                path_bytes += std::mem::size_of::<Selection>() + path.last().unwrap().kind.len();
+                path_bytes += cost;
                 stack.push((child, 0));
             } else {
                 stack.pop();
                 if !stack.is_empty() {
                     if let Some(p) = path.pop() {
-                        path_bytes -= std::mem::size_of::<Selection>() + p.kind.len();
+                        let cost = std::mem::size_of::<Selection>() + p.kind.len();
+                        path_bytes -= cost;
+                        remaining += cost;
                     }
                 }
             }
@@ -2612,5 +2619,16 @@ mod leaf_path_budget {
             leaves.iter().map(|l| l.path.len()).collect::<Vec<_>>(),
             [0, 1, 2, 3]
         );
+    }
+    #[test]
+    fn traversal_paths_share_the_budget_even_without_output_leaves() {
+        let mut t = chain(32);
+        t.nodes = vec![
+            Node::SubTree {
+                path: String::new()
+            };
+            32
+        ];
+        assert!(t.leaves_limited(0, None, 512).is_err());
     }
 }

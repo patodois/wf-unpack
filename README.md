@@ -384,4 +384,4 @@ Licensed under either of MIT or Apache-2.0, at your option.
 
 Extraction rejects a symlink at the final output file and reports failure; ancestor symlinks are allowed as user-configured output locations.
 
-Animation-tree leaves return a Result and refuse more than 8 MiB of copied path selections, including their kind strings.
+Animation-tree leaves return a Result and refuse more than 8 MiB of path selections across output leaves and the active traversal path, including their kind strings.
