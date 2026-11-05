@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod bridge_anim;
 #[cfg(feature = "bridge")]
 pub mod bridge_scene;
+pub mod build;
 pub mod bytes;
 pub mod cache;
 pub mod clipspec;
@@ -31,6 +32,8 @@ pub mod pipeline;
 pub mod player;
 pub mod postprocess;
 pub mod probe;
+#[cfg(feature = "bridge")]
+pub mod resolve;
 pub mod scene;
 pub mod texture;
 pub mod toc;

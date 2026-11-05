@@ -101,6 +101,7 @@ use rewrite_bridge::{
 
 use crate::animation::{self, AnimHeader, KIND_ANIMATION};
 use crate::bridge_anim::{self, ClipInfo};
+use crate::build::{GameBuild, Strictness};
 use crate::cache::Package;
 use crate::clipspec::clip_spec;
 use crate::header::CommonHeader;
@@ -296,6 +297,16 @@ impl Warframe {
         })
     }
 
+    /// [`Warframe::open`], after `strictness` has looked at the build: with [`Strictness::Strict`] an
+    /// install whose `.toc` or `Packages.bin` format this reader does not support is refused here, with one
+    /// error that names the build (see [`crate::build`]), instead of failing later on the first asset.
+    pub fn open_with(game: &Path, strictness: Strictness) -> Result<Self> {
+        if strictness == Strictness::Strict {
+            GameBuild::inspect(game)?.check(strictness)?;
+        }
+        Self::open(game)
+    }
+
     /// Shrinks baked textures to at most this many pixels on a side (a box filter over 2x2
     /// blocks, halving until they fit). Default: no limit. A level's models each own copies of
     /// their images (the bridge's `Material` owns them), so big levels need a limit: the dojo's
@@ -471,6 +482,50 @@ impl Warframe {
 }
 
 impl Warframe {
+    /// What [`Provider::list`] would say about one id, without building the whole index: `None` when
+    /// `path` is not a listed model or level (animated and collision suffixes are not part of a listed
+    /// path, so an id that carries one is `None` here; split it first with [`split_animated_id`]).
+    /// Reads the one header it needs.
+    pub fn asset_info(&self, path: &str) -> Result<Option<AssetInfo>> {
+        let stem = |path: &str| {
+            path.rsplit('/')
+                .next()
+                .unwrap_or(path)
+                .trim_end_matches(".fbx")
+                .trim_end_matches(".level")
+                .to_string()
+        };
+        if is_level(path) {
+            let listed = Package::open_in(&self.game, "H.AnimRetarget")?
+                .is_some_and(|p| p.toc.get(path).is_some());
+            return Ok(listed.then(|| AssetInfo {
+                name: stem(path),
+                kind: AssetKind::Level,
+                id: path.to_string(),
+            }));
+        }
+        let mut inner = self.lock_inner();
+        // The live entry, as `models` takes it
+        let Some(entry) = inner.head.toc.get(path).cloned() else {
+            return Ok(None);
+        };
+        let raw = inner.head.read(&entry)?;
+        let Ok(common) = CommonHeader::parse(&raw) else {
+            return Ok(None);
+        };
+        if common.kind != KIND_STATIC && common.kind != KIND_SKINNED {
+            return Ok(None);
+        }
+        let whole = common.kind == KIND_SKINNED
+            && path.starts_with(CHARACTERS_FOLDER)
+            && ModelHeader::parse(&raw).is_ok_and(|h| is_whole_character(&h));
+        Ok(Some(AssetInfo {
+            name: stem(path),
+            kind: kind_of(path, whole),
+            id: path.to_string(),
+        }))
+    }
+
     /// The paths of every `.level` (type 212 in `H.AnimRetarget`), sorted.
     pub fn levels(&self) -> Result<Vec<String>> {
         let pkg = Package::open_in(&self.game, "H.AnimRetarget")?;

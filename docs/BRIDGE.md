@@ -226,6 +226,62 @@ rotation and `MeshScale` turned right-handed. The dojo is 499 instances of 39 mo
   full size (runs between 1.4 and 2.1 GB), 1.6 GB with `with_max_texture(Some(1024))`, 1.1 GB with 512 and
   0.45 GB without textures (`with_textures(false)`). The big hubs need a limit.
 
+## Names from the game's data: `resolve`
+
+An asset id is the path of a file. The names other tools use for Warframe's items (`/Lotus/Powersuits/Excalibur/Excalibur`,
+`/Lotus/Weapons/Tenno/Rifle/Rifle`: the *uniqueName* of an entity of `/Packages.bin`) are **not** ids: `load` of one
+fails and `list` never returns one. `wf-unpack resolve <uniqueName>` (and `wf_unpack::resolve::resolve`) goes from the
+name to the ids:
+
+```sh
+wf-unpack resolve /Lotus/Powersuits/Excalibur/Excalibur
+wf-unpack resolve /Lotus/Weapons/Tenno/Rifle/Rifle
+wf-unpack resolve --strict /Lotus/Language/Suits/ExcaliburDesc      # exit status 3: no model, and why
+```
+
+- It reads the entity's property text and the text of every entity it derives from, and collects the top-level
+  `Mesh=` and `PickUpMesh=` lines that name an `.fbx` (`resolve::MODEL_KEYS`). Each path is checked against what
+  `list` returns (`Warframe::asset_info` answers that for one id without building the index), so every id it prints
+  loads.
+- Several models are possible, and are all printed, **nearest entity first**, each with the entity that set it. The
+  first is not always the character: one enemy of the install sets a grate panel on itself and the character in its
+  parent. Choosing is the caller's job.
+- It does **not** assemble a Warframe (helmet, armour, weapons come from other entities), and it reads no key other
+  than those two. `Diorama`, `BaseLevel` and `Prefab` lines that name a `.level` are listed too, with whether the
+  provider lists them; some are pieces of a mission level that the game assembles at run time.
+- It says why when there is nothing: the name is not an entity (language tags, node ids and server-side names are
+  not in Packages.bin), or it is an entity with no `Mesh` or `PickUpMesh` in its lineage (a mod, a resource), or it
+  names paths that are not models of the install. A name that already is a listed id (with or without
+  `?animations=`) is reported as such.
+- Exit status: 0 for a model or an id, 3 for none, 1 for an error.
+
+## Which build, and strict mode
+
+`wf-unpack version` reports what the install is: the `.toc` format numbers, the `Packages.bin` version, the file
+version that `Warframe.x64.exe` carries in its version resource (for example `2026.10.06.11.44`; it has the shape of
+the build label private-server projects use, but this reader has not confirmed they are the same value), the Steam build
+id and update date from `steamapps/appmanifest_230410.acf` when that file is beside the install or where Steam keeps
+it, and the verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `verified` | the build is one the README's check numbers were produced on (`build::VERIFIED`: one, Steam build 25757057) |
+| `readable, not verified` | every format number is one the parsers read, but nobody ran the checks on this build |
+| `unsupported` | a `.toc` that is not version 20, a `Packages.bin` older than 46, or files that cannot be read; `version` exits 1 |
+
+Only the format numbers decide `unsupported`: a new game build with the same format numbers is `readable`, not
+refused. Whether it still reads correctly is unproven, because the checks have been run on one build only; a
+change in the *content* (names of property keys, which models an entity uses) is not detected by anything, so run
+`check-bridge` and compare with the README table.
+
+The readers behave as they always have unless asked: `Warframe::open` and `PackagesBin::load` check each format
+as the package is opened, and read a `Packages.bin` newer than version 46 with the layout of 46 (the parser checks
+the entity count and that no bytes are left over, so a changed layout most likely fails loudly). For a rewrite that
+would rather stop at the door, `Warframe::open_with(game, Strictness::Strict)` and
+`PackagesBin::load_with(game, Strictness::Strict)` (and `--strict` on `version` and `resolve`) look at every `.toc`
+and at `Packages.bin` first, and refuse with one error that names the build, for an unsupported format anywhere in
+the install and for a `Packages.bin` newer than the highest this reader ran on (46).
+
 ## Player movement values
 
 `wf_unpack::player::Player::load(game)` reads the numbers the Tenno moves with from Packages.bin. Nothing

@@ -106,7 +106,7 @@ Without the `export` line, write `cargo run --release -- list ...` or `target/re
 instead of `wf-unpack list ...`.
 
 The commands that talk to rewrite-bridge (`check-bridge`, `bridge-anim`, `bridge-scene`, `check-bridge-scenes`,
-`check-conformance`) only exist when built with the `bridge` feature, which downloads [rewrite-bridge](https://crates.io/crates/rewrite-bridge) from crates.io:
+`check-conformance`, `resolve`) only exist when built with the `bridge` feature, which downloads [rewrite-bridge](https://crates.io/crates/rewrite-bridge) from crates.io:
 
 ```sh
 cargo build --release --features bridge
@@ -199,6 +199,11 @@ wf-unpack palette /Lotus/Powersuits/Excalibur/Excalibur
 wf-unpack check-lighting --game $C        # every level: pages, probes, post-process fields, about 35 s and 0.5 GB
 wf-unpack model /Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx -o out/ --suit /Lotus/Powersuits/Excalibur/Excalibur
 
+# Which game build this is (executable file version, Steam build id, format numbers) and whether the reader supports it
+wf-unpack version [--strict]
+# Which model ids a uniqueName reaches (needs --features bridge); exit status 3 and the reason when none
+wf-unpack resolve /Lotus/Powersuits/Excalibur/Excalibur
+
 # Surveys: asset types in an H. package, texture headers vs. B./F. sizes
 wf-unpack kinds $C/H.Misc.toc
 wf-unpack textures --game $C                # 1 s
@@ -225,7 +230,7 @@ shown as `N`). They exit 0 either way. On the Steam build of 2026-10-22:
 | `check-levels` | all 4,601 `.level` and 411 `.static` files parse, 0 fail |
 | `check-atmosphere` | 4,601 levels, 0 fail: 566 directional lights in 434 levels, 635 `sunPosition` in 634, 1,350 GI volumes in 857 levels (5,794 textures, 2,032 `.lpd`, 3,585 `.epd` named, all in the install), 44 dynamic skies in 28; 543 levels name a global cube map, 10 distinct, 4 in the install (269 levels) |
 
-If your numbers are far from these, the game has been updated; open an issue with the version.
+If your numbers are far from these, the game has been updated; run `wf-unpack version` and open an issue with its output.
 
 ## Using it from another game
 

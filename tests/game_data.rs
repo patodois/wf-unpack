@@ -1870,3 +1870,164 @@ fn the_atmosphere_command_prints_text_and_json() {
     assert_eq!(json["gi"]["volumes"][0]["indirectionSize"][0], 36);
     assert_eq!(json["leftOut"][0]["what"], "directional light strength");
 }
+
+/// The install is a build this reader supports, and strict mode accepts it.
+#[test]
+fn the_install_is_a_supported_build() {
+    use wf_unpack::build::{GameBuild, Strictness, Support, PACKAGES_MAX_VERIFIED};
+    let Some(dir) = game_dir() else { return };
+    let b = GameBuild::inspect(&dir).unwrap();
+    assert_eq!(
+        b.toc_versions.keys().copied().collect::<Vec<_>>(),
+        [20],
+        "{b:?}"
+    );
+    assert_eq!(b.packages_version, Ok(PACKAGES_MAX_VERIFIED));
+    assert_ne!(b.support(), Support::Unsupported, "{}", b.describe());
+    b.check(Strictness::Strict).unwrap();
+    // Strict loading gives the same entities as the default one
+    use wf_unpack::packages::PackagesBin;
+    assert_eq!(
+        PackagesBin::load_with(&dir, Strictness::Strict)
+            .unwrap()
+            .len(),
+        PackagesBin::load(&dir).unwrap().len()
+    );
+}
+
+/// `asset_info` answers for one id what `list` answers for all of them.
+#[cfg(feature = "bridge")]
+#[test]
+fn asset_info_agrees_with_list() {
+    use rewrite_bridge::Provider;
+    use wf_unpack::bridge::Warframe;
+    let Some(dir) = game_dir() else { return };
+    let wf = Warframe::open(&dir).unwrap();
+    for id in [
+        "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx",
+        "/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx",
+        "/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level",
+        "/Lotus/Objects/Grineer/Props/GlnGratePanel2M.fbx",
+    ] {
+        let listed = wf
+            .list(id)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap();
+        assert_eq!(wf.asset_info(id).unwrap(), Some(listed), "{id}");
+    }
+    // Not a listed model or level: an entity name, a texture, an animation clip (it is in H.Misc but is not
+    // a model), a missing path, a suffixed id
+    for id in [
+        "/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/JogForward_anim.fbx",
+        "/Lotus/Powersuits/Excalibur/Excalibur",
+        "/Lotus/Interface/Icons/Miscellaneous/Kuva.png",
+        "/Lotus/Nothing/Here.fbx",
+        "/Lotus/Levels/Nothing/Here.level",
+        "/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx?animations=/Sword/",
+    ] {
+        assert_eq!(wf.asset_info(id).unwrap(), None, "{id}");
+    }
+}
+
+/// `resolve` on names of the kinds the OpenWF study sampled: a suit, a weapon, an enemy whose own mesh is a
+/// prop, an entity with no model, names that are not entities, and a name that already is an id.
+#[cfg(feature = "bridge")]
+#[test]
+fn resolve_follows_the_lineage_to_listed_models() {
+    use rewrite_bridge::AssetKind;
+    use wf_unpack::bridge::Warframe;
+    use wf_unpack::packages::PackagesBin;
+    use wf_unpack::resolve::{resolve, Outcome};
+    let Some(dir) = game_dir() else { return };
+    let wf = Warframe::open(&dir).unwrap();
+    let bin = PackagesBin::load(&dir).unwrap();
+    let go = |name: &str| resolve(&wf, &bin, name).unwrap();
+
+    let suit = go("/Lotus/Powersuits/Excalibur/Excalibur");
+    assert_eq!(suit.outcome, Outcome::Models);
+    assert_eq!(
+        suit.asset_ids(),
+        ["/Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx"]
+    );
+    assert_eq!(suit.models[0].mention.key, "Mesh");
+    assert_eq!(
+        suit.models[0].mention.entity,
+        "/Lotus/Powersuits/Excalibur/ExcaliburBaseSuit"
+    );
+    assert_eq!(suit.models[0].mention.generation, 1);
+
+    let rifle = go("/Lotus/Weapons/Tenno/Rifle/Rifle");
+    assert_eq!(rifle.models[0].mention.key, "PickUpMesh");
+    assert_eq!(
+        rifle.models[0].asset.as_ref().unwrap().kind,
+        AssetKind::Weapon
+    );
+
+    // The entity's own Mesh is a prop and the character's comes from its parent: both are reported,
+    // nearest first
+    let boss = go("/Lotus/Types/Enemies/Grineer/Vip/Avatars/DoubleBossAvatar");
+    let kinds: Vec<_> = boss
+        .models
+        .iter()
+        .map(|m| m.asset.as_ref().unwrap().kind)
+        .collect();
+    assert_eq!(kinds, [AssetKind::Prop, AssetKind::Character]);
+
+    assert_eq!(
+        go("/Lotus/Upgrades/Mods/Melee/WeaponToxinDamageMod").outcome,
+        Outcome::NoModelProperty
+    );
+    for name in [
+        "/Lotus/Language/Suits/ExcaliburDesc",
+        "SolNode12",
+        "/Lotus/Types/Game/GrineerSquadOne",
+    ] {
+        assert_eq!(go(name).outcome, Outcome::NotAnEntity, "{name}");
+    }
+    let id = go("/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx?animations=/Sword/");
+    assert_eq!(id.outcome, Outcome::AlreadyAnAssetId);
+    assert_eq!(id.asset.unwrap().kind, AssetKind::Character);
+
+    // The first-listed ids load through the provider
+    use rewrite_bridge::Provider;
+    let wf = wf.with_textures(false);
+    for id in suit.asset_ids().into_iter().chain(rifle.asset_ids()) {
+        wf.load(id).unwrap();
+    }
+}
+
+/// The two commands, run as programs: a model gives exit 0, no model gives 3, and the report says why.
+#[cfg(feature = "bridge")]
+#[test]
+fn the_resolve_and_version_commands_report_and_set_their_exit_status() {
+    let Some(dir) = game_dir() else { return };
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wf-unpack"))
+            .args(args)
+            .arg("--game")
+            .arg(&dir)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["resolve", "/Lotus/Powersuits/Excalibur/Excalibur"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("asset id: /Lotus/Characters/Tenno/Excalibur/ExcaliburBody_skel.fbx"),
+        "{text}"
+    );
+    let out = run(&["resolve", "--strict", "/Lotus/Language/Suits/ExcaliburDesc"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("not an entity of Packages.bin"));
+    let out = run(&["version", "--strict"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Packages.bin:     version 46") && text.contains("support:"),
+        "{text}"
+    );
+}

@@ -3,6 +3,9 @@ mod animtree_cmd;
 #[cfg(feature = "bridge")]
 mod bridge_cmd;
 mod player_cmd;
+#[cfg(feature = "bridge")]
+mod resolve_cmd;
+mod version_cmd;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -375,6 +378,27 @@ enum Command {
         #[arg(long, default_value = DEFAULT_GAME_DIR)]
         game: PathBuf,
     },
+    /// Print the game build of an install (executable file version, Steam build id, format numbers) and
+    /// whether this reader supports it. Exits 1 for an unsupported build
+    Version {
+        /// Also exit 1 for what strict mode refuses (a Packages.bin newer than any this reader ran on)
+        #[arg(long)]
+        strict: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
+    /// Print which model asset ids a uniqueName (/Lotus/...) reaches, or why it reaches none. Exits 3 when
+    /// it reaches none
+    #[cfg(feature = "bridge")]
+    Resolve {
+        /// An entity name, e.g. /Lotus/Powersuits/Excalibur/Excalibur
+        unique_name: String,
+        /// Refuse an unsupported build up front, with one error that names it
+        #[arg(long)]
+        strict: bool,
+        #[arg(long, default_value = DEFAULT_GAME_DIR)]
+        game: PathBuf,
+    },
 }
 
 const DEFAULT_GAME_DIR: &str = "~/Games/Warframe/Cache.Windows";
@@ -473,6 +497,19 @@ fn main() -> Result<()> {
         Command::CheckMaterials { game, survey } => {
             check_materials_cmd(&expand_home(&game), survey)
         }
+        Command::Version { strict, game } => {
+            std::process::exit(version_cmd::version_cmd(&expand_home(&game), strict)?)
+        }
+        #[cfg(feature = "bridge")]
+        Command::Resolve {
+            unique_name,
+            strict,
+            game,
+        } => std::process::exit(resolve_cmd::resolve_cmd(
+            &expand_home(&game),
+            &unique_name,
+            strict,
+        )?),
         Command::Props { path, game } => props_cmd(&expand_home(&game), &path),
         Command::FindText { needle, game } => find_text_cmd(&expand_home(&game), &needle),
         Command::CheckPackages { game } => check_packages_cmd(&expand_home(&game)),

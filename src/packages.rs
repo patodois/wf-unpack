@@ -46,7 +46,12 @@ use anyhow::{bail, ensure, Context, Result};
 use zstd::dict::DecoderDictionary;
 use zstd::zstd_safe::{DParameter, FrameFormat};
 
+use crate::build::{self, Strictness};
 use crate::bytes::Reader;
+
+/// The lowest `Packages.bin` version the parser reads. Later versions are read with the same layout (see
+/// [`crate::build::PACKAGES_MAX_VERIFIED`] for the highest one it has been run on).
+pub const MIN_VERSION: u32 = 46;
 
 pub struct PackagesBin {
     pub version: u32,
@@ -117,8 +122,8 @@ impl PackagesBin {
         ensure!(r.u32()? == 20, "unexpected Packages.bin header size");
         let version = r.u32()?;
         ensure!(
-            version >= 46,
-            "Packages.bin version {version} is not supported (46 and later only)"
+            version >= MIN_VERSION,
+            "Packages.bin version {version} is not supported ({MIN_VERSION} and later only)"
         );
         ensure!(r.u32()? == 1, "unexpected Packages.bin flags");
         let mut junk = Junk(u64::from(r.u32()?));
@@ -230,8 +235,20 @@ impl PackagesBin {
         })
     }
 
-    /// Reads `/Packages.bin` from the `H.Misc` package of a `Cache.Windows` folder.
+    /// Reads `/Packages.bin` from the `H.Misc` package of a `Cache.Windows` folder. Same as
+    /// [`PackagesBin::load_with`] with [`Strictness::Lenient`]: the formats are checked as the files are
+    /// opened, and a `Packages.bin` newer than the one this reader ran on is read with the layout of 46.
     pub fn load(game: &std::path::Path) -> Result<Self> {
+        Self::load_with(game, Strictness::Lenient)
+    }
+
+    /// Reads `/Packages.bin`; with [`Strictness::Strict`] it first refuses a build whose `.toc` files or
+    /// `Packages.bin` this reader does not support, with one error that names the build (see
+    /// [`crate::build`]).
+    pub fn load_with(game: &std::path::Path, strictness: Strictness) -> Result<Self> {
+        if strictness == Strictness::Strict {
+            build::GameBuild::inspect(game)?.check(strictness)?;
+        }
         let mut pkg = crate::cache::Package::open(&game.join("H.Misc.toc"))?;
         let raw = pkg
             .read_path("/Packages.bin")?
