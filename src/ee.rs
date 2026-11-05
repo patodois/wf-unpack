@@ -128,6 +128,7 @@ impl Attributes {
         let mut p = Parser {
             s: text.as_bytes(),
             i: 0,
+            depth: 0,
         };
         p.top().map(Attributes)
     }
@@ -138,6 +139,7 @@ pub fn parse_value(text: &str) -> Result<Value> {
     let mut p = Parser {
         s: text.as_bytes(),
         i: 0,
+        depth: 0,
     };
     p.value(false)
 }
@@ -145,6 +147,7 @@ pub fn parse_value(text: &str) -> Result<Value> {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 fn is_key_byte(b: u8) -> bool {
@@ -198,7 +201,13 @@ impl Parser<'_> {
         match self.peek() {
             Some(b'{') => {
                 self.i += 1;
-                self.block()
+                if self.depth >= 128 {
+                    bail!("attributes nest beyond 128 blocks");
+                }
+                self.depth += 1;
+                let result = self.block();
+                self.depth -= 1;
+                result
             }
             Some(b'"') => {
                 self.i += 1;
@@ -323,5 +332,64 @@ mod tests {
         assert_eq!(a.flag("K"), Some(false));
         assert!(Attributes::parse("K={1,2\n").is_err());
         assert!(Attributes::parse("K=\"open\n").is_err());
+    }
+}
+#[cfg(test)]
+mod depth_regression {
+    use super::*;
+    #[test]
+    fn excessive_attribute_nesting_is_rejected() {
+        assert!(Attributes::parse("x={a={b=1}} ").is_ok());
+        let text = format!("x={}0{}", "{".repeat(256), "}".repeat(256));
+        assert!(Attributes::parse(&text).is_err());
+    }
+}
+
+#[cfg(test)]
+mod depth_stack_regression {
+    use super::*;
+    #[test]
+    fn nested_attributes_fit_a_bounded_stack() {
+        const FLAG: &str = "WF_ATTRIBUTE_STACK_UNIT_CHILD";
+        if std::env::var_os(FLAG).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ee::depth_stack_regression::nested_attributes_fit_a_bounded_stack",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let text = format!("x={}0{}", "{".repeat(64), "}".repeat(64));
+                let parsed = Attributes::parse(&text).unwrap();
+                let copy = parsed.clone();
+                assert!(!copy.0[0].1.to_string().is_empty());
+                drop(copy);
+                drop(parsed);
+                let text = format!("x={}0{}", "{".repeat(2048), "}".repeat(2048));
+                assert!(Attributes::parse(&text).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
