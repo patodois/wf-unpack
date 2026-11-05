@@ -1757,3 +1757,38 @@ mod nonfinite_decompose_compatibility {
         assert!(q.iter().all(|x| x.is_finite()));
     }
 }
+
+#[cfg(test)]
+mod rotated_reflection_coverage {
+    use super::*;
+    #[test]
+    fn rotated_reflections_recompose_with_translation_and_nonuniform_scale() {
+        let axis = 1.0f32 / 3.0f32.sqrt();
+        for angle in [0.7f32, 2.2, 3.5] {
+            let q = [
+                axis * (angle / 2.0).sin(),
+                axis * (angle / 2.0).sin(),
+                axis * (angle / 2.0).sin(),
+                (angle / 2.0).cos(),
+            ];
+            for scale in [[-2.0, 3.0, 4.0], [2.0, -3.0, 4.0], [2.0, 3.0, -4.0]] {
+                let original = crate::level::Transform {
+                    translation: [2.0, -7.0, 4.0],
+                    rotation: q,
+                    scale,
+                }
+                .matrix();
+                let (translation, rotation, scale) = decompose(&original);
+                let actual = crate::level::Transform {
+                    translation,
+                    rotation,
+                    scale,
+                }
+                .matrix();
+                for (a, b) in actual.iter().flatten().zip(original.iter().flatten()) {
+                    assert!((a - b).abs() < 2e-5, "{actual:?} != {original:?}");
+                }
+            }
+        }
+    }
+}
