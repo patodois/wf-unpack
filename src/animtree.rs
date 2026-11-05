@@ -1769,19 +1769,38 @@ impl Tree {
     /// Every node under `start` that plays clips, each once, with the way to it. With `stance`
     /// (a folder name such as `Sword` or `Unarmed`), only leaves with a clip in a folder of that
     /// name, and only those clips.
-    pub fn leaves(&self, start: usize, stance: Option<&str>) -> Vec<Leaf> {
+    pub fn leaves(&self, start: usize, stance: Option<&str>) -> Result<Vec<Leaf>> {
+        self.leaves_limited(start, stance, 8 << 20)
+    }
+
+    fn leaves_limited(
+        &self,
+        start: usize,
+        stance: Option<&str>,
+        budget: usize,
+    ) -> Result<Vec<Leaf>> {
         let cards = self.cardinalities();
         let mut seen = vec![false; self.nodes.len()];
         let mut out = Vec::new();
         let mut path = Vec::new();
+        let mut path_bytes = 0usize;
+        let mut remaining = budget;
         if start >= self.nodes.len() {
-            return out;
+            return Ok(out);
         }
         let mut stack = vec![(start, 0usize)];
         while let Some(&(node, next)) = stack.last() {
             if next == 0 {
                 seen[node] = true;
-                self.append_leaf(node, stance, &cards, &path, &mut out);
+                self.append_leaf(
+                    node,
+                    stance,
+                    &cards,
+                    &path,
+                    path_bytes,
+                    &mut remaining,
+                    &mut out,
+                )?;
             }
             if let Some(&child) = self.graph.edges[node].get(next) {
                 stack.last_mut().unwrap().1 += 1;
@@ -1801,15 +1820,18 @@ impl Tree {
                     var,
                     slot: next,
                 });
+                path_bytes += std::mem::size_of::<Selection>() + path.last().unwrap().kind.len();
                 stack.push((child, 0));
             } else {
                 stack.pop();
                 if !stack.is_empty() {
-                    path.pop();
+                    if let Some(p) = path.pop() {
+                        path_bytes -= std::mem::size_of::<Selection>() + p.kind.len();
+                    }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn append_leaf(
@@ -1818,8 +1840,10 @@ impl Tree {
         stance: Option<&str>,
         cards: &BTreeMap<u32, usize>,
         path: &[Selection],
+        path_bytes: usize,
+        remaining: &mut usize,
         out: &mut Vec<Leaf>,
-    ) {
+    ) -> Result<()> {
         let keep = |p: &str| stance.is_none_or(|s| matches_folder(p, s));
         let mut clips = Vec::new();
         let mut blend = None;
@@ -1862,6 +1886,9 @@ impl Tree {
             _ => {}
         }
         if !clips.is_empty() {
+            *remaining = remaining
+                .checked_sub(path_bytes)
+                .context("leaf paths exceed the aggregate byte budget")?;
             out.push(Leaf {
                 node,
                 kind: self.graph.type_name(node).to_string(),
@@ -1870,6 +1897,7 @@ impl Tree {
                 clips,
             });
         }
+        Ok(())
     }
 }
 
@@ -2526,12 +2554,63 @@ mod deep_tree_regression {
                     subtrees: vec![],
                     errors: vec![],
                 };
-                let leaves = t.leaves(0, None);
+                let leaves = t.leaves(0, None).unwrap();
                 assert_eq!(leaves.len(), 1);
                 assert_eq!(leaves[0].path.len(), n - 1);
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod leaf_path_budget {
+    use super::*;
+    fn chain(n: usize) -> Tree {
+        Tree {
+            graph: Graph {
+                common: CommonHeader {
+                    hash: [0; 16],
+                    sources: vec![],
+                    attributes: String::new(),
+                    kind: 0,
+                    kind_high: 0,
+                    len: 0,
+                },
+                parent: String::new(),
+                types: vec!["Parametric".into()],
+                node_types: vec![0; n],
+                edges: (0..n)
+                    .map(|i| {
+                        if i + 1 < n {
+                            vec![(i + 1) as i32]
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .collect(),
+                body_start: 0,
+            },
+            nodes: vec![
+                Node::Parametric {
+                    path: "clip.anim".into()
+                };
+                n
+            ],
+            clips: vec![],
+            fsms: vec![],
+            subtrees: vec![],
+            errors: vec![],
+        }
+    }
+    #[test]
+    fn aggregate_leaf_paths_obey_a_byte_budget() {
+        assert!(chain(32).leaves_limited(0, None, 4096).is_err());
+        let leaves = chain(4).leaves_limited(0, None, 4096).unwrap();
+        assert_eq!(
+            leaves.iter().map(|l| l.path.len()).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 }

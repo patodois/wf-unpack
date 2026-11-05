@@ -1079,7 +1079,7 @@ fn moving_state_with_a_sword() {
     let loco = find_locomotion(&tree, &fsms).unwrap();
     // The child of the locomotion machine that plays "Moving" (exposed state 1)
     let moving = usize::try_from(tree.graph.edges[loco.fsm_node][1]).unwrap();
-    let leaves = tree.leaves(moving, Some("Sword"));
+    let leaves = tree.leaves(moving, Some("Sword")).unwrap();
     assert!(!leaves.is_empty());
     let walk = leaves
         .iter()
