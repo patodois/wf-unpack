@@ -123,3 +123,19 @@ fn unsafe_selected_path_counts_as_failure_and_other_files_continue() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("wrote 1 files"));
     assert!(String::from_utf8_lossy(&result.stderr).contains("(1 failed)"));
 }
+
+#[test]
+fn no_matching_entries_do_not_create_the_output_directory() {
+    let (r, _) = fixture("no-match", 3, "file.txt");
+    let out = r.join("unused");
+    let result = Command::new(env!("CARGO_BIN_EXE_wf-unpack"))
+        .arg("extract")
+        .arg(r.join("Small.toc"))
+        .arg("absent")
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(!out.exists());
+}

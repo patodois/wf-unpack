@@ -650,7 +650,6 @@ fn extract(path: &Path, pattern: &str, out: &Path) -> Result<()> {
         .filter(|e| matches(pattern, &e.path))
         .cloned()
         .collect();
-    fs::create_dir_all(out)?;
     let (mut written, mut failed) = (0, 0);
     for e in &selected {
         let Some(dest) = safe_join(out, &e.path) else {
