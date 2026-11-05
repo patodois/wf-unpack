@@ -1774,22 +1774,52 @@ impl Tree {
         let mut seen = vec![false; self.nodes.len()];
         let mut out = Vec::new();
         let mut path = Vec::new();
-        self.collect_leaves(start, stance, &cards, &mut seen, &mut path, &mut out);
+        if start >= self.nodes.len() {
+            return out;
+        }
+        let mut stack = vec![(start, 0usize)];
+        while let Some(&(node, next)) = stack.last() {
+            if next == 0 {
+                seen[node] = true;
+                self.append_leaf(node, stance, &cards, &path, &mut out);
+            }
+            if let Some(&child) = self.graph.edges[node].get(next) {
+                stack.last_mut().unwrap().1 += 1;
+                let Ok(child) = usize::try_from(child) else {
+                    continue;
+                };
+                if seen[child] {
+                    continue;
+                }
+                let var = match &self.nodes[node] {
+                    Node::Select { var, .. } | Node::SingleAxis { var, .. } => Some(*var),
+                    _ => None,
+                };
+                path.push(Selection {
+                    node,
+                    kind: self.graph.type_name(node).to_string(),
+                    var,
+                    slot: next,
+                });
+                stack.push((child, 0));
+            } else {
+                stack.pop();
+                if !stack.is_empty() {
+                    path.pop();
+                }
+            }
+        }
         out
     }
 
-    fn collect_leaves(
+    fn append_leaf(
         &self,
         node: usize,
         stance: Option<&str>,
         cards: &BTreeMap<u32, usize>,
-        seen: &mut Vec<bool>,
-        path: &mut Vec<Selection>,
+        path: &[Selection],
         out: &mut Vec<Leaf>,
     ) {
-        if std::mem::replace(&mut seen[node], true) {
-            return;
-        }
         let keep = |p: &str| stance.is_none_or(|s| matches_folder(p, s));
         let mut clips = Vec::new();
         let mut blend = None;
@@ -1835,25 +1865,10 @@ impl Tree {
             out.push(Leaf {
                 node,
                 kind: self.graph.type_name(node).to_string(),
-                path: path.clone(),
+                path: path.to_vec(),
                 blend,
                 clips,
             });
-        }
-        let var = match &self.nodes[node] {
-            Node::Select { var, .. } | Node::SingleAxis { var, .. } => Some(*var),
-            _ => None,
-        };
-        for (slot, &c) in self.graph.edges[node].iter().enumerate() {
-            let Ok(c) = usize::try_from(c) else { continue };
-            path.push(Selection {
-                node,
-                kind: self.graph.type_name(node).to_string(),
-                var,
-                slot,
-            });
-            self.collect_leaves(c, stance, cards, seen, path, out);
-            path.pop();
         }
     }
 }
@@ -2438,5 +2453,85 @@ mod edge_budget_regression {
             b.extend_from_slice(&(-1i32).to_le_bytes());
         }
         assert!(parse_edges(&b, 128, 4096).is_err());
+    }
+}
+
+#[cfg(test)]
+mod deep_tree_regression {
+    use super::*;
+    #[test]
+    fn walks_deep_tree_without_recursive_stack_growth() {
+        const FLAG: &str = "WF_DEEP_TREE_UNIT_CHILD";
+        if std::env::var_os(FLAG).is_none() {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","animtree::deep_tree_regression::walks_deep_tree_without_recursive_stack_growth","--nocapture"])
+                .env(FLAG,"1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let n = 512;
+                let common = CommonHeader {
+                    hash: [0; 16],
+                    sources: vec![],
+                    attributes: String::new(),
+                    kind: 0,
+                    kind_high: 0,
+                    len: 0,
+                };
+                let graph = Graph {
+                    common,
+                    parent: String::new(),
+                    types: vec!["SubTreeNode".into()],
+                    node_types: vec![0; n],
+                    edges: (0..n)
+                        .map(|i| {
+                            if i + 1 < n {
+                                vec![(i + 1) as i32]
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect(),
+                    body_start: 0,
+                };
+                let mut nodes = vec![
+                    Node::SubTree {
+                        path: String::new()
+                    };
+                    n
+                ];
+                nodes[n - 1] = Node::Parametric {
+                    path: "clip".into(),
+                };
+                let t = Tree {
+                    graph,
+                    nodes,
+                    clips: vec![],
+                    fsms: vec![],
+                    subtrees: vec![],
+                    errors: vec![],
+                };
+                let leaves = t.leaves(0, None);
+                assert_eq!(leaves.len(), 1);
+                assert_eq!(leaves[0].path.len(), n - 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

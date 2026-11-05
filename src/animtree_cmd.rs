@@ -171,23 +171,35 @@ impl Ctx<'_> {
         if let Some(&k) = self.keep.get(&node) {
             return k;
         }
-        // Mark before descending: the graph is acyclic, but shared nodes are visited often
-        self.keep.insert(node, false);
-        let mut k = self
-            .clip_paths(node)
-            .iter()
-            .any(|p| matches_stance(p, stance));
-        let kids: Vec<usize> = self.tree.graph.edges[node]
-            .iter()
-            .filter_map(|&c| usize::try_from(c).ok())
-            .collect();
-        for c in kids {
-            if self.keeps(c) {
-                k = true;
+        let mut stack = vec![(node, false)];
+        while let Some((current, expanded)) = stack.pop() {
+            if expanded {
+                let own = self
+                    .clip_paths(current)
+                    .iter()
+                    .any(|p| matches_stance(p, stance));
+                let child = self.tree.graph.edges[current]
+                    .iter()
+                    .filter_map(|&c| usize::try_from(c).ok())
+                    .any(|c| self.keep.get(&c).copied().unwrap_or(false));
+                self.keep.insert(current, own || child);
+            } else if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.keep.entry(current)
+            {
+                entry.insert(false);
+                stack.push((current, true));
+                for child in self.tree.graph.edges[current]
+                    .iter()
+                    .rev()
+                    .filter_map(|&c| usize::try_from(c).ok())
+                {
+                    if !self.keep.contains_key(&child) {
+                        stack.push((child, false));
+                    }
+                }
             }
         }
-        self.keep.insert(node, k);
-        k
+        self.keep[&node]
     }
 
     fn summary(&self, node: usize) -> String {
@@ -1001,5 +1013,101 @@ mod tests {
             .map(|(n, _)| n.as_str())
             .collect();
         assert_eq!(names, ["Z", "A", "B", "NAN"]);
+    }
+}
+
+#[cfg(test)]
+mod cli_depth_regression {
+    use super::*;
+    #[test]
+    fn deep_stance_filter_uses_a_heap_stack() {
+        const FLAG: &str = "WF_STANCE_STACK_UNIT_CHILD";
+        if std::env::var_os(FLAG).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "animtree_cmd::cli_depth_regression::deep_stance_filter_uses_a_heap_stack",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                use wf_unpack::{animtree::Graph, header::CommonHeader};
+                let n = 512;
+                let graph = Graph {
+                    common: CommonHeader {
+                        hash: [0; 16],
+                        sources: vec![],
+                        attributes: String::new(),
+                        kind: 0,
+                        kind_high: 0,
+                        len: 0,
+                    },
+                    parent: String::new(),
+                    types: vec!["SubTreeNode".into()],
+                    node_types: vec![0; n],
+                    edges: (0..n)
+                        .map(|i| {
+                            if i + 1 < n {
+                                vec![(i + 1) as i32]
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect(),
+                    body_start: 0,
+                };
+                let mut nodes = vec![
+                    Node::SubTree {
+                        path: String::new()
+                    };
+                    n
+                ];
+                nodes[n - 1] = Node::Parametric {
+                    path: "/test/Unarmed/clip".into(),
+                };
+                let tree = Tree {
+                    graph,
+                    nodes,
+                    clips: vec![],
+                    fsms: vec![],
+                    subtrees: vec![],
+                    errors: vec![],
+                };
+                let hints = BTreeMap::new();
+                let mut ctx = Ctx {
+                    tree: &tree,
+                    fsms: &[],
+                    hints: &hints,
+                    stance: Some("Unarmed"),
+                    max_depth: 8,
+                    cards: BTreeMap::new(),
+                    sets: HashMap::new(),
+                    keep: HashMap::new(),
+                };
+                assert!(ctx.keeps(0));
+                assert_eq!(ctx.keep.len(), n);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
