@@ -747,10 +747,17 @@ pub fn affine_inverse(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 /// Splits an affine matrix into translation, rotation quaternion (x, y, z, w) and scale.
 pub fn decompose(m: &[[f32; 4]; 4]) -> ([f32; 3], [f32; 4], [f32; 3]) {
     let t = [m[0][3], m[1][3], m[2][3]];
-    let scale: [f32; 3] =
+    let mut scale: [f32; 3] =
         std::array::from_fn(|c| (m[0][c] * m[0][c] + m[1][c] * m[1][c] + m[2][c] * m[2][c]).sqrt());
+    let a = |i: usize, j: usize| f64::from(m[i][j]);
+    let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+        - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    if det < 0.0 {
+        scale[0] = -scale[0];
+    }
     let r = |i: usize, j: usize| {
-        if scale[j] > 0.0 {
+        if scale[j].abs() > 0.0 {
             m[i][j] / scale[j]
         } else {
             0.0
@@ -1705,5 +1712,48 @@ mod tests {
         // No triangles anywhere: an error, not an empty scene
         model.header.meshes[0].lod_counts = [0; LOD_COUNT];
         assert!(model.usable_lod(0).is_err());
+    }
+}
+#[cfg(test)]
+mod reflection_regression {
+    use super::*;
+    #[test]
+    fn reflected_affine_transform_recomposes() {
+        for scale in [[-1.0, 1.0, 1.0], [-2.0, -3.0, 4.0], [2.0, 3.0, -4.0]] {
+            let mut m = [[0.0; 4]; 4];
+            for i in 0..3 {
+                m[i][i] = scale[i];
+            }
+            m[3][3] = 1.0;
+            let (translation, rotation, scale) = decompose(&m);
+            let t = crate::level::Transform {
+                translation,
+                rotation,
+                scale,
+            };
+            let actual = t.matrix();
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert!((actual[i][j] - m[i][j]).abs() < 1e-5, "{actual:?} != {m:?}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nonfinite_decompose_compatibility {
+    use super::*;
+    #[test]
+    fn nonfinite_scale_keeps_the_previous_rotation_fallback() {
+        let m = [
+            [f32::NAN, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (_, q, s) = decompose(&m);
+        assert!(s[0].is_nan());
+        assert!(q.iter().all(|x| x.is_finite()));
     }
 }
