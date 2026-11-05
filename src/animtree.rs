@@ -171,6 +171,15 @@ fn parse_edges(b: &[u8], n: usize, edge_count: usize) -> Result<Vec<Vec<i32>>> {
         let len = r.u32()? as usize;
         spans.push((start, len));
     }
+    let copied = spans
+        .iter()
+        .try_fold(0usize, |sum, &(_, len)| sum.checked_add(len))
+        .context("edge copy count overflow")?;
+    let copy_limit = edge_count.saturating_mul(16).max(n);
+    ensure!(
+        copied <= copy_limit,
+        "shared edge spans exceed the {copy_limit}-edge copy budget"
+    );
     let entries = (0..edge_count)
         .map(|_| r.u32().map(|v| v as i32))
         .collect::<Result<Vec<_>>>()?;
@@ -2412,5 +2421,22 @@ mod tests {
         let l = find_locomotion(&tree, &fsms).unwrap();
         assert_eq!((l.root_fsm, l.locomotion_child, l.fsm_node), (0, 2, 3));
         assert_eq!(tree.root(), Some(0));
+    }
+}
+#[cfg(test)]
+mod edge_budget_regression {
+    use super::*;
+    #[test]
+    fn repeated_edge_spans_have_a_copy_budget() {
+        let mut b = vec![0; 4];
+        b.extend_from_slice(&4096u32.to_le_bytes());
+        for _ in 1..128 {
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&4096u32.to_le_bytes());
+        }
+        for _ in 0..4096 {
+            b.extend_from_slice(&(-1i32).to_le_bytes());
+        }
+        assert!(parse_edges(&b, 128, 4096).is_err());
     }
 }
