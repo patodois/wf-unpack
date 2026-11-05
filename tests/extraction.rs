@@ -105,3 +105,21 @@ fn incomplete_extraction_returns_failure() {
     );
     assert!(!o.join("file.txt").exists());
 }
+
+#[test]
+fn unsafe_selected_path_counts_as_failure_and_other_files_continue() {
+    let (r, o) = fixture("unsafe", 3, "../evil.txt");
+    let mut toc = fs::read(r.join("Small.toc")).unwrap();
+    let mut entry = vec![0; 96];
+    entry[16..20].copy_from_slice(&3u32.to_le_bytes());
+    entry[20..24].copy_from_slice(&3u32.to_le_bytes());
+    entry[32..40].copy_from_slice(b"safe.txt");
+    toc.extend_from_slice(&entry);
+    fs::write(r.join("Small.toc"), toc).unwrap();
+    let result = extract(&r, &o);
+    assert!(!result.status.success());
+    assert_eq!(fs::read(o.join("safe.txt")).unwrap(), b"new");
+    assert!(!r.join("evil.txt").exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("wrote 1 files"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("(1 failed)"));
+}

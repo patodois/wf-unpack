@@ -655,6 +655,7 @@ fn extract(path: &Path, pattern: &str, out: &Path) -> Result<()> {
     for e in &selected {
         let Some(dest) = safe_join(out, &e.path) else {
             eprintln!("skipping unsafe path {:?}", e.path);
+            failed += 1;
             continue;
         };
         // Ancestor symlinks are user configuration; refuse only a symlink at the final file.
