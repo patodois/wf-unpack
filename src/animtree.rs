@@ -1841,6 +1841,7 @@ impl Tree {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_leaf(
         &self,
         node: usize,
