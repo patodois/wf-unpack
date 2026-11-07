@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 # Block-compression texture decoder (BC1 to BC7), written from the public specifications
 bcn-decode = "0.1.0"
 # Oodle blocks of the cache files, clean-room (github.com/patodois/lztans)
-lztans = "0.1.0"
+lztans = "0.1.1"
 png = "0.18.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 # Packages.bin uses magicless frames, an experimental zstd parameter
