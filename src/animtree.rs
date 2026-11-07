@@ -1861,11 +1861,12 @@ impl Tree {
                 for (i, &c) in a.pick.table.iter().enumerate() {
                     let Some(p) = self.clip(c) else { continue };
                     if keep(p) {
+                        let clip = copy_clip_path(p, remaining)?;
                         let when = a.pick.values_of(i, cards).map_or_else(Vec::new, |vals| {
                             a.pick.vars.iter().copied().zip(vals).collect()
                         });
                         clips.push(ClipUse {
-                            clip: p.to_string(),
+                            clip,
                             speed: None,
                             rate: None,
                             when,
@@ -1877,7 +1878,7 @@ impl Tree {
                 for p in points {
                     if let Some(c) = self.clips.get(p.clip as usize).filter(|c| keep(c)) {
                         clips.push(ClipUse {
-                            clip: c.clone(),
+                            clip: copy_clip_path(c, remaining)?,
                             speed: Some(p.speed),
                             rate: Some(p.rate),
                             when: Vec::new(),
@@ -1886,7 +1887,7 @@ impl Tree {
                 }
             }
             Node::Parametric { path } if keep(path) => clips.push(ClipUse {
-                clip: path.clone(),
+                clip: copy_clip_path(path, remaining)?,
                 speed: None,
                 rate: None,
                 when: Vec::new(),
@@ -1907,6 +1908,13 @@ impl Tree {
         }
         Ok(())
     }
+}
+
+fn copy_clip_path(path: &str, remaining: &mut usize) -> Result<String> {
+    *remaining = remaining
+        .checked_sub(path.len())
+        .context("clip paths exceed the aggregate byte budget")?;
+    Ok(path.to_string())
 }
 
 /// The weight of a bone in a blend mask.
@@ -2631,5 +2639,48 @@ mod leaf_path_budget {
             32
         ];
         assert!(t.leaves_limited(0, None, 512).is_err());
+    }
+    #[test]
+    fn clip_paths_share_the_leaf_budget_for_every_clip_node_kind() {
+        let animation = AnimNode {
+            pick: Pick {
+                vars: vec![],
+                table: vec![0; 16],
+            },
+            flag_a: 0,
+            mode: 0,
+            blend: 0.0,
+            flag_b: 0,
+            tag: String::new(),
+            name: String::new(),
+        };
+        let nodes = [
+            Node::Animation(animation.clone()),
+            Node::NamedAnimation(animation.clone()),
+            Node::CinematicAnimation(animation),
+            Node::SpeedBlend {
+                lo: 0.0,
+                hi: 1.0,
+                var: 0,
+                points: vec![
+                    SpeedPoint {
+                        clip: 0,
+                        speed: 0.0,
+                        rate: 1.0
+                    };
+                    16
+                ],
+            },
+            Node::Parametric {
+                path: "p".repeat(1024),
+            },
+        ];
+        for node in nodes {
+            let mut tree = chain(1);
+            tree.nodes[0] = node;
+            tree.clips = vec!["c".repeat(256)];
+            assert!(tree.leaves_limited(0, None, 512).is_err());
+            assert_eq!(tree.leaves_limited(0, None, 16384).unwrap().len(), 1);
+        }
     }
 }
