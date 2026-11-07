@@ -362,9 +362,11 @@ The build has no git dependency; everything comes from [crates.io](https://crate
 - The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
   rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
 - `animtree::Tree::leaves` returns `Result<Vec<Leaf>>` instead of a plain `Vec`. It fails, instead of growing without
-  limit, when the paths copied for the leaves of one tree add up to more than 8 MiB.
+  limit, when path selections, their kind strings and clip-path strings across output leaves and the active
+  traversal of one tree exceed a shared 8 MiB budget.
 - `extract` reports a failure (and a non-zero exit status) when a selected entry cannot be written, creates output
-  folders only when it writes a file, and refuses entries whose path would leave the output folder.
+  folders only when it writes a file, and refuses entry paths containing parent components. It refuses a symlink
+  at the final output file; ancestor symlinks are allowed as user-configured output locations.
 - Animation trees are walked without recursion, nested attribute blocks and lightmap coordinates are bounded, and the
   signs of a mirrored joint survive when its transform is split into position, rotation and scale.
 
@@ -392,7 +394,3 @@ Licensed under either of MIT or Apache-2.0, at your option.
 - **glTF**: the open 3D file format the exports use (`.gltf` + `.bin` + PNGs). **PBR**: physically based
   materials (base colour, metal and roughness, normal map).
 - **RSS**: resident set size, the memory a process holds in RAM. **Footprint** is macOS's stricter count.
-
-Extraction rejects a symlink at the final output file and reports failure; ancestor symlinks are allowed as user-configured output locations.
-
-Animation-tree leaves return a Result and refuse more than 8 MiB of path selections across output leaves and the active traversal path, including their kind strings.
