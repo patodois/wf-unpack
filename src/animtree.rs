@@ -2683,4 +2683,28 @@ mod leaf_path_budget {
             assert_eq!(tree.leaves_limited(0, None, 16384).unwrap().len(), 1);
         }
     }
+    #[test]
+    fn returning_from_a_sibling_refunds_the_active_path() {
+        let mut tree = chain(3);
+        tree.graph.edges = vec![vec![1, 2], vec![], vec![]];
+        tree.nodes = vec![
+            Node::SubTree {
+                path: String::new()
+            };
+            3
+        ];
+        let one = std::mem::size_of::<Selection>() + tree.graph.type_name(0).len();
+        assert!(tree.leaves_limited(0, None, one).unwrap().is_empty());
+    }
+    #[test]
+    fn one_physical_edge_can_be_shared_once_per_node() {
+        let mut bytes = vec![0; 4];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 1..32 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(parse_edges(&bytes, 32, 1).unwrap(), vec![vec![-1]; 32]);
+    }
 }
