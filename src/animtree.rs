@@ -2778,4 +2778,26 @@ mod leaf_path_budget {
         bytes.extend_from_slice(&(-1i32).to_le_bytes());
         assert!(parse_edges(&bytes, n, 2).is_err());
     }
+    #[test]
+    fn each_output_leaf_pays_for_its_exact_retained_path() {
+        let mut tree = chain(3);
+        tree.nodes = vec![
+            Node::SubTree {
+                path: String::new(),
+            },
+            Node::SubTree {
+                path: String::new(),
+            },
+            Node::Parametric {
+                path: String::new(),
+            },
+        ];
+        let selection = std::mem::size_of::<Selection>() + tree.graph.type_name(0).len();
+        let exact = 4 * selection + std::mem::size_of::<ClipUse>();
+        let error = tree.leaves_limited(0, None, exact - 1).unwrap_err();
+        assert!(error.to_string().contains("leaf paths"));
+        let leaves = tree.leaves_limited(0, None, exact).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].path.len(), 2);
+    }
 }
