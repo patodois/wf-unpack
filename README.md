@@ -52,7 +52,7 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
 
 ```sh
-sh tools/verify-release.sh wf-unpack v0.5.0 path/to/folder
+sh tools/verify-release.sh wf-unpack v0.5.1 path/to/folder
 ```
 
 The signed text is `osp release patodois/wf-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
@@ -356,6 +356,11 @@ The build has no git dependency; everything comes from [crates.io](https://crate
   [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by Puxtril; no code was copied (see
   [docs/FORMATS.md](docs/FORMATS.md)). The optional `bridge` feature adds [rewrite-bridge](https://crates.io/crates/rewrite-bridge);
   the viewer is built on [Bevy](https://bevyengine.org).
+
+## Changes in 0.5.1
+
+- Requires lztans 0.1.1, whose decoder no longer refuses valid nested RLE data and limits its inner arrays.
+- `animtree::Tree::leaves` also charges clip uses and condition pairs against its 8 MiB budget before building the output.
 
 ## Changes in 0.5.0
 
