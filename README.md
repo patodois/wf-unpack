@@ -52,7 +52,7 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
 
 ```sh
-sh tools/verify-release.sh wf-unpack v0.4.0 path/to/folder
+sh tools/verify-release.sh wf-unpack v0.5.0 path/to/folder
 ```
 
 The signed text is `osp release patodois/wf-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
@@ -241,14 +241,14 @@ The other game needs none of Warframe's formats. To use it:
 ```toml
 [dependencies]
 wf-unpack = { git = "https://github.com/patodois/wf-unpack", features = ["bridge"] }
-# crates.io gives every crate in the build the same rewrite-bridge: all 0.3.x requirements share one copy
-rewrite-bridge = "0.3"
+# crates.io gives every crate in the build the same rewrite-bridge: all 0.4.x requirements share one copy
+rewrite-bridge = "0.4"
 ```
 
 Every crate in one build has to share one copy of rewrite-bridge, or `Warframe` implements a `Provider` that
 your code's `Provider` is not ("multiple different versions of crate `rewrite_bridge`"). From crates.io Cargo does
-that for you: this crate asks for `0.3.1`, your `"0.3"` accepts it, and both resolve to one 0.3.x release. Another
-minor line (`"0.2"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
+that for you: this crate asks for `0.4`, your `"0.4"` accepts it, and both resolve to one 0.4.x release. Another
+minor line (`"0.3"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
 
 ```rust
 use rewrite_bridge::Provider;
@@ -356,6 +356,17 @@ The build has no git dependency; everything comes from [crates.io](https://crate
   [Warframe-Exporter](https://github.com/Puxtril/Warframe-Exporter) by Puxtril; no code was copied (see
   [docs/FORMATS.md](docs/FORMATS.md)). The optional `bridge` feature adds [rewrite-bridge](https://crates.io/crates/rewrite-bridge);
   the viewer is built on [Bevy](https://bevyengine.org).
+
+## Changes in 0.5.0
+
+- The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
+  rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
+- `animtree::Tree::leaves` returns `Result<Vec<Leaf>>` instead of a plain `Vec`. It fails, instead of growing without
+  limit, when the paths copied for the leaves of one tree add up to more than 8 MiB.
+- `extract` reports a failure (and a non-zero exit status) when a selected entry cannot be written, creates output
+  folders only when it writes a file, and refuses entries whose path would leave the output folder.
+- Animation trees are walked without recursion, nested attribute blocks and lightmap coordinates are bounded, and the
+  signs of a mirrored joint survive when its transform is split into position, rotation and scale.
 
 ## License
 

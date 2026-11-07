@@ -1,6 +1,6 @@
 [package]
 name = "wf-unpack"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Reader for Evolution Engine .toc/.cache packages (Warframe game data)"
 license = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # Packages.bin uses magicless frames, an experimental zstd parameter
 zstd = { version = "0.13", features = ["experimental"] }
 # Shared model types for crossovers with other game rewrites
-rewrite-bridge = { version = "0.3.1", optional = true }
+rewrite-bridge = { version = "0.4", optional = true }
 
 # The F_NOCACHE hint in cache.rs and the peak memory report of check-levels
 [target.'cfg(unix)'.dependencies]
