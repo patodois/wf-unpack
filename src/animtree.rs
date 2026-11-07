@@ -1861,8 +1861,10 @@ impl Tree {
                 for (i, &c) in a.pick.table.iter().enumerate() {
                     let Some(p) = self.clip(c) else { continue };
                     if keep(p) {
-                        let clip = copy_clip_path(p, remaining)?;
-                        let when = a.pick.values_of(i, cards).map_or_else(Vec::new, |vals| {
+                        let values = a.pick.values_of(i, cards);
+                        let clip =
+                            copy_clip_path(p, values.as_ref().map_or(0, Vec::len), remaining)?;
+                        let when = values.map_or_else(Vec::new, |vals| {
                             a.pick.vars.iter().copied().zip(vals).collect()
                         });
                         clips.push(ClipUse {
@@ -1878,7 +1880,7 @@ impl Tree {
                 for p in points {
                     if let Some(c) = self.clips.get(p.clip as usize).filter(|c| keep(c)) {
                         clips.push(ClipUse {
-                            clip: copy_clip_path(c, remaining)?,
+                            clip: copy_clip_path(c, 0, remaining)?,
                             speed: Some(p.speed),
                             rate: Some(p.rate),
                             when: Vec::new(),
@@ -1887,7 +1889,7 @@ impl Tree {
                 }
             }
             Node::Parametric { path } if keep(path) => clips.push(ClipUse {
-                clip: copy_clip_path(path, remaining)?,
+                clip: copy_clip_path(path, 0, remaining)?,
                 speed: None,
                 rate: None,
                 when: Vec::new(),
@@ -1910,10 +1912,15 @@ impl Tree {
     }
 }
 
-fn copy_clip_path(path: &str, remaining: &mut usize) -> Result<String> {
+fn copy_clip_path(path: &str, when_count: usize, remaining: &mut usize) -> Result<String> {
+    let storage = when_count
+        .checked_mul(std::mem::size_of::<(u32, usize)>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ClipUse>()))
+        .context("clip use storage overflows the byte budget")?;
     *remaining = remaining
-        .checked_sub(path.len())
-        .context("clip paths exceed the aggregate byte budget")?;
+        .checked_sub(storage)
+        .and_then(|bytes| bytes.checked_sub(path.len()))
+        .context("clip uses exceed the aggregate byte budget")?;
     Ok(path.to_string())
 }
 
@@ -2707,4 +2714,29 @@ mod leaf_path_budget {
         bytes.extend_from_slice(&(-1i32).to_le_bytes());
         assert_eq!(parse_edges(&bytes, 32, 1).unwrap(), vec![vec![-1]; 32]);
     }
+    #[test]
+    fn empty_clip_uses_and_conditions_consume_the_byte_budget() {
+        for vars in [vec![], vec![7]] {
+            let mut tree = chain(1);
+            tree.nodes[0] = Node::Animation(AnimNode {
+                pick: Pick {
+                    vars: vars.clone(),
+                    table: vec![0],
+                },
+                flag_a: 0,
+                mode: 0,
+                blend: 0.0,
+                flag_b: 0,
+                tag: String::new(),
+                name: String::new(),
+            });
+            tree.clips = vec![String::new()];
+            let cost =
+                std::mem::size_of::<ClipUse>() + vars.len() * std::mem::size_of::<(u32, usize)>();
+            assert!(tree.leaves_limited(0, None, cost - 1).is_err());
+            let leaves = tree.leaves_limited(0, None, cost).unwrap();
+            assert_eq!(leaves[0].clips[0].when.len(), vars.len());
+        }
+    }
+
 }

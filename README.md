@@ -362,7 +362,7 @@ The build has no git dependency; everything comes from [crates.io](https://crate
 - The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
   rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
 - `animtree::Tree::leaves` returns `Result<Vec<Leaf>>` instead of a plain `Vec`. It fails, instead of growing without
-  limit, when path selections, their kind strings and clip-path strings across output leaves and the active
+  limit, when path selections, their kind strings, clip uses, condition pairs and clip-path strings across output leaves and the active
   traversal of one tree exceed a shared 8 MiB budget.
 - `extract` reports a failure (and a non-zero exit status) when a selected entry cannot be written, creates output
   folders only when it writes a file, and refuses entry paths containing parent components. It refuses a symlink
