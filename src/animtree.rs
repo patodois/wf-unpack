@@ -2739,4 +2739,43 @@ mod leaf_path_budget {
         }
     }
 
+    #[test]
+    fn the_public_leaf_budget_stops_at_eight_mebibytes() {
+        let mut tree = chain(1);
+        let storage = std::mem::size_of::<ClipUse>();
+        tree.nodes[0] = Node::Parametric {
+            path: "x".repeat((8 << 20) - storage),
+        };
+        assert_eq!(tree.leaves(0, None).unwrap().len(), 1);
+        tree.nodes[0] = Node::Parametric {
+            path: "x".repeat((8 << 20) - storage + 1),
+        };
+        assert!(tree.leaves(0, None).is_err());
+    }
+    #[test]
+    fn traversal_kind_bytes_are_included_in_the_exact_budget() {
+        let mut tree = chain(2);
+        tree.nodes = vec![
+            Node::SubTree {
+                path: String::new()
+            };
+            2
+        ];
+        let cost = std::mem::size_of::<Selection>() + tree.graph.type_name(0).len();
+        assert!(tree.leaves_limited(0, None, cost - 1).is_err());
+        assert!(tree.leaves_limited(0, None, cost).unwrap().is_empty());
+    }
+    #[test]
+    fn sparse_edge_copies_stop_at_the_node_floor() {
+        let n = 33;
+        let mut bytes = vec![0; 4];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 1..n {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(-1i32).to_le_bytes());
+        bytes.extend_from_slice(&(-1i32).to_le_bytes());
+        assert!(parse_edges(&bytes, n, 2).is_err());
+    }
 }
