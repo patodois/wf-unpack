@@ -3,9 +3,7 @@
 [![rewrite-bridge on crates.io](https://img.shields.io/crates/v/rewrite-bridge.svg?label=rewrite-bridge)](https://crates.io/crates/rewrite-bridge)
 [![rewrite-bridge docs](https://img.shields.io/docsrs/rewrite-bridge?label=docs.rs)](https://docs.rs/rewrite-bridge)
 
-A Rust tool and library that reads Warframe's game data (Digital Extremes' Evolution Engine) from your own
-install, and turns it into things other software understands: glTF 2.0 models, PNG and DDS textures,
-animations, whole levels, and the numbers the Tenno moves with.
+wf-unpack is a Rust tool and library for asset-tool and game-rewrite developers that reads Warframe's Evolution Engine data from their own installation and exports models, textures, animations, levels and movement values.
 
 It is for people who want to look at, convert or study Warframe's assets, and for people who write a **game
 rewrite**: a new engine for an old game that loads the original's assets, possibly mixed with another game's

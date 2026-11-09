@@ -4,6 +4,8 @@ version = "0.5.1"
 edition = "2021"
 description = "Reader for Evolution Engine .toc/.cache packages (Warframe game data)"
 license = "MIT OR Apache-2.0"
+keywords = ["warframe", "assets", "gltf", "animation", "rewrite-bridge"]
+categories = ["game-development", "parser-implementations", "command-line-utilities"]
 readme = "README.md"
 # The fuzz crate needs nightly and is not part of the package; neither are the process reports and reviews
 exclude = ["/fuzz", "/CLOUD-REPORT.md", "/docs/reviews"]
